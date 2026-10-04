@@ -12,6 +12,11 @@ export interface Database {
   batch(statements: Statement[]): Promise<unknown[]>
 }
 export interface Env {
+  NATIVE_EXECUTOR?: (env: Env, order: import('./orders.ts').Order, snapshot: import('./executor.ts').Snapshot) => Promise<import('./executor.ts').Result>
+  PAYMENT_SETTINGS?: import('./payments.ts').PaymentSettings
+  PAYMENTS_LOCKED?: string
+  PUBLIC_ORIGIN?: string
+  ALIPAY_CLIENT?: typeof import('../server/alipay.ts').createAlipayClient
   LOCAL_EXECUTOR?: (order: import('./orders.ts').Order, snapshot: import('./executor.ts').Snapshot) => Promise<import('./executor.ts').Result>
   STRIPE_PUBLISHABLE_KEY?: string
   DB: Database

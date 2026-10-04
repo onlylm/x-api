@@ -547,6 +547,13 @@ code {
   margin-top: 28px;
   min-height: 44px;
 }
+.login-purchase-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 24px;
+}
+.login-purchase-links .login-redeem-link { margin-top: 0; }
 .recharge-topbar,
 .recharge-result-heading {
   display: flex;
@@ -726,6 +733,130 @@ code {
 .status-revoked {
   color: var(--recharge-muted);
   background: var(--recharge-line);
+}
+.payment-settings {
+  padding-bottom: 28px;
+  margin-bottom: 28px;
+  border-bottom: 1px solid var(--recharge-line);
+}
+.payment-heading,
+.payment-status,
+.payment-save-row,
+.payment-enable-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+}
+.payment-settings .note,
+.payment-draft-state,
+.payment-status,
+.payment-card-pager span {
+  color: var(--recharge-muted);
+  font-size: 12px;
+  line-height: 1.8;
+}
+.payment-settings .note { margin: 8px 0 16px; }
+.payment-status { padding: 16px 0; }
+.payment-checks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 24px;
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+}
+.payment-checks li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.payment-checks .status { flex-shrink: 0; }
+.payment-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(0, 2fr);
+  align-items: start;
+  gap: 20px 16px;
+  margin-top: 24px;
+}
+.payment-form > * { min-width: 0; }
+.payment-card-pager { margin: 8px 0 0; flex-wrap: wrap; }
+.payment-policy, .payment-save-row { grid-column: 1 / -1; }
+.payment-form .payment-policy { margin: 0; }
+.payment-enable-row {
+  justify-content: space-between;
+  margin-top: 24px;
+  padding-top: 24px;
+  border-top: 1px solid var(--recharge-line);
+}
+.payment-enable-row strong { font-size: 13px; font-weight: 600; }
+.payment-enable-row .note { margin-bottom: 0; }
+.payment-settings .notice button { margin: 8px 0 0 12px; }
+.payment-settings input, .payment-settings select, .payment-settings button { min-height: 40px; }
+.payment-settings select:disabled { cursor: default; background: var(--recharge-surface); }
+.alipay-form { margin-top: 24px; }
+.alipay-identity-fields, .alipay-key-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px 16px;
+}
+.alipay-key-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 20px; }
+.alipay-identity-fields > *, .alipay-key-fields > * { min-width: 0; }
+.alipay-key-fields textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 120px;
+  padding: 12px;
+  border: 1px solid var(--recharge-line);
+  border-radius: 8px;
+  background: var(--recharge-surface);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.alipay-key-fields small, .alipay-notify { color: var(--recharge-muted); font-size: 12px; line-height: 1.8; }
+.alipay-key-fields textarea::placeholder { color: var(--recharge-muted); }
+.payment-settings input, .payment-settings textarea { caret-color: var(--recharge-accent); }
+.alipay-notify { display: flex; flex-direction: column; gap: 8px; margin: 20px 0 24px; }
+.alipay-notify code { overflow-wrap: anywhere; }
+.alipay-prices { border: 0; padding: 0; margin: 0 0 24px; min-width: 0; }
+.alipay-prices legend { font-size: 13px; font-weight: 600; }
+.alipay-price-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--recharge-line);
+}
+.alipay-price-row > * { min-width: 0; }
+.alipay-price-row strong { font-size: 13px; font-weight: 500; }
+.alipay-price-enabled { display: flex; align-items: center; gap: 8px; font-size: 12px; min-height: 44px; }
+.alipay-price-enabled input { width: 16px; height: 16px; min-height: 16px; accent-color: var(--recharge-accent); }
+.alipay-shop-link { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; }
+.alipay-orders { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--recharge-line); }
+.alipay-orders .pager { flex-wrap: wrap; }
+.alipay-orders .stack small { color: var(--recharge-muted); }
+.alipay-orders .status { align-self: flex-start; }
+@media (max-width: 900px) {
+  .alipay-identity-fields, .alipay-key-fields { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 540px) {
+  .alipay-price-row { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+}
+.payment-loading { padding: 24px 0; color: var(--recharge-muted); }
+.payment-meta, .payment-card-pager, .payment-settings select { font-variant-numeric: tabular-nums; }
+@media (max-width: 900px) {
+  .payment-form, .payment-checks { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 540px) {
+  .payment-settings .actions { flex-wrap: wrap; }
+  .payment-save-row > button, .payment-enable-row > button { width: 100%; }
+  .payment-card-pager span { flex-basis: 100%; }
+  .payment-settings select { text-overflow: ellipsis; }
 }
 @media (max-width: 900px) {
   .voucher-fields {

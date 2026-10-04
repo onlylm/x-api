@@ -2,6 +2,8 @@ node_modules/
 dist/
 .wrangler/
 .xgift-private/
+.playwright-cli/
+output/playwright/
 .env
 .env.*
 !.env.example

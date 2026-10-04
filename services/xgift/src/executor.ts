@@ -11,12 +11,14 @@ import {
   type Env,
 } from './core.ts'
 import { executionReady, type Order } from './orders.ts'
+import { paymentBinding, type PaymentBinding } from './payments.ts'
 export interface Snapshot {
   endpoint: string
   secret: string
   account: Record<string, unknown>
   proxy: Record<string, unknown> | null
   account_id: string
+  payment?: PaymentBinding
 }
 export interface Result {
   order_id: string
@@ -95,7 +97,12 @@ async function provider(
   return result
 }
 async function bindQueued(env: Env, order: Order) {
-  if (!executionReady(env)) return null
+  if (!await executionReady(env)) return null
+  const native = !!env.LOCAL_EXECUTOR
+  const payment = native ? await paymentBinding(env) : null
+  // Persist the chosen card and billing configuration with this execution.
+  // A configured payment service may never fall back to legacy automatic funding.
+  if (native && env.PAYMENT_SETTINGS && !payment) return null
   const candidates = (
     await env.DB.prepare(
       "SELECT s.id,s.payload FROM secrets s WHERE s.kind='account' AND s.enabled=1 AND NOT EXISTS(SELECT 1 FROM account_slots a WHERE a.account_id=s.id AND a.released=0) ORDER BY s.updated_at LIMIT 20",
@@ -116,11 +123,12 @@ async function bindQueued(env: Env, order: Order) {
       proxy = JSON.parse(await unseal(env, 'secret:' + row.id, row.payload))
     }
     const snapshot: Snapshot = {
-      endpoint: env.LOCAL_EXECUTOR ? 'local:v1' : secureEndpoint(env.EXECUTOR_URL),
-      secret: env.LOCAL_EXECUTOR ? '' : env.EXECUTOR_SECRET!,
+      endpoint: native ? 'local:v1' : secureEndpoint(env.EXECUTOR_URL),
+      secret: native ? '' : env.EXECUTOR_SECRET!,
       account,
       proxy,
       account_id: candidate.id,
+      ...(payment ? { payment } : {}),
     }
     const cipher = await seal(
         env,
@@ -144,7 +152,7 @@ async function bindQueued(env: Env, order: Order) {
         ),
         env.DB.prepare(
           "UPDATE orders SET status='running',execution_config=?,work_token=?,lease_until=?,updated_at=? WHERE id=? AND status='queued' AND EXISTS(SELECT 1 FROM account_slots WHERE order_id=orders.id AND account_id=?)",
-        ).bind(cipher, work, now + (env.LOCAL_EXECUTOR ? 180000 : 60000), now, order.id, candidate.id),
+        ).bind(cipher, work, now + (native ? 180000 : 60000), now, order.id, candidate.id),
       ])
     } catch {
       continue
@@ -177,7 +185,7 @@ async function claim(env: Env) {
       create: false,
     }
   }
-  if (!executionReady(env)) return null
+  if (!await executionReady(env)) return null
   const next = await env.DB.prepare(
     "SELECT * FROM orders WHERE status='queued' ORDER BY created_at LIMIT 1",
   ).first<Order>()
@@ -191,8 +199,12 @@ export async function reconcile(env: Env) {
     receipt: string | null = null,
     code: string | null = 'result_unconfirmed'
   try {
-    const result = snapshot.endpoint === 'local:v1' && env.LOCAL_EXECUTOR
-      ? await env.LOCAL_EXECUTOR(order, snapshot)
+    const result = snapshot.endpoint === 'local:v1'
+      ? env.NATIVE_EXECUTOR
+        ? await env.NATIVE_EXECUTOR(env, order, snapshot)
+        : env.LOCAL_EXECUTOR
+          ? await env.LOCAL_EXECUTOR(order, snapshot)
+          : fail('execution_unavailable', '原生执行器暂不可用。', 503)
       : await provider(snapshot, order, create)
     if (result.status === 'succeeded') {
       const e = result.evidence

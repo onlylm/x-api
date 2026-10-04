@@ -12,6 +12,9 @@ import { Dialog } from '@cloudflare/kumo/components/dialog'
 import { Table } from '@cloudflare/kumo/components/table'
 import { DirectRecharge, Redeem } from './Recharge'
 import { Vouchers } from './Vouchers'
+import { PaymentSettings } from './PaymentSettings'
+import { AlipaySettings } from './AlipaySettings'
+import { Checkout } from './Checkout'
 import {
   ArrowClockwise,
   ArrowSquareOut,
@@ -84,7 +87,7 @@ const sections = {
   vouchers: ['卡密管理', '生成套餐卡密、查看兑换记录及撤销未用卡密', Key],
   ledger: ['点数流水', '充值、冻结、消费与退回记录', Receipt],
   products: ['商品配置', '点数售价与预期支付金额', SlidersHorizontal],
-  cards: ['卡台与卡池', 'ZovoCard 接入、卡余额与消费记录', CreditCard],
+  cards: ['卡台与卡池', '支付宝收款、X 付款与卡台资产管理', CreditCard],
   secrets: ['账号与出口', '管理 X 赠送账号和代理连接', Plugs],
   keys: ['接口密钥', '生成或撤销签名密钥', Key],
   docs: ['接口文档', '通过签名接口创建和查询订单', BookOpen],
@@ -338,6 +341,7 @@ const productOptions: [string, string][] = [
 ]
 
 export default function App() {
+  if (/^\/buy\/?$/.test(window.location.pathname)) return <Checkout request={api} />
   return /^\/redeem\/?$/.test(window.location.pathname) ? (
     <Redeem request={api} />
   ) : (
@@ -604,7 +608,7 @@ function Workspace() {
               ))}
             </dl>
             <p className="note">
-              首单验收最多处理 1 笔真实赠送，单笔消费上限 $10；已有订单持续核对。
+              首单验收最多处理 1 笔真实赠送；指定卡的限额以卡台设置为准，已有订单持续核对。
             </p>
           </>
         )
@@ -1159,9 +1163,14 @@ function Workspace() {
               <ArrowRight size={17} />
             </Button>
           </form>
-          <a className="login-redeem-link text-link" href="/redeem">
-            持有卡密？前往兑换套餐 <ArrowRight size={16} />
-          </a>
+          <div className="login-purchase-links">
+            <a className="login-redeem-link text-link" href="/buy">
+              支付宝扫码购买套餐 <ArrowRight size={16} />
+            </a>
+            <a className="login-redeem-link text-link" href="/redeem">
+              持有卡密？前往兑换套餐 <ArrowRight size={16} />
+            </a>
+          </div>
         </div>
         <footer>用户账户由管理员开通 · {window.location.host}</footer>
       </main>
@@ -1216,6 +1225,10 @@ function Workspace() {
           })}
         </nav>
         <div className="sidebar-bottom">
+          <a href="/buy">
+            扫码购买
+            <ArrowSquareOut size={15} />
+          </a>
           <a href="/redeem">
             卡密兑换
             <ArrowSquareOut size={15} />
@@ -1265,6 +1278,10 @@ function Workspace() {
           </div>
         )}
         <div className="page-content" key={section}>
+          {admin && section === 'cards' && <>
+            <PaymentSettings request={api} onError={onError} />
+            <AlipaySettings request={api} onError={onError} />
+          </>}
           {loading ? (
             <div className="loading" role="status">
               正在加载…
@@ -1520,7 +1537,7 @@ function Cards({ data, pager, form, actionButton, toolbar }: CardsProps) {
       {toolbar('持卡人账单资料', actionButton(giftProfile.configured ? '修改账单资料' : '填写账单资料', configureGift))}
       <p className="note">
         {giftProfile.configured ? '账单资料已保存，接收用户名由每笔商城订单提供。' : '请补齐持卡人姓名、账单邮箱与国家；接收用户名在商城下单时填写。'}
-        {' '}首选 PP5583RC，首次注资 20 USD，开卡费上限 0.50 USD；每日注资上限 20 USD，首单验收限 1 单且含费用最多 10 USD。真实支付执行尚在接入，保存资料不会启用赠送。
+        {' '}X 付款使用上方选定的已有卡，不会自动开卡、充值或换卡。首单验收限 1 单；保存账单资料不会启用付款。
       </p>
       {!config.configured ? (
         <div className="setup-empty">

@@ -89,7 +89,7 @@ export async function createOrder(
   userId: string,
   idem: string,
   body: Record<string, unknown>,
-  options: { voucherId?: string; verifiedRecipientId?: string } = {},
+  options: { voucherId?: string; verifiedRecipientId?: string; alipayCheckoutId?: string } = {},
 ) {
   // Voucher authority is supplied only by the server-side redemption flow.
   const mode = options.voucherId ? 'voucher' : 'direct'
@@ -97,6 +97,9 @@ export async function createOrder(
     fail('invalid_mode', '卡密订单请使用卡密兑换入口。')
   if (options.voucherId && !/^vch_[a-f0-9]{32}$/.test(options.voucherId))
     fail('invalid_input', '卡密编号无效。')
+  if (options.alipayCheckoutId && (userId !== 'usr_' + '0'.repeat(28) + 'a11a' ||
+      !/^chk_[a-f0-9]{32}$/.test(options.alipayCheckoutId) || options.voucherId))
+    fail('invalid_input', '支付宝系统结算授权无效。')
   if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(idem))
     fail('invalid_idempotency', '请提供 8–128 位幂等键。')
   const merchant = text(body.merchant_order_no, '商户订单号', 128),
@@ -162,7 +165,7 @@ export async function createOrder(
     const row = await env.DB.prepare(
       `INSERT INTO orders(id,user_id,merchant_order_no,idempotency_key,request_hash,product_code,recipient,points,currency,amount_minor,stripe_product,months,created_at,updated_at,recipient_id,mode,voucher_id)
    SELECT ?,u.id,?,?,?,?,?,COALESCE(up.points,p.points),p.currency,p.amount_minor,p.stripe_product,p.months,?,?,?,?,?
-   FROM users u JOIN products p ON p.code=? LEFT JOIN user_prices up ON up.user_id=u.id AND up.product_code=p.code WHERE u.id=? AND u.enabled=1 AND p.enabled=1${checkPrice ? ' AND COALESCE(up.points,p.points)=?' : ''}${env.LOCAL_EXECUTOR ? " AND NOT EXISTS(SELECT 1 FROM orders WHERE status<>'failed')" : ''} RETURNING *`,
+   FROM users u JOIN products p ON p.code=? LEFT JOIN user_prices up ON up.user_id=u.id AND up.product_code=p.code WHERE u.id=? AND u.enabled=1 AND p.enabled=1${checkPrice ? ' AND COALESCE(up.points,p.points)=?' : ''}${env.LOCAL_EXECUTOR ? " AND NOT EXISTS(SELECT 1 FROM orders WHERE status<>'failed') AND (NOT EXISTS(SELECT 1 FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention')) OR EXISTS(SELECT 1 FROM alipay_checkouts a WHERE a.id=? AND a.paid_at IS NOT NULL AND a.status='paid' AND a.product_code=p.code AND a.recipient=? AND a.recipient_id=? AND a.points=COALESCE(up.points,p.points) AND a.currency=p.currency AND a.amount_minor=p.amount_minor AND a.stripe_product=p.stripe_product AND a.months=p.months))" : ''}${env.PAYMENT_SETTINGS ? ' AND EXISTS(SELECT 1 FROM payment_settings WHERE id=1 AND enabled=1 AND revision=?)' : ''} RETURNING *`,
     )
       .bind(
         orderId,
@@ -179,6 +182,8 @@ export async function createOrder(
         product,
         userId,
         ...(checkPrice ? [Number(body.expected_points)] : []),
+        ...(env.LOCAL_EXECUTOR ? [options.alipayCheckoutId ?? '', recipient, recipientId] : []),
+        ...(env.PAYMENT_SETTINGS ? [env.PAYMENT_SETTINGS.revision] : []),
       )
       .first<Order>()
     if (!row)

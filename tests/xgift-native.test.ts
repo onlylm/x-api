@@ -6,8 +6,9 @@ import { executeNative, guardPage, X_MERCHANT } from '../services/xgift/server/n
 import { createUser, createKey } from '../services/xgift/src/auth.ts'
 import { credit, createOrder, type Order } from '../services/xgift/src/orders.ts'
 import { saveSecret, eligibility } from '../services/xgift/src/network.ts'
-import { configureCards } from '../services/xgift/src/cards.ts'
+import { cardConfiguration, configureCards } from '../services/xgift/src/cards.ts'
 import { configureGiftProfile } from '../services/xgift/src/gift-profile.ts'
+import { configurePayments, paymentSettings, resolvePaymentEnv, setPaymentsEnabled } from '../services/xgift/src/payments.ts'
 import { reconcile } from '../services/xgift/src/executor.ts'
 import { unseal, type Env } from '../services/xgift/src/core.ts'
 import { signature } from '../shared/xgift-signature.ts'
@@ -32,7 +33,8 @@ async function fixture(t: Context) {
   await saveSecret(env, 'sec_testaccount', 'account', { name: 'Test sender', auth_token: 'dummy-cookie', ct0: 'dummy-csrf', daily_limit: 300 })
   await configureCards(env, { environment: 'production', transport: 'direct', api_key: 'sk_fixture', writes_enabled: true })
   await configureGiftProfile(env, { first_name: 'Test', last_name: 'User', billing_email: 'test@example.test', billing_country: 'HK', billing_line1: 'Fixture address' })
-  const state = { eligible: true, recipientId: '12345', xError: false, malformed: false, xCreates: 0, cardOpens: 0, methods: 0, confirms: 0, polls: 0, lostConfirm: false, lostCard: false, wrongPage: false, openFee: 0.5, requiresAction: false }
+  const state = { eligible: true, recipientId: '12345', xError: false, malformed: false, xCreates: 0, cardOpens: 0, methods: 0, confirms: 0, polls: 0, lostConfirm: false, lostCard: false, wrongPage: false, openFee: 0.5, requiresAction: false,
+    cardId: 123, cardProduct: 'PP5583RC', cardBalance: 20, cardStatus: 'ACTIVE', cardExpiry: '12/30', cardReads: [] as number[], methodBilling: [] as string[], paymentKeys: [] as string[], onInit: undefined as (() => Promise<void>) | undefined }
   t.mock.method(globalThis, 'fetch', async (input: string | URL, init?: RequestInit) => {
     const url = new URL(String(input))
     if (url.hostname === 'x.com') {
@@ -50,12 +52,19 @@ async function fixture(t: Context) {
           assert.equal(body.init_amount, 20); assert.equal(body.product_code, 'PP5583RC'); assert.equal(body.max_on_percent, 10); assert.equal(body.transaction_limit, 10); assert.equal(body.transaction_limit_type, 'limited')
           if (state.lostCard) throw new Error('lost open reply')
           return { id: 123, status: 'ACTIVE', product_code: 'PP5583RC' }
-        })() : { id: 123, product_code: 'PP5583RC', card_number: '4242424242424242', cvv: '123', expire: '12/30', status: 'ACTIVE', available_amount: 20 }
+        })() : (() => {
+          assert.equal(init?.method ?? 'GET', 'GET', 'Existing-card reads must not mutate provider state')
+          const requestedCard = Number(url.pathname.match(/\/cards\/(\d+)$/)?.[1])
+          state.cardReads.push(requestedCard)
+          return { id: state.cardId, product_code: state.cardProduct, card_number: '4242424242424242', cvv: '123', expire: state.cardExpiry, status: state.cardStatus, available_amount: state.cardBalance }
+        })()
       return Response.json({ code: 0, data })
     }
     assert.equal(url.hostname, 'api.stripe.com')
-    if (url.pathname.endsWith('/init')) return Response.json({ ...page(), ...(state.wrongPage ? { currency: 'sgd' } : {}) })
-    if (url.pathname.endsWith('/payment_methods')) { state.methods++; return Response.json({ id: 'pm_fixture', type: 'card', livemode: true }) }
+    const fields = new URLSearchParams(init?.method === 'POST' ? String(init.body) : url.search)
+    state.paymentKeys.push(fields.get('key') ?? '')
+    if (url.pathname.endsWith('/init')) { await state.onInit?.(); return Response.json({ ...page(), ...(state.wrongPage ? { currency: 'sgd' } : {}) }) }
+    if (url.pathname.endsWith('/payment_methods')) { state.methods++; state.methodBilling.push(fields.get('billing_details[email]') ?? ''); return Response.json({ id: 'pm_fixture', type: 'card', livemode: true }) }
     if (url.pathname.endsWith('/confirm')) {
       state.confirms++; assert.equal(new URLSearchParams(String(init?.body)).get('expected_amount'), '30000')
       if (state.lostConfirm) throw new Error('lost confirm reply')
@@ -130,4 +139,170 @@ test('payment proof rejects wrong merchant, recipient, quantity, currency, subsc
   for (const patch of [{ currency: 'sgd' }, { account_settings: { account_id: 'other' } }, { success_url: 'https://x.com/other/gift-premium/success' }, { subscription_data: {} }, { payment_intent: { amount: 30000, currency: 'bdt' } }, { total_summary: { total: 60000, subtotal: 60000, due: 60000 } }]) assert.throws(() => guardPage({ ...page(), ...patch }, order, session, true))
   const quantity = page(); quantity.line_item_group.line_items[0]!.quantity = 2
   assert.throws(() => guardPage(quantity, order, session, true))
+})
+
+async function selectedFixture(t: Context) {
+  const s = await fixture(t)
+  s.env.NATIVE_EXECUTOR = executeNative
+  s.state.cardProduct = 'EXISTING-CARD-PRODUCT'
+  // Existing-card payments work with all card-provider mutations disabled.
+  await configureCards(s.env, { environment: 'production', transport: 'direct', api_key: 'sk_fixture', writes_enabled: false })
+  await setPaymentsEnabled(s.env, { enabled: false })
+  const provider = await cardConfiguration(s.env)
+  const settings = await configurePayments(s.env, {
+    revision: (await paymentSettings(s.env))!.revision,
+    stripe_publishable_key: 'pk_live_selectedfixture', card_id: 123, provider_revision: provider.revision,
+  })
+  const resume = () => setPaymentsEnabled(s.env, { enabled: true, revision: settings.revision, confirmation: 'ENABLE_PAYMENTS' })
+  const pause = () => setPaymentsEnabled(s.env, { enabled: false })
+  await resume()
+  Object.assign(s.env, await resolvePaymentEnv(s.env))
+  async function tick() {
+    s.db.exec('UPDATE orders SET next_check=0')
+    return reconcile(await resolvePaymentEnv(s.env))
+  }
+  return { ...s, tick, pause, resume, settings }
+}
+
+test('selected existing card never opens or funds a card and freezes key, card and billing per execution', async t => {
+  const s = await selectedFixture(t)
+  await s.create(); await s.tick()
+  await configureGiftProfile(s.env, { first_name: 'Changed', last_name: 'Profile', billing_email: 'changed@example.test', billing_country: 'HK' })
+  for (let i = 0; i < 7; i++) await s.tick()
+  const order = s.db.prepare('SELECT * FROM orders').get() as unknown as Order
+  assert.equal(order.status, 'succeeded')
+  assert.deepEqual([s.state.xCreates, s.state.cardOpens, s.state.methods, s.state.confirms], [1, 0, 1, 1])
+  assert.deepEqual(s.state.methodBilling, ['test@example.test'])
+  assert.ok(s.state.cardReads.every(id => id === 123))
+  assert.ok(s.state.paymentKeys.every(key => key === 'pk_live_selectedfixture'))
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM native_funding').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+  const snapshot = JSON.parse(await unseal(s.env, 'execution:' + order.id, order.execution_config!))
+  assert.equal(snapshot.payment.card_id, 123)
+  assert.equal(snapshot.payment.billing.billing_email, 'test@example.test')
+  const raw = String(s.db.prepare('SELECT payload FROM native_jobs').get()!.payload)
+  assert.doesNotMatch(raw, /4242424242424242|selectedfixture|test@example/)
+  assert.doesNotMatch(await unseal(s.env, 'native:' + order.id, raw), /4242424242424242|"cvv"/)
+})
+
+test('a pause while checkout is refreshed blocks confirmation and resuming preserves the original card', async t => {
+  const s = await selectedFixture(t)
+  await s.create()
+  for (let i = 0; i < 4; i++) await s.tick()
+  s.state.onInit = async () => { s.state.onInit = undefined; await s.pause() }
+  await s.tick()
+  assert.equal(s.state.confirms, 0)
+  assert.equal(s.db.prepare('SELECT failure_code FROM orders').get()!.failure_code, 'payments_paused')
+  assert.equal(s.db.prepare('SELECT stage FROM native_jobs').get()!.stage, 'tokenized')
+  await s.resume(); await s.tick()
+  assert.equal(s.state.confirms, 1)
+  await s.pause(); await s.tick()
+  assert.equal(s.db.prepare('SELECT status FROM orders').get()!.status, 'succeeded')
+  assert.deepEqual([s.state.cardOpens, s.state.methods, s.state.confirms], [0, 1, 1])
+})
+
+test('insufficient or expired selected cards never tokenize, confirm, top up or open replacements', async t => {
+  const s = await selectedFixture(t)
+  await s.create(); await s.tick(); await s.tick()
+  s.state.cardBalance = 9.99
+  await s.tick(); await s.tick()
+  assert.equal(s.db.prepare('SELECT stage FROM native_jobs').get()!.stage, 'funding')
+  s.state.cardBalance = 20; s.state.cardExpiry = '00/00'
+  await s.tick()
+  assert.deepEqual([s.state.cardOpens, s.state.methods, s.state.confirms], [0, 0, 0])
+  assert.equal(s.db.prepare('SELECT frozen FROM wallets').get()!.frozen, 1700)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+})
+
+test('a pause arriving after the durable submit marker still prevents the upstream confirmation', async t => {
+  const s = await selectedFixture(t)
+  await s.create()
+  for (let i = 0; i < 4; i++) await s.tick()
+  const prepare = s.env.DB.prepare.bind(s.env.DB)
+  let paused = false
+  t.mock.method(s.env.DB, 'prepare', (sql: string) => {
+    const statement = prepare(sql)
+    if (!sql.startsWith('INSERT INTO native_jobs')) return statement
+    const bind = statement.bind.bind(statement), run = statement.run.bind(statement)
+    let stage: unknown
+    statement.bind = (...values) => { stage = values[1]; bind(...values); return statement }
+    statement.run = async () => {
+      const result = await run()
+      if (stage === 'submitted' && !paused) { paused = true; await s.pause() }
+      return result
+    }
+    return statement
+  })
+  await s.tick()
+  assert.equal(paused, true)
+  assert.equal(s.state.confirms, 0)
+  assert.equal(s.db.prepare('SELECT stage FROM native_jobs').get()!.stage, 'tokenized')
+  await s.resume(); await s.tick(); await s.tick()
+  assert.equal(s.state.confirms, 1)
+  assert.equal(s.db.prepare('SELECT status FROM orders').get()!.status, 'succeeded')
+})
+
+test('provider changes stop bound work without selecting a different card; pending orders block configuration edits', async t => {
+  const s = await selectedFixture(t)
+  await s.create(); await s.tick(); await s.pause()
+  await assert.rejects(configurePayments(s.env, { revision: s.settings.revision, stripe_publishable_key: 'pk_live_changed', card_id: 456, provider_revision: s.settings.provider_revision }), /未结订单/)
+  await s.resume()
+  await assert.rejects(configureCards(s.env, { environment: 'production', transport: 'direct', api_key: 'sk_changedfixture', writes_enabled: false }), /未结订单/)
+  // Even a direct database/operator change cannot silently switch the bound payment.
+  s.db.exec("UPDATE card_provider SET revision='cfg_changedoutsideapi'")
+  for (let i = 0; i < 4; i++) await s.tick()
+  assert.equal(s.db.prepare('SELECT status FROM orders').get()!.status, 'unknown')
+  assert.deepEqual([s.state.cardOpens, s.state.methods, s.state.confirms], [0, 0, 0])
+  assert.ok(s.state.cardReads.every(id => id === 123))
+})
+
+test('incoming closure stops native confirmation but already submitted sessions remain read-only pollable', async t => {
+  const s = await selectedFixture(t)
+  await s.create()
+  s.db.exec(`INSERT INTO alipay_checkouts(id,access_hash,request_hash,out_trade_no,product_code,product_name,months,points,currency,amount_minor,stripe_product,
+    amount_cents,recipient,recipient_id,provider_revision,outbound_revision,config_payload,status,paid_at,order_id,created_at,expires_at,updated_at)
+    SELECT 'chk_fixture','fixture','fixture','xgift_fixture',product_code,'Fixture',months,points,currency,amount_minor,stripe_product,
+      8880,recipient,recipient_id,'fixture','fixture','fixture','paid',1,id,1,9999999999999,1 FROM orders`)
+  for (let i = 0; i < 4; i++) await s.tick()
+  s.state.onInit = async () => {
+    s.state.onInit = undefined
+    s.db.exec("UPDATE alipay_checkouts SET status='attention',failure_code='payment_closed_unconfirmed'")
+  }
+  await s.tick()
+  assert.equal(s.state.confirms, 0)
+  assert.equal(s.db.prepare('SELECT failure_code FROM orders').get()!.failure_code, 'collection_requires_review')
+  assert.equal(s.db.prepare('SELECT stage FROM native_jobs').get()!.stage, 'tokenized')
+  s.db.exec("UPDATE alipay_checkouts SET status='paid',failure_code=NULL")
+  await s.tick()
+  assert.equal(s.state.confirms, 1)
+  s.db.exec("UPDATE alipay_checkouts SET status='attention',failure_code='payment_closed_unconfirmed'")
+  await s.tick()
+  assert.equal(s.state.confirms, 1)
+  assert.equal(s.state.polls, 1)
+})
+
+test('selected-card lost confirmation and 3DS only poll the original checkout, including while paused', async t => {
+  const s = await selectedFixture(t)
+  s.state.lostConfirm = true; s.state.requiresAction = true
+  await s.create()
+  for (let i = 0; i < 8; i++) await s.tick()
+  assert.equal(s.db.prepare('SELECT failure_code FROM orders').get()!.failure_code, 'payment_requires_action')
+  assert.equal(s.db.prepare('SELECT frozen FROM wallets').get()!.frozen, 1700)
+  assert.deepEqual([s.state.xCreates, s.state.cardOpens, s.state.methods, s.state.confirms], [1, 0, 1, 1])
+  await s.pause(); s.state.requiresAction = false
+  await s.tick(); await s.tick()
+  assert.equal(s.db.prepare('SELECT status FROM orders').get()!.status, 'succeeded')
+  assert.equal(s.state.confirms, 1)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM ledger WHERE kind='consume'").get()!.n, 1)
+})
+
+test('creating a saved payment configuration cannot turn a legacy in-flight job into automatic card funding', async t => {
+  const s = await fixture(t)
+  await s.create(); await s.tick(); await s.tick()
+  await setPaymentsEnabled(s.env, { enabled: false })
+  // Deliberately pass the old boot-time environment: the executor must re-read the database guard.
+  await s.tick(); await s.tick()
+  assert.equal(s.state.cardOpens, 0)
+  assert.equal(s.state.confirms, 0)
+  assert.equal(s.db.prepare('SELECT status FROM orders').get()!.status, 'unknown')
 })

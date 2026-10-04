@@ -1,14 +1,15 @@
-import { readResponse, seal, unseal, type Env } from '../src/core.ts'
+import { Failure, readResponse, seal, unseal, type Env } from '../src/core.ts'
 import type { Order } from '../src/orders.ts'
 import type { Result, Snapshot } from '../src/executor.ts'
 import { accountEligibility, quote, xQuery } from '../src/network.ts'
 import { cardConfiguration, cardRead, cardWrite, paymentCard } from '../src/cards.ts'
 import { giftProfile, giftPolicy } from '../src/gift-profile.ts'
+import { assertPaymentAllowed, type PaymentBinding } from '../src/payments.ts'
 
 // X merchant published by x_gift_bot setup.go. Validate every returned payment page against it.
 export const X_MERCHANT = 'acct_1Ika5JA3KZ32dPo1'
 type Json = Record<string, any>
-interface Job { stage: string; session?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string }
+interface Job { stage: string; session?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding }
 const sessionPattern = /^cs_live_[A-Za-z0-9]+$/
 const successUrl = (o: Order) => `https://x.com/${o.recipient}/gift-premium/success`
 export function guardPage(p: Json, order: Order, session: string, before: boolean) {
@@ -35,6 +36,20 @@ async function save(env: Env, order: Order, job: Job) {
   await env.DB.prepare('INSERT INTO native_jobs VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET stage=excluded.stage,payload=excluded.payload,updated_at=excluded.updated_at')
     .bind(order.id, job.stage, await seal(env, 'native:' + order.id, JSON.stringify(job)), Date.now()).run()
 }
+async function prepareWrite(env: Env, order: Order, job: Job, stage: string) {
+  const previous = job.stage
+  job.stage = stage
+  await save(env, order, job)
+  try {
+    // Saving is asynchronous: a pause can arrive after the preceding guard.
+    await assertPaymentAllowed(env, job.payment, order.id)
+  } catch (error) {
+    // No upstream request was sent, so resuming can safely retry the previous stage.
+    job.stage = previous
+    await save(env, order, job)
+    throw error
+  }
+}
 async function fundCard(env: Env) {
   const reference = 'xgift:initial-card:v1'
   const config = await cardConfiguration(env)
@@ -51,31 +66,50 @@ async function fundCard(env: Env) {
   if (!product || product.issuer !== 'four' || typeof product.min_amount !== 'number' || product.min_amount > 20 || typeof product.open_fee !== 'number' || product.open_fee > 0.50 || product.open_fee < 0 || product.recharge_fee !== 0) throw new Error('card_product_price_changed')
   const balance = await cardRead(env, 'balance') as Json
   if (balance.currency !== 'USD' || !Number.isFinite(Number(balance.spendable_balance)) || Number(balance.spendable_balance) < 20 + product.open_fee) throw new Error('card_balance_insufficient')
+  await assertPaymentAllowed(env)
   // Reservation is durable before sending. An ambiguous operation consumes the budget until reconciled.
   await env.DB.prepare('INSERT INTO native_funding VALUES(?,?,?) ON CONFLICT(reference) DO NOTHING')
     .bind(reference, new Date().toISOString().slice(0, 10), 2000).run()
+  await assertPaymentAllowed(env)
   const result = await cardWrite(env, 'open', { confirmation: 'CHARGE', reference,
     product_code: giftPolicy.preferred_product, amount_minor: 2000,
     first_name: profile.first_name, last_name: profile.last_name, max_transaction_usd_cents: 1000 })
   if (result.status !== 'succeeded' || !result.card_id) throw new Error('card_funding_unconfirmed')
   return Number(result.card_id)
 }
+function validateCard(card: Json, cardId: number, selected: boolean) {
+  const expiry = String(card.expire ?? '').match(/^(\d{2})\/(\d{2}|\d{4})$/)
+  const month = Number(expiry?.[1]), year = expiry ? Number(expiry[2]) + (expiry[2]!.length === 2 ? 2000 : 0) : 0
+  const current = new Date()
+  if (Number(card.id) !== cardId || (!selected && card.product_code !== giftPolicy.preferred_product) || card.status !== 'ACTIVE' || !/^\d{12,19}$/.test(String(card.card_number)) || !/^\d{3,4}$/.test(String(card.cvv)) || !expiry || month < 1 || month > 12 || year < current.getUTCFullYear() || (year === current.getUTCFullYear() && month < current.getUTCMonth() + 1) || !Number.isFinite(Number(card.available_amount)) || Number(card.available_amount) < 10 || (card.currency !== undefined && String(card.currency).toUpperCase() !== 'USD')) throw new Error('card_not_ready')
+  return expiry
+}
 export async function executeNative(env: Env, order: Order, snapshot: Snapshot): Promise<Result> {
   const unknown = (code = 'result_unconfirmed'): Result => ({ order_id: order.id, status: 'unknown', failure_code: code })
   const running = (): Result => ({ order_id: order.id, status: 'running' })
   const row = await env.DB.prepare('SELECT payload FROM native_jobs WHERE order_id=?').bind(order.id).first<{ payload: string }>()
-  const job: Job = row ? JSON.parse(await unseal(env, 'native:' + order.id, row.payload)) : { stage: 'preflight', key: env.STRIPE_PUBLISHABLE_KEY ?? '' }
+  const job: Job = row ? JSON.parse(await unseal(env, 'native:' + order.id, row.payload)) : {
+    stage: 'preflight', key: snapshot.payment?.stripe_publishable_key ?? env.STRIPE_PUBLISHABLE_KEY ?? '',
+    ...(snapshot.payment ? { payment: snapshot.payment, card_id: snapshot.payment.card_id } : {}),
+  }
+  const payment = job.payment
+  // A later configuration change cannot switch an existing job to another card.
+  // Legacy submitted jobs remain queryable even after the admin configuration is introduced.
+  if (env.PAYMENT_SETTINGS && !payment && !['submitted', 'paid'].includes(job.stage)) return unknown('payment_binding_missing')
   if (env.PAYMENTS_ENABLED !== 'true' && !['submitted', 'paid'].includes(job.stage)) return unknown('payments_paused')
   if (!/^pk_live_[A-Za-z0-9]+$/.test(job.key) || !order.recipient_id) return unknown('execution_configuration_missing')
   // Only the two exact BDT products are authorized in this first release; never use a caller's price.
   if (order.currency !== 'bdt' || ![3, 6].includes(order.months) || order.amount_minor !== order.months * 10000 || order.stripe_product !== (order.months === 3 ? 'prod_TJXJtpzqCpI36N' : 'prod_TJXKKNJwZJIhCM')) return unknown('product_not_authorized')
   try {
+    if (!['submitted', 'paid'].includes(job.stage)) await assertPaymentAllowed(env, payment, order.id)
+    if (payment && (job.card_id !== payment.card_id || job.key !== payment.stripe_publishable_key)) return unknown('payment_binding_mismatch')
     if (job.stage === 'preflight') {
       const check = await accountEligibility(env, snapshot.account, snapshot.proxy, order.recipient)
       if (!check.eligible || check.recipient_id !== order.recipient_id) return { order_id: order.id, status: 'failed', financial_state: 'not_charged', failure_code: 'recipient_not_eligible' }
       const price = await quote(env, snapshot.account_id, order.product_code)
       if (!price.matches_expected || price.currency !== order.currency || Math.round(price.amount * 100) !== order.amount_minor) return { order_id: order.id, status: 'failed', financial_state: 'not_charged', failure_code: 'price_changed' }
-      job.stage = 'creating'; await save(env, order, job)
+      await assertPaymentAllowed(env, payment, order.id)
+      await prepareWrite(env, order, job, 'creating')
       const result = await xQuery(env, snapshot.account, snapshot.proxy, 'useOneTimePurchaseGiftMutation', 'GqTVJ4S1526tLkxj69xIZw', {
         cancel_url: successUrl(order).replace('/success', ''), success_url: successUrl(order), external_product_id: order.stripe_product, gift_recipient: order.recipient_id,
       }, true)
@@ -88,25 +122,34 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
     if (job.stage === 'creating' || job.stage === 'tokenizing') return unknown('original_request_unconfirmed')
     if (!job.session || !sessionPattern.test(job.session)) return unknown('session_missing')
     if (job.stage === 'session') {
+      await assertPaymentAllowed(env, payment, order.id)
       const page = await stripe(job.key, 'POST', `payment_pages/${job.session}/init`, { browser_locale: 'en', redirect_type: 'url' })
       guardPage(page, order, job.session, true)
       job.proof = page; job.checksum = page.init_checksum; job.stage = 'funding'
       await save(env, order, job); return running()
     }
     if (job.stage === 'funding') {
-      job.card_id = await fundCard(env); job.stage = 'funded'; await save(env, order, job); return running()
+      await assertPaymentAllowed(env, payment, order.id)
+      if (payment) {
+        // Existing-card mode is read-only at the card provider: never open, top up or change limits.
+        validateCard(await paymentCard(env, payment.card_id), payment.card_id, true)
+        job.card_id = payment.card_id
+      } else job.card_id = await fundCard(env)
+      job.stage = 'funded'; await save(env, order, job); return running()
     }
     if (job.stage === 'funded') {
-      const billing = await giftProfile(env)
-      if (!billing.configured || !billing.billing_email || !billing.billing_country || !billing.first_name || !billing.last_name) throw new Error('billing_profile_missing')
-      const config = await cardConfiguration(env)
-      const operation = await env.DB.prepare("SELECT provider_revision FROM card_operations WHERE reference='xgift:initial-card:v1' AND card_id=? AND status='succeeded'").bind(job.card_id!).first<{ provider_revision: string }>()
-      if (!operation || operation.provider_revision !== config.revision) throw new Error('card_provider_changed')
+      const billing = payment ? { configured: true, ...payment.billing } : await giftProfile(env)
+      if (!billing.configured || !('billing_email' in billing) || !billing.billing_email || !billing.billing_country || !billing.first_name || !billing.last_name) throw new Error('billing_profile_missing')
+      if (!payment) {
+        const config = await cardConfiguration(env)
+        const operation = await env.DB.prepare("SELECT provider_revision FROM card_operations WHERE reference='xgift:initial-card:v1' AND card_id=? AND status='succeeded'").bind(job.card_id!).first<{ provider_revision: string }>()
+        if (!operation || operation.provider_revision !== config.revision) throw new Error('card_provider_changed')
+      }
       const card = await paymentCard(env, job.card_id!)
-      const expiry = String(card.expire ?? '').match(/^(\d{2})\/(\d{2}|\d{4})$/)
-      if (Number(card.id) !== job.card_id || card.product_code !== giftPolicy.preferred_product || card.status !== 'ACTIVE' || !/^\d{12,19}$/.test(String(card.card_number)) || !/^\d{3,4}$/.test(String(card.cvv)) || !expiry || !Number.isFinite(Number(card.available_amount)) || Number(card.available_amount) < 10) throw new Error('card_not_ready')
-      // Card limits enforce the approved 10 USD ceiling, including a total spend cap on this card.
-      job.stage = 'tokenizing'; await save(env, order, job)
+      const expiry = validateCard(card, job.card_id!, !!payment)
+      await assertPaymentAllowed(env, payment, order.id)
+      // The USD balance threshold is conservative; an existing card's limits are not modified.
+      await prepareWrite(env, order, job, 'tokenizing')
       const fields: Record<string, string> = { type: 'card', 'card[number]': String(card.card_number), 'card[cvc]': String(card.cvv), 'card[exp_month]': expiry[1]!, 'card[exp_year]': expiry[2]!,
         'billing_details[name]': `${billing.first_name} ${billing.last_name}`, 'billing_details[email]': billing.billing_email, 'billing_details[address][country]': billing.billing_country }
       for (const [name, value] of Object.entries({ line1: billing.billing_line1, line2: billing.billing_line2, city: billing.billing_city, state: billing.billing_state, postal_code: billing.billing_postal_code })) if (value) fields[`billing_details[address][${name}]`] = value
@@ -119,8 +162,10 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
       if (!check.eligible || check.recipient_id !== order.recipient_id) return { order_id: order.id, status: 'failed', financial_state: 'not_charged', failure_code: 'recipient_changed_before_payment' }
       const page = await stripe(job.key, 'POST', `payment_pages/${job.session}/init`, { browser_locale: 'en', redirect_type: 'url' })
       guardPage(page, order, job.session, true)
-      job.proof = page; job.checksum = page.init_checksum; job.stage = 'submitted'; job.submitted_at = Date.now()
-      await save(env, order, job)
+      if (payment) validateCard(await paymentCard(env, payment.card_id), payment.card_id, true)
+      await assertPaymentAllowed(env, payment, order.id)
+      job.proof = page; job.checksum = page.init_checksum; job.submitted_at = Date.now()
+      await prepareWrite(env, order, job, 'submitted')
       // Deliberately submit once. Every subsequent invocation only inspects the same checkout.
       await stripe(job.key, 'POST', `payment_pages/${job.session}/confirm`, { payment_method: job.method!, expected_amount: String(order.amount_minor), expected_payment_method_type: 'card', init_checksum: job.checksum!, return_url: successUrl(order) }, 'xgift-confirm-' + order.id)
       return running()
@@ -139,7 +184,7 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
       } }
     }
     return unknown('execution_stage_unconfirmed')
-  } catch {
-    return unknown('execution_requires_reconciliation')
+  } catch (error) {
+    return unknown(error instanceof Failure ? error.code : 'execution_requires_reconciliation')
   }
 }

@@ -96,8 +96,12 @@ export async function configureCards(env: Env, body: Row) {
     old.transport === transport
       ? old.revision
       : id('cfg')
-  await env.DB.prepare(
-    'INSERT INTO card_provider VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET environment=excluded.environment,payload=excluded.payload,writes_enabled=excluded.writes_enabled,revision=excluded.revision,updated_at=excluded.updated_at',
+  const lock = `NOT EXISTS(SELECT 1 FROM orders WHERE status IN('queued','running','unknown'))
+    AND NOT EXISTS(SELECT 1 FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention'))
+    AND NOT EXISTS(SELECT 1 FROM payment_settings WHERE enabled=1)`
+  const changed = await env.DB.prepare(
+    `INSERT INTO card_provider SELECT 1,?,?,?,?,? WHERE (${lock}) OR EXISTS(SELECT 1 FROM card_provider WHERE revision=?)
+     ON CONFLICT(id) DO UPDATE SET environment=excluded.environment,payload=excluded.payload,writes_enabled=excluded.writes_enabled,revision=excluded.revision,updated_at=excluded.updated_at RETURNING id`,
   )
     .bind(
       environment,
@@ -109,8 +113,10 @@ export async function configureCards(env: Env, body: Row) {
       writes,
       revision,
       Date.now(),
+      revision,
     )
-    .run()
+    .first()
+  if (!changed) return fail('payment_orders_pending', '请先暂停付款并核对未结订单，再修改卡台连接配置。', 409)
   await audit(
     env,
     'admin',
@@ -279,6 +285,8 @@ export async function cardRead(
 ) {
   const provider = await configuration(env)
   try {
+    if (resource === 'card' && cardId)
+      return safeCard(object(await call(env, provider, `/cards/${integer(cardId, '卡 ID')}?sync=1`)))
     if (resource === 'balance')
       return select(object(await call(env, provider, '/balance')), [
         'balance',

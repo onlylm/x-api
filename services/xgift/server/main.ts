@@ -7,6 +7,7 @@ import { proxyFetch } from './proxy.ts'
 import { server } from './http.ts'
 import worker from '../src/index.ts'
 import type { Env } from '../src/core.ts'
+import { createAlipayClient } from './alipay.ts'
 import { executeNative } from './native-executor.ts'
 
 const { MASTER_KEY, ADMIN_PASSWORD, PUBLIC_ORIGIN, DATABASE_PATH } = process.env
@@ -31,6 +32,10 @@ const env: Env = {
   ASSETS: assets(fileURLToPath(new URL('../dist/', import.meta.url))),
   MASTER_KEY,
   ADMIN_PASSWORD,
+  PUBLIC_ORIGIN,
+  PAYMENTS_LOCKED: process.env.PAYMENTS_LOCKED ?? 'false',
+  NATIVE_EXECUTOR: executeNative,
+  ALIPAY_CLIENT: createAlipayClient,
   CARD_DEFAULT_TRANSPORT: 'direct',
   OUTBOUND_FETCH: proxyFetch,
   PAYMENTS_ENABLED: process.env.PAYMENTS_ENABLED ?? 'false',
@@ -53,7 +58,7 @@ const timer = setInterval(() => {
     .finally(() => {
       task = undefined
     })
-}, env.LOCAL_EXECUTOR ? 5000 : 60000)
+}, 5000)
 http.listen(8791, '127.0.0.1', () =>
   console.log('X API server listening on loopback:8791'),
 )

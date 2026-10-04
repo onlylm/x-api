@@ -43,6 +43,9 @@ import {
   eligibility,
 } from './network.ts'
 import { giftProfile, configureGiftProfile } from './gift-profile.ts'
+import { configurePayments, paymentView, resolvePaymentEnv, setPaymentsEnabled } from './payments.ts'
+import { alipayNotification, alipayOrders, alipayView, checkoutCatalog, checkoutEligibility, checkoutStatus,
+  configureAlipay, createCheckout, enableAlipay, reconcileAlipay } from './alipay-payments.ts'
 import {
   createOrder,
   credit,
@@ -74,7 +77,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (!['GET', 'POST'].includes(method))
     return fail('method_not_allowed', '请求方法不支持。', 405)
   const raw = method === 'POST' ? await rawBody(request) : '',
-    data = method === 'POST' ? parseBody(raw) : {}
+    data = method === 'POST' && path !== '/api/alipay/notify' ? parseBody(raw) : {}
   if (path.startsWith('/v1/')) {
     const userId = await signedUser(request, env, raw)
     if (path === '/v1/capabilities' && method === 'GET') {
@@ -132,7 +135,29 @@ async function route(request: Request, env: Env): Promise<Response> {
       return json(await getOrder(env, userId, match[1]))
     return fail('not_found', '接口不存在。', 404)
   }
+  if (path === '/api/alipay/notify') {
+    if (method !== 'POST' || !request.headers.get('Content-Type')?.toLowerCase().startsWith('application/x-www-form-urlencoded'))
+      return new Response('failure', { status: 400 })
+    try {
+      const form = new URLSearchParams(raw), params: Record<string, string> = {}
+      for (const [key, value] of form) {
+        if (Object.hasOwn(params, key) || ['__proto__', 'constructor', 'prototype'].includes(key)) return new Response('failure', { status: 400 })
+        params[key] = value
+      }
+      return new Response(await alipayNotification(env, params) ? 'success' : 'failure', { headers: { 'Cache-Control': 'no-store' } })
+    } catch { return new Response('failure', { status: 400 }) }
+  }
   if (method === 'POST') browserWrite(request)
+  if (path === '/api/checkout/catalog' && method === 'GET') return json(await checkoutCatalog(env))
+  if (path === '/api/checkout' || path.startsWith('/api/checkout/')) {
+    if (method !== 'POST') fail('method_not_allowed', '请通过购买表单提交。', 405)
+    await limit(env, 'checkout-ip:' + await sha256(request.headers.get('CF-Connecting-IP') ?? 'local'), path.endsWith('/status') ? 120 : 20)
+    const checkoutData = data
+    if (path === '/api/checkout/eligibility') return json(await checkoutEligibility(env, checkoutData))
+    if (path === '/api/checkout/status') return json(await checkoutStatus(env, checkoutData))
+    if (path === '/api/checkout') return json(await createCheckout(env, checkoutData))
+    return fail('not_found', '接口不存在。', 404)
+  }
   // Public readiness metadata lets the unauthenticated redemption page stay usable.
   if (path === '/api/capabilities' && method === 'GET')
     return json(await orderCapabilities(env))
@@ -230,6 +255,13 @@ async function route(request: Request, env: Env): Promise<Response> {
       return json(
         await cardWrite(env, cardMutation[1] as 'open' | 'recharge', data),
       )
+    if (path === '/api/admin/payments' && method === 'GET') return json(await paymentView(env))
+    if (path === '/api/admin/alipay' && method === 'GET') return json(await alipayView(env))
+    if (path === '/api/admin/alipay/config' && method === 'POST') return json(await configureAlipay(env, data))
+    if (path === '/api/admin/alipay/enabled' && method === 'POST') return json(await enableAlipay(env, data))
+    if (path === '/api/admin/alipay/orders' && method === 'GET') return json(await alipayOrders(env, pagination(url).offset))
+    if (path === '/api/admin/payments/config' && method === 'POST') return json(await configurePayments(env, data))
+    if (path === '/api/admin/payments/enabled' && method === 'POST') return json(await setPaymentsEnabled(env, data))
     if (path === '/api/admin/overview' && method === 'GET') {
       const summary = await env.DB.prepare(
         "SELECT (SELECT COUNT(*) FROM users) users,(SELECT COALESCE(SUM(available),0) FROM wallets) available,(SELECT COALESCE(SUM(frozen),0) FROM wallets) frozen,(SELECT COUNT(*) FROM orders WHERE status IN('queued','running','unknown')) pending,(SELECT COUNT(*) FROM orders WHERE status='unknown') unknown,(SELECT COUNT(*) FROM webhook_deliveries WHERE status='dead') failed_webhooks",
@@ -590,7 +622,9 @@ export default {
             { status: 403 },
           ),
         )
-      return secure(await route(request, env))
+      const path = new URL(request.url).pathname
+      const bypassPaymentResolution = path.startsWith('/api/admin/payments') || path.startsWith('/api/admin/alipay') || path === '/api/alipay/notify'
+      return secure(await route(request, bypassPaymentResolution ? env : await resolvePaymentEnv(env)))
     } catch (e) {
       return secure(
         Response.json(
@@ -612,7 +646,9 @@ export default {
     }
   },
   async scheduled(_event: unknown, env: Env) {
+    env = await resolvePaymentEnv(env)
     await cleanup(env)
+    await reconcileAlipay(env)
     await reconcile(env)
     await deliverWebhook(env)
   },
