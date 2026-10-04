@@ -10,6 +10,8 @@ import {
 import { eligibility } from './network.ts'
 export interface Order {
   recipient_id?: string | null
+  mode?: 'direct' | 'voucher'
+  voucher_id?: string | null
   id: string
   user_id: string
   merchant_order_no: string
@@ -48,6 +50,7 @@ export function executionReady(env: Env) {
 export function publicOrder(o: Order) {
   return {
     id: o.id,
+    mode: o.mode ?? 'direct',
     merchant_order_no: o.merchant_order_no,
     product_code: o.product_code,
     recipient: o.recipient,
@@ -59,6 +62,17 @@ export function publicOrder(o: Order) {
     receipt: o.receipt,
     created_at: o.created_at,
     updated_at: o.updated_at,
+  }
+}
+export async function orderCapabilities(env: Env) {
+  const row = env.LOCAL_EXECUTOR
+    ? await env.DB.prepare("SELECT COUNT(*) n FROM orders WHERE status<>'failed'").first<{ n: number }>()
+    : null
+  const ready = executionReady(env)
+  return {
+    execution_ready: ready,
+    accepts_orders: ready && (!row || row.n === 0),
+    modes: ['direct', 'voucher'],
   }
 }
 export async function products(env: Env, userId: string) {
@@ -75,7 +89,14 @@ export async function createOrder(
   userId: string,
   idem: string,
   body: Record<string, unknown>,
+  options: { voucherId?: string; verifiedRecipientId?: string } = {},
 ) {
+  // Voucher authority is supplied only by the server-side redemption flow.
+  const mode = options.voucherId ? 'voucher' : 'direct'
+  if ((body.mode !== undefined && body.mode !== mode) || body.voucher_id !== undefined)
+    fail('invalid_mode', '卡密订单请使用卡密兑换入口。')
+  if (options.voucherId && !/^vch_[a-f0-9]{32}$/.test(options.voucherId))
+    fail('invalid_input', '卡密编号无效。')
   if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(idem))
     fail('invalid_idempotency', '请提供 8–128 位幂等键。')
   const merchant = text(body.merchant_order_no, '商户订单号', 128),
@@ -88,7 +109,14 @@ export async function createOrder(
     !/^[A-Za-z0-9_.:-]{1,128}$/.test(merchant)
   )
     fail('invalid_input', '订单号或 X 用户名格式无效。')
-  const digest = await sha256(JSON.stringify({ merchant, product, recipient, ...(env.LOCAL_EXECUTOR ? { recipient_id: body.recipient_id, expected_points: body.expected_points } : {}) }))
+  const checkIdentity = !!env.LOCAL_EXECUTOR || !!options.voucherId || body.recipient_id !== undefined
+  const checkPrice = !!env.LOCAL_EXECUTOR || !!options.voucherId || body.expected_points !== undefined
+  // Retain the old digest for existing direct API callers and native orders.
+  const digest = await sha256(JSON.stringify({
+    merchant, product, recipient,
+    ...(checkIdentity || checkPrice ? { recipient_id: body.recipient_id, expected_points: body.expected_points } : {}),
+    ...(options.voucherId ? { mode, voucher_id: options.voucherId } : {}),
+  }))
   const existing = async () =>
     env.DB.prepare(
       'SELECT * FROM orders WHERE user_id=? AND (merchant_order_no=? OR idempotency_key=?)',
@@ -98,6 +126,8 @@ export async function createOrder(
   const check = (list: Order[]) => {
     if (
       list.length !== 1 ||
+      (list[0].mode ?? 'direct') !== mode ||
+      (list[0].voucher_id ?? null) !== (options.voucherId ?? null) ||
       list[0].request_hash !== digest ||
       list[0].idempotency_key !== idem
     )
@@ -110,20 +140,29 @@ export async function createOrder(
   if (!executionReady(env))
     fail('execution_disabled', '自动支付尚未配置或已暂停，未冻结点数。', 503)
   let recipientId: string | null = null
-  if (env.LOCAL_EXECUTOR) {
+  if (checkPrice)
     integer(body.expected_points, '确认点数', 1, 100000000)
-    const check = await eligibility(env, recipient)
-    if (!check.eligible || !check.recipient_id) fail('not_eligible', '该账号当前不能接收赠送。', 409)
-    if (check.recipient_id !== body.recipient_id) fail('recipient_changed', '接收账号身份已变化，请重新检测。', 409)
-    recipientId = check.recipient_id!
+  if (checkIdentity) {
+    if (typeof body.recipient_id !== 'string' || !/^\d{1,25}$/.test(body.recipient_id))
+      fail('invalid_input', '请先检测并确认接收账号。')
+    if (options.voucherId && options.verifiedRecipientId) {
+      if (options.verifiedRecipientId !== body.recipient_id)
+        fail('recipient_changed', '接收账号身份已变化，请重新检测。', 409)
+      recipientId = options.verifiedRecipientId
+    } else {
+      const check = await eligibility(env, recipient)
+      if (!check.eligible || !check.recipient_id) return fail('not_eligible', '该账号当前不能接收赠送。', 409)
+      if (check.recipient_id !== body.recipient_id) fail('recipient_changed', '接收账号身份已变化，请重新检测。', 409)
+      recipientId = check.recipient_id
+    }
   }
   const orderId = id('ord'),
     now = Date.now()
   try {
     const row = await env.DB.prepare(
-      `INSERT INTO orders(id,user_id,merchant_order_no,idempotency_key,request_hash,product_code,recipient,points,currency,amount_minor,stripe_product,months,created_at,updated_at${env.LOCAL_EXECUTOR ? ',recipient_id' : ''})
-   SELECT ?,u.id,?,?,?,?,?,COALESCE(up.points,p.points),p.currency,p.amount_minor,p.stripe_product,p.months,?,?${env.LOCAL_EXECUTOR ? ',?' : ''}
-   FROM users u JOIN products p ON p.code=? LEFT JOIN user_prices up ON up.user_id=u.id AND up.product_code=p.code WHERE u.id=? AND u.enabled=1 AND p.enabled=1${env.LOCAL_EXECUTOR ? " AND COALESCE(up.points,p.points)=? AND NOT EXISTS(SELECT 1 FROM orders WHERE status<>'failed')" : ''} RETURNING *`,
+      `INSERT INTO orders(id,user_id,merchant_order_no,idempotency_key,request_hash,product_code,recipient,points,currency,amount_minor,stripe_product,months,created_at,updated_at,recipient_id,mode,voucher_id)
+   SELECT ?,u.id,?,?,?,?,?,COALESCE(up.points,p.points),p.currency,p.amount_minor,p.stripe_product,p.months,?,?,?,?,?
+   FROM users u JOIN products p ON p.code=? LEFT JOIN user_prices up ON up.user_id=u.id AND up.product_code=p.code WHERE u.id=? AND u.enabled=1 AND p.enabled=1${checkPrice ? ' AND COALESCE(up.points,p.points)=?' : ''}${env.LOCAL_EXECUTOR ? " AND NOT EXISTS(SELECT 1 FROM orders WHERE status<>'failed')" : ''} RETURNING *`,
     )
       .bind(
         orderId,
@@ -134,14 +173,16 @@ export async function createOrder(
         recipient,
         now,
         now,
-        ...(env.LOCAL_EXECUTOR ? [recipientId] : []),
+        recipientId,
+        mode,
+        options.voucherId ?? null,
         product,
         userId,
-        ...(env.LOCAL_EXECUTOR ? [Number(body.expected_points)] : []),
+        ...(checkPrice ? [Number(body.expected_points)] : []),
       )
       .first<Order>()
     if (!row)
-      return fail('product_unavailable', '商品未开放或账户已停用。', 409)
+      return fail('product_unavailable', '商品或账户不可用、点数价格已变化，或当前验收名额已用尽。', 409)
     return { order: publicOrder(row), created: true }
   } catch (e) {
     const raced = await existing()

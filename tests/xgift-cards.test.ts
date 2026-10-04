@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import {
   cardConfiguration,
   configureCards,
@@ -22,10 +22,11 @@ type Context = Parameters<Parameters<typeof test>[1]>[0]
 function setup(t: Context) {
   const db = new DatabaseSync(':memory:')
   t.after(() => db.close())
-  for (const name of ['0001_platform', '0002_card_provider'])
+  const migrations = new URL('../services/xgift/migrations/', import.meta.url)
+  for (const name of readdirSync(migrations).filter((name) => /^\d+.*\.sql$/.test(name)).sort())
     db.exec(
       readFileSync(
-        new URL(`../services/xgift/migrations/${name}.sql`, import.meta.url),
+        new URL(name, migrations),
         'utf8',
       ),
     )

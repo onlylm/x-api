@@ -16,11 +16,13 @@ import {
   id,
   integer,
   json,
+  limit,
   parseBody,
   rawBody,
   text,
   passwordHash,
   token,
+  sha256,
   type Env,
 } from './core.ts'
 import { cleanup, reconcile } from './executor.ts'
@@ -45,6 +47,7 @@ import {
   createOrder,
   credit,
   executionReady,
+  orderCapabilities,
   getOrder,
   pagination,
   products,
@@ -52,6 +55,14 @@ import {
   type Order,
 } from './orders.ts'
 import { configureWebhook, deliverWebhook } from './webhooks.ts'
+import {
+  inspectVoucher,
+  issueVouchers,
+  listVouchers,
+  redeemVoucher,
+  revokeVoucher,
+  voucherPublicView,
+} from './vouchers.ts'
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url),
     path = url.pathname,
@@ -67,15 +78,11 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (path.startsWith('/v1/')) {
     const userId = await signedUser(request, env, raw)
     if (path === '/v1/capabilities' && method === 'GET') {
-      const row = env.LOCAL_EXECUTOR ? await env.DB.prepare("SELECT COUNT(*) n FROM orders WHERE status<>'failed'").first<{ n: number }>() : null
-      return json({ execution_ready: executionReady(env), accepts_orders: executionReady(env) && (!row || row.n === 0) })
+      return json(await orderCapabilities(env))
     }
     if (path === '/v1/eligibility' && method === 'POST')
     {
-      const now = Date.now()
-      const rate = await env.DB.prepare('INSERT INTO login_limits VALUES(?,1,?) ON CONFLICT(id) DO UPDATE SET attempts=CASE WHEN reset_at<=? THEN 1 ELSE attempts+1 END,reset_at=CASE WHEN reset_at<=? THEN excluded.reset_at ELSE reset_at END RETURNING attempts')
-        .bind('eligibility:' + userId, now + 60000, now, now).first<{ attempts: number }>()
-      if (!rate || rate.attempts > 20) fail('rate_limited', '查询较频繁，请稍后再试。', 429)
+      await limit(env, 'eligibility:' + userId, 20)
       return json(await eligibility(env, data.username))
     }
     if (path === '/v1/products' && method === 'GET')
@@ -89,6 +96,7 @@ async function route(request: Request, env: Env): Promise<Response> {
           .first(),
       )
     if (path === '/v1/orders' && method === 'POST') {
+      await limit(env, 'eligibility:' + userId, 20)
       const result = await createOrder(
         env,
         userId,
@@ -125,6 +133,35 @@ async function route(request: Request, env: Env): Promise<Response> {
     return fail('not_found', '接口不存在。', 404)
   }
   if (method === 'POST') browserWrite(request)
+  // Public readiness metadata lets the unauthenticated redemption page stay usable.
+  if (path === '/api/capabilities' && method === 'GET')
+    return json(await orderCapabilities(env))
+  if (path === '/api/redeem' || path.startsWith('/api/redeem/')) {
+    if (method !== 'POST') fail('method_not_allowed', '请通过表单提交卡密。', 405)
+    if (!['/api/redeem', '/api/redeem/inspect', '/api/redeem/status', '/api/redeem/eligibility'].includes(path))
+      fail('not_found', '接口不存在。', 404)
+    await limit(env, 'redeem-ip:' + await sha256(request.headers.get('CF-Connecting-IP') ?? 'local'), 30)
+    if (path === '/api/redeem/inspect' || path === '/api/redeem/status')
+      return json(await voucherPublicView(env, data.code))
+    const { voucher, order } = await inspectVoucher(env, data.code)
+    if (!order) {
+      await limit(env, 'redeem-check:' + voucher.id, 10)
+      await limit(env, 'eligibility:' + voucher.user_id, 20)
+    }
+    if (path === '/api/redeem/eligibility') {
+      const view = await voucherPublicView(env, data.code)
+      if (view.state !== 'available')
+        fail('voucher_unavailable', '卡密已使用、撤销或过期，请查询原兑换记录。', 409)
+      if (!(await orderCapabilities(env)).accepts_orders)
+        fail('execution_disabled', '暂时无法接收新订单，卡密尚未使用，请稍后再试。', 503)
+      const available = await env.DB.prepare('SELECT u.id FROM users u JOIN products p ON p.code=? WHERE u.id=? AND u.enabled=1 AND p.enabled=1')
+        .bind(voucher.product_code, voucher.user_id).first()
+      if (!available) fail('voucher_unavailable', '该卡密暂时无法兑换，请联系发卡商户。', 409)
+      return json(await eligibility(env, data.username))
+    }
+    const result = await redeemVoucher(env, data)
+    return json(result, result.created ? 201 : 200)
+  }
   if (path === '/api/login' && method === 'POST')
     return login(request, env, data)
   if (path === '/api/logout' && method === 'POST') return logout(request, env)
@@ -142,6 +179,15 @@ async function route(request: Request, env: Env): Promise<Response> {
     userId = principal.userId
   if (path.startsWith('/api/admin/')) {
     if (!admin) return fail('forbidden', '需要管理员权限。', 403)
+    if (path === '/api/admin/vouchers' && method === 'GET')
+      return json(await listVouchers(env, pagination(url).offset))
+    if (path === '/api/admin/vouchers' && method === 'POST') {
+      await limit(env, 'voucher-issue:admin', 5)
+      return json(await issueVouchers(env, data), 201)
+    }
+    const voucherRevoke = path.match(/^\/api\/admin\/vouchers\/(vch_[a-f0-9]{32})\/revoke$/)
+    if (voucherRevoke && method === 'POST')
+      return json(await revokeVoucher(env, voucherRevoke[1], data))
     if (path === '/api/admin/gift-profile' && method === 'GET')
       return json(await giftProfile(env))
     if (path === '/api/admin/gift-profile' && method === 'POST')
@@ -408,6 +454,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     return fail('not_found', '接口不存在。', 404)
   }
   if (!userId) return fail('forbidden', '请登录用户账户。', 403)
+  if (path === '/api/eligibility' && method === 'POST') {
+    await limit(env, 'eligibility:' + userId, 20)
+    return json(await eligibility(env, data.username))
+  }
   if (path === '/api/me' && method === 'GET')
     return json(
       await env.DB.prepare(
@@ -450,6 +500,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json(result)
   }
   if (path === '/api/orders' && method === 'POST') {
+    await limit(env, 'eligibility:' + userId, 20)
+    if (typeof data.recipient_id !== 'string' || !/^\d{1,25}$/.test(data.recipient_id))
+      fail('invalid_input', '请先检测并确认接收账号。')
+    integer(data.expected_points, '确认点数', 1, 100000000)
     const result = await createOrder(
       env,
       userId,
@@ -459,6 +513,13 @@ async function route(request: Request, env: Env): Promise<Response> {
     return json(result.order, result.created ? 201 : 200)
   }
   if (path === '/api/orders' && method === 'GET') {
+    const merchant = url.searchParams.get('merchant_order_no')
+    if (merchant) {
+      const order = await env.DB.prepare('SELECT * FROM orders WHERE user_id=? AND merchant_order_no=?')
+        .bind(userId, merchant).first<Order>()
+      if (!order) return fail('not_found', '订单不存在。', 404)
+      return json(publicOrder(order))
+    }
     const { offset } = pagination(url)
     return json(
       (
@@ -470,6 +531,9 @@ async function route(request: Request, env: Env): Promise<Response> {
       ).results.map(publicOrder),
     )
   }
+  const browserOrder = path.match(/^\/api\/orders\/(ord_[a-f0-9]{32})$/)
+  if (browserOrder && method === 'GET')
+    return json(await getOrder(env, userId, browserOrder[1]))
   if (path === '/api/ledger' && method === 'GET') {
     const { offset } = pagination(url)
     return json(

@@ -16,6 +16,12 @@
   --kumo-button-emphasis-bg: #334c42;
   --kumo-button-emphasis-ring: #334c42;
   --color-kumo-brand: #334c42;
+  --recharge-ink: #202730;
+  --recharge-muted: #66717d;
+  --recharge-line: #e8eaee;
+  --recharge-surface: #f7f8fa;
+  --recharge-confirm: #f1f5f2;
+  --recharge-accent: #334c42;
 }
 * {
   box-sizing: border-box;
@@ -518,6 +524,252 @@ code {
   place-content: center;
   min-height: 100vh;
   color: #8b929c;
+}
+.text-link {
+  color: var(--recharge-accent);
+  font-size: 13px;
+  font-weight: 550;
+  text-underline-offset: 4px;
+}
+.text-link:hover {
+  text-decoration: underline;
+}
+.text-link:focus-visible {
+  outline: 2px solid var(--recharge-accent);
+  outline-offset: 4px;
+  border-radius: 3px;
+}
+.login-redeem-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 28px;
+  min-height: 44px;
+}
+.recharge-topbar,
+.recharge-result-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+.recharge-topbar .text-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+}
+.redeem-wrap {
+  width: min(520px, 100%);
+  margin: auto;
+  padding: 64px 0;
+}
+.redeem-wrap h1 {
+  font-size: 30px;
+  text-wrap: balance;
+}
+.recharge-intro,
+.recharge-confirm p {
+  color: var(--recharge-muted);
+  line-height: 1.8;
+  font-size: 13px;
+  margin: 12px 0 20px;
+  text-wrap: pretty;
+}
+.recharge-steps {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  list-style: none;
+  padding: 0;
+  margin: 32px 0;
+  color: var(--recharge-muted);
+  font-size: 12px;
+}
+.recharge-steps li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.recharge-steps li > span {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--recharge-line);
+  font-variant-numeric: tabular-nums;
+}
+.recharge-steps [aria-current='step'] {
+  color: var(--recharge-accent);
+  font-weight: 600;
+}
+.recharge-steps [aria-current='step'] > span {
+  background: var(--recharge-accent);
+  color: #fff;
+}
+.redeem-page .recharge-form {
+  gap: 16px;
+}
+.redeem-page .recharge-form > button {
+  justify-content: center;
+  margin-top: 0;
+}
+.recipient-form {
+  margin-top: 28px;
+}
+.voucher-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 20px 0;
+  margin-top: 16px;
+  border-bottom: 1px solid var(--recharge-line);
+  font-size: 15px;
+  font-weight: 600;
+}
+.voucher-summary small {
+  color: var(--recharge-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.direct-recharge,
+.voucher-create {
+  padding-bottom: 28px;
+  margin-bottom: 28px;
+  border-bottom: 1px solid var(--recharge-line);
+}
+.direct-recharge > .recharge-result-heading {
+  align-items: flex-start;
+}
+.direct-recharge .note,
+.voucher-create > .note {
+  margin: 8px 0 20px;
+  color: var(--recharge-muted);
+}
+.direct-fields,
+.voucher-fields {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) minmax(160px, 1fr) auto;
+  gap: 20px 16px;
+  align-items: end;
+}
+.voucher-fields {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.direct-fields > *,
+.voucher-fields > * {
+  min-width: 0;
+}
+.recharge-confirm {
+  margin: 24px 0;
+  padding: 24px;
+  border-radius: 8px;
+  background: var(--recharge-confirm);
+}
+.recharge-confirm > strong {
+  display: block;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+  margin-top: 16px;
+  overflow-wrap: anywhere;
+}
+.recharge-confirm p strong {
+  color: var(--recharge-ink);
+  font-variant-numeric: tabular-nums;
+}
+.recharge-confirm code,
+.recharge-details dd {
+  overflow-wrap: anywhere;
+}
+.recharge-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.recharge-result {
+  margin: 28px 0 20px;
+}
+.recharge-details > div {
+  padding: 14px 0;
+  font-size: 13px;
+}
+.recharge-details dt {
+  flex-shrink: 0;
+  color: var(--recharge-muted);
+}
+.recharge-details dd {
+  text-align: right;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.redeem-wrap .note {
+  color: var(--recharge-muted);
+}
+.redeem-page button,
+.direct-recharge button,
+.voucher-create button,
+.redeem-page input,
+.direct-fields input,
+.direct-fields select,
+.voucher-fields input,
+.voucher-fields select {
+  min-height: 44px;
+}
+.status-active,
+.status-redeemed {
+  color: #2e654a;
+  background: #e9f2ec;
+}
+.status-expired,
+.status-revoked {
+  color: var(--recharge-muted);
+  background: var(--recharge-line);
+}
+@media (max-width: 900px) {
+  .voucher-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .direct-fields {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .direct-fields > button {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+}
+@media (max-width: 540px) {
+  .redeem-wrap {
+    padding: 40px 0;
+  }
+  .redeem-wrap h1 {
+    font-size: 26px;
+  }
+  .direct-fields,
+  .voucher-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .direct-fields > button {
+    justify-self: stretch;
+  }
+  .recharge-result-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .recharge-confirm {
+    padding: 20px;
+  }
+  .recharge-steps {
+    font-size: 11px;
+    gap: 8px;
+  }
+  .recharge-steps li {
+    gap: 5px;
+  }
+  .recharge-actions > button {
+    flex: 1;
+  }
 }
 @keyframes enter {
   from {

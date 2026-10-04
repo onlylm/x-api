@@ -28,6 +28,10 @@ const tables = [
   'audit',
   'card_provider',
   'card_operations',
+  'gift_profile',
+  'native_jobs',
+  'native_funding',
+  'vouchers',
 ]
 try {
   for (const table of tables.filter((t) => t !== 'products')) {

@@ -10,6 +10,8 @@ import { Button } from '@cloudflare/kumo/components/button'
 import { Input } from '@cloudflare/kumo/components/input'
 import { Dialog } from '@cloudflare/kumo/components/dialog'
 import { Table } from '@cloudflare/kumo/components/table'
+import { DirectRecharge, Redeem } from './Recharge'
+import { Vouchers } from './Vouchers'
 import {
   ArrowClockwise,
   ArrowSquareOut,
@@ -79,6 +81,7 @@ const sections = {
   overview: ['概览', '账户余额与服务状态', ChartBar],
   users: ['用户管理', '开通账户、入账点数及设置用户价格', Users],
   orders: ['充值订单', '查询进度与核对原订单', ListChecks],
+  vouchers: ['卡密管理', '生成套餐卡密、查看兑换记录及撤销未用卡密', Key],
   ledger: ['点数流水', '充值、冻结、消费与退回记录', Receipt],
   products: ['商品配置', '点数售价与预期支付金额', SlidersHorizontal],
   cards: ['卡台与卡池', 'ZovoCard 接入、卡余额与消费记录', CreditCard],
@@ -93,6 +96,7 @@ class ApiError extends Error {
   constructor(
     message: string,
     public status: number,
+    public code?: string,
   ) {
     super(message)
   }
@@ -110,6 +114,7 @@ async function api<T = Row>(path: string, body?: Row): Promise<T> {
     throw new ApiError(
       data.error?.message ?? '请求未确认，请刷新后核对原记录。',
       response.status,
+      data.error?.code,
     )
   return data.data as T
 }
@@ -333,6 +338,14 @@ const productOptions: [string, string][] = [
 ]
 
 export default function App() {
+  return /^\/redeem\/?$/.test(window.location.pathname) ? (
+    <Redeem request={api} />
+  ) : (
+    <Workspace />
+  )
+}
+
+function Workspace() {
   const [principal, setPrincipal] = useState<Principal | null>(null),
     [section, setSection] = useState<Section>('overview'),
     [page, setPage] = useState(1)
@@ -665,10 +678,14 @@ export default function App() {
             ),
           )}
           <Grid
-            headers={['用户', '可用 / 冻结', '状态', '操作']}
+            headers={['用户 / 商户 ID', '可用 / 冻结', '状态', '操作']}
             rows={rows}
             render={(r) => [
-              <Stack top={r.name} bottom={r.email} />,
+              <span className="stack">
+                <span>{s(r.name)}</span>
+                <small>{s(r.email)}</small>
+                <code>{s(r.id)}</code>
+              </span>,
               `${s(r.available)} / ${s(r.frozen)}`,
               <Status value={r.enabled ? '正常' : '停用'} />,
               <div className="row-actions">
@@ -744,6 +761,13 @@ export default function App() {
     if (section === 'orders')
       return (
         <>
+          {!admin && (
+            <DirectRecharge
+              request={api}
+              userId={principal?.userId ?? ''}
+              onCreated={() => setRefresh((v) => v + 1)}
+            />
+          )}
           {toolbar(
             '订单记录',
             admin &&
@@ -754,6 +778,7 @@ export default function App() {
               '订单 / 时间',
               '接收账号',
               '套餐',
+              '模式',
               '点数',
               '状态',
               '结果',
@@ -763,6 +788,7 @@ export default function App() {
               <Stack top={r.merchant_order_no} bottom={date(r.created_at)} />,
               <Stack top={'@' + s(r.recipient)} bottom={r.user_name ?? ''} />,
               s(r.product_code),
+              r.mode === 'voucher' ? '卡密兑换' : '直充',
               s(r.points),
               <Status value={r.status} />,
               <>
@@ -783,6 +809,17 @@ export default function App() {
           <p className="note">
             待核对订单的点数继续冻结，请查询原订单，勿重复提交。
           </p>
+        </>
+      )
+    if (section === 'vouchers')
+      return (
+        <>
+          <Vouchers
+            rows={rows}
+            request={api}
+            onChanged={() => setRefresh((v) => v + 1)}
+          />
+          {pager(rows.length === 30)}
         </>
       )
     if (section === 'ledger')
@@ -1122,6 +1159,9 @@ export default function App() {
               <ArrowRight size={17} />
             </Button>
           </form>
+          <a className="login-redeem-link text-link" href="/redeem">
+            持有卡密？前往兑换套餐 <ArrowRight size={16} />
+          </a>
         </div>
         <footer>用户账户由管理员开通 · x-api.gptibo.com</footer>
       </main>
@@ -1131,6 +1171,7 @@ export default function App() {
         'overview',
         'users',
         'orders',
+        'vouchers',
         'ledger',
         'products',
         'cards',

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { createHmac } from 'node:crypto'
 import worker from '../services/xgift/src/index.ts'
 import { createKey, createUser } from '../services/xgift/src/auth.ts'
@@ -26,15 +26,9 @@ type Context = Parameters<Parameters<typeof test>[1]>[0]
 function setup(t: Context) {
   const db = new DatabaseSync(':memory:')
   t.after(() => db.close())
-  db.exec(
-    readFileSync(
-      new URL(
-        '../services/xgift/migrations/0001_platform.sql',
-        import.meta.url,
-      ),
-      'utf8',
-    ),
-  )
+  const migrations = new URL('../services/xgift/migrations/', import.meta.url)
+  for (const name of readdirSync(migrations).filter((name) => /^\d+.*\.sql$/.test(name)).sort())
+    db.exec(readFileSync(new URL(name, migrations), 'utf8'))
   const states = new WeakMap<Statement, { sql: string; values: Value[] }>()
   const env: Env = {
     MASTER_KEY: 'a'.repeat(64),
@@ -447,7 +441,6 @@ test('admin can raise an existing account limit to 300 without changing its cred
 
 test('gift billing profile is admin-only, encrypted and does not enable payment or expose details to audits', async (t) => {
   const f = setup(t)
-  f.db.exec(readFileSync(new URL('../services/xgift/migrations/0003_gift_profile.sql', import.meta.url), 'utf8'))
   const route = '/api/admin/gift-profile'
   assert.equal((await f.call(route)).status, 401)
   const u = await f.user()
