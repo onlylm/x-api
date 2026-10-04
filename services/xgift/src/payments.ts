@@ -119,7 +119,12 @@ export async function configurePayments(env: Env, body: Row) {
   if (!env.NATIVE_EXECUTOR) fail('native_executor_unavailable', '当前运行环境不支持后台原生支付配置。', 409)
   const key = text(body.stripe_publishable_key, 'X 支付公钥', 248)
   if (!keyValid(key)) fail('invalid_input', '请填写从 X 官方客户端核实的 pk_live_ 公钥，不要填写私钥。')
-  const cardId = integer(body.card_id, '指定卡 ID')
+  // HTML selects submit strings. Normalize only exact decimal IDs here; keep
+  // strict numeric/range validation for card IDs and all other integer inputs.
+  const rawCardId = body.card_id
+  const numericCardId = typeof rawCardId === 'string' && /^[1-9][0-9]{0,9}$/.exec(rawCardId)?.[0] === rawCardId
+    ? Number(rawCardId) : rawCardId
+  const cardId = integer(numericCardId, '指定卡 ID')
   const providerRevision = text(body.provider_revision, '卡台配置版本', 64)
   const selected = await verifiedCard(env, cardId, providerRevision)
   const now = Math.max(Date.now(), (current?.updated_at ?? 0) + 1)

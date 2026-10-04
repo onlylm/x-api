@@ -121,6 +121,86 @@ test('configuration persists encrypted metadata, masks card data, and does not e
   assert.equal(s.state.executions, 0)
 })
 
+test('payment configuration accepts the card ID string sent by the admin form and reloads a numeric binding without payment side effects', async t => {
+  const s = await fixture(t)
+  const saved = await s.request('/api/admin/payments/config', await s.configurationBody({ card_id: '123' }), s.cookie)
+  assert.equal(saved.status, 200)
+  const view = (await saved.json()).data
+  assert.equal(view.selected_card.id, 123)
+  assert.equal(view.enabled, false)
+  assert.equal(view.execution_ready, false)
+  assert.equal(view.accepts_orders, false)
+  assert.deepEqual(s.state.calls, ['GET /openapi/v1/cards/123'])
+
+  const settings = await paymentSettings(s.env)
+  assert.equal(settings?.card_id, 123)
+  assert.equal(settings?.selected_card?.id, 123)
+  assert.equal(settings?.enabled, false)
+  const reloaded = await s.request('/api/admin/payments', undefined, s.cookie)
+  assert.equal(reloaded.status, 200)
+  const reloadedView = (await reloaded.json()).data
+  assert.equal(reloadedView.selected_card.id, 123)
+  assert.equal(reloadedView.revision, view.revision)
+  assert.equal(reloadedView.enabled, false)
+  const effective = await resolvePaymentEnv({ ...s.env, PAYMENT_SETTINGS: undefined })
+  assert.equal(effective.PAYMENT_SETTINGS?.card_id, 123)
+  assert.equal(effective.PAYMENTS_ENABLED, 'false')
+  await assert.rejects(paymentBinding(effective), (e: Failure) => e.code === 'payments_paused')
+
+  // Enable only the in-memory fixture to verify the saved ID can form a runtime binding.
+  await s.enable()
+  const binding = await paymentBinding(await resolvePaymentEnv(s.env))
+  assert.equal(binding?.card_id, 123)
+  assert.equal(binding?.revision, view.revision)
+  assert.deepEqual(s.state.calls, ['GET /openapi/v1/cards/123', 'GET /openapi/v1/cards/123'])
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM native_funding').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 0)
+  assert.equal(s.state.executions, 0)
+})
+
+test('payment configuration accepts canonical decimal card ID strings and retains numeric boundary compatibility', async t => {
+  const s = await fixture(t)
+  for (const cardId of ['1', '1000000000', 1, 123, 1000000000]) {
+    const saved = await s.request('/api/admin/payments/config', await s.configurationBody({ card_id: cardId }), s.cookie)
+    assert.equal(saved.status, 200, `card_id=${JSON.stringify(cardId)}`)
+    const view = (await saved.json()).data
+    assert.equal(view.selected_card.id, Number(cardId))
+    assert.equal(view.enabled, false)
+    assert.equal((await paymentSettings(s.env))?.card_id, Number(cardId))
+    assert.equal(s.state.calls.at(-1), `GET /openapi/v1/cards/${Number(cardId)}`)
+  }
+  assert.equal(s.state.calls.length, 5)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM native_funding').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 0)
+  assert.equal(s.state.executions, 0)
+})
+
+test('payment configuration rejects malformed card IDs before provider access or persistence', async t => {
+  const s = await fixture(t)
+  const invalidCardIds = [
+    '', ' ', '\t\n', ' 123', '123 ', '0', '00', '0123', '+123', '-1', '1.5', '123.0',
+    '1e2', '1E2', '0x7b', 'NaN', 'Infinity', '1000000001', '9999999999', '10000000000',
+    '123/../../orders', '123?sync=0', '123#fragment', '123\n',
+    0, -1, 1.5, 1000000001, null, true, false, [], [123], {}, { id: 123 }, undefined,
+  ]
+  for (const cardId of invalidCardIds) {
+    const response = await s.request('/api/admin/payments/config', await s.configurationBody({ card_id: cardId }), s.cookie)
+    const label = `card_id=${JSON.stringify(cardId)}`
+    assert.equal(response.status, 400, label)
+    assert.equal((await response.json()).error.code, 'invalid_input', label)
+    assert.equal(await paymentSettings(s.env), null, label)
+    assert.equal(s.state.calls.length, 0, label)
+  }
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM payment_settings').get()!.n, 0)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='configure_payments'").get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM native_funding').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 0)
+  assert.equal(s.state.executions, 0)
+})
+
 test('configuration rejects private keys, unsupported runtimes, stale versions and unready cards without changing persisted settings', async t => {
   const s = await fixture(t)
   await assert.rejects(s.save({ stripe_publishable_key: 'sk_live_privatefixture' }), (e: Failure) => e.code === 'invalid_input')
