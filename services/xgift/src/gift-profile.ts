@@ -6,7 +6,6 @@ export const giftPolicy = {
   initial_card_usd_cents: 2000,
   max_open_fee_usd_cents: 50,
   daily_funding_usd_cents: 2000,
-  initial_order_limit: 1,
   initial_order_max_usd_cents: 1000,
 } as const
 

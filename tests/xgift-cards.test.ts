@@ -340,10 +340,10 @@ test('card admin routes require session and same-origin writes and never return 
     path: string,
     body?: unknown,
     cookie = '',
-    origin = 'https://x-api.gptibo.com',
+    origin = 'https://x-api.example.test',
   ) =>
     worker.fetch(
-      new Request('https://x-api.gptibo.com' + path, {
+      new Request('https://x-api.example.test' + path, {
         method: body ? 'POST' : 'GET',
         headers: {
           Cookie: cookie,

@@ -94,6 +94,7 @@ async function fixture(t: Context, enabled = true) {
     return Response.json({ data: { user: { result: { rest_id: '12345', core: { screen_name: username }, premium_gifting_eligible: true } } } })
   })
   db.exec('UPDATE products SET enabled=1,points=months/3*1700')
+  db.exec('UPDATE order_admission SET enabled=1')
   await saveSecret(env, 'sec_fixtureaccount', 'account', { name: 'Fixture sender', auth_token: 'fixture-auth', ct0: 'fixture-csrf' })
   const provider = await configureCards(env, cardConfig)
   await configureGiftProfile(env, { first_name: 'Test', last_name: 'User', billing_email: 'test@example.test', billing_country: 'HK' })
@@ -868,7 +869,7 @@ test('pending invoice locks merchant and price configuration updates', async t =
   assert.equal((await f.status(body)).amount_cny, '88.80')
 })
 
-test('pending checkout reserves first-order capacity against direct API gift creation', async t => {
+test('pending checkout reserves shared daily capacity against direct API gift creation', async t => {
   const f = await fixture(t)
   await createCheckout(f.env, purchase())
   const user = await createUser(f.env, { name: 'Fixture partner', email: 'fixture@example.test', password: 'fixture-user-password' })

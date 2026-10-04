@@ -12,7 +12,7 @@ try {
 } catch (error) {
   if (error.code !== 'ENOENT') throw error
   data = {
-    url: 'https://x-api.gptibo.com',
+    url: 'https://x.aifu.me',
     admin_username: 'admin',
     admin_password: randomBytes(24).toString('base64url'),
     master_key: randomBytes(32).toString('hex'),

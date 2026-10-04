@@ -12,7 +12,7 @@ import worker from '../services/xgift/src/index.ts'
 
 type Context = Parameters<Parameters<typeof test>[1]>[0]
 type Issued = { id: string; code: string; product_code: string; expires_at: number }
-const origin = 'https://x-api.gptibo.com'
+const origin = 'https://x-api.example.test'
 const password = 'voucher-test-user-password'
 
 async function fixture(t: Context, points = 1000) {
@@ -85,23 +85,24 @@ async function fixture(t: Context, points = 1000) {
   const native = () => {
     env.STRIPE_PUBLISHABLE_KEY = 'pk_live_fixture'
     env.LOCAL_EXECUTOR = async () => { throw new Error('Tests must not execute payments') }
+    db.exec('UPDATE order_admission SET enabled=1')
   }
   return { db, env, owner, upstream, call, login, admin, issue, inspect, redeem, wallet, native }
 }
 
-test('anonymous capabilities expose only availability and modes and follow the shared first-order limit', async t => {
+test('anonymous capabilities expose availability, reason and modes and follow shared daily admission', async t => {
   const f = await fixture(t)
   const available = await f.call('/api/capabilities')
   assert.equal(available.status, 200)
   assert.equal(available.headers.get('Cache-Control'), 'no-store')
   assert.deepEqual(await available.json(), {
-    data: { execution_ready: true, accepts_orders: true, modes: ['direct', 'voucher'] },
+    data: { execution_ready: true, accepts_orders: true, reason: null, modes: ['direct', 'voucher'] },
   })
   f.env.PAYMENTS_ENABLED = 'false'
   const paused = await f.call('/api/capabilities')
   assert.equal(paused.status, 200)
   assert.deepEqual(await paused.json(), {
-    data: { execution_ready: false, accepts_orders: false, modes: ['direct', 'voucher'] },
+    data: { execution_ready: false, accepts_orders: false, reason: 'execution_unavailable', modes: ['direct', 'voucher'] },
   })
   f.env.PAYMENTS_ENABLED = 'true'
   f.native()
@@ -112,7 +113,7 @@ test('anonymous capabilities expose only availability and modes and follow the s
   const full = await f.call('/api/capabilities')
   assert.equal(full.status, 200)
   assert.deepEqual(await full.json(), {
-    data: { execution_ready: true, accepts_orders: false, modes: ['direct', 'voucher'] },
+    data: { execution_ready: true, accepts_orders: false, reason: 'order_in_progress', modes: ['direct', 'voucher'] },
   })
   assert.equal(f.upstream.calls, 1, 'capability checks must not query upstream accounts')
 })
@@ -397,7 +398,7 @@ test('redemption rechecks identity and eligibility and applies the merchant pric
   assert.equal(f.db.prepare('SELECT recipient_id,points FROM orders').get()!.recipient_id, '12345')
 })
 
-test('native first-order admission covers direct and voucher modes without consuming the blocked voucher', async t => {
+test('native daily admission covers direct and voucher modes without consuming the blocked voucher', async t => {
   const f = await fixture(t)
   f.native()
   const [voucher] = (await f.issue()).vouchers

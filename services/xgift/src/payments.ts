@@ -1,6 +1,7 @@
 import { audit, booleanInt, fail, id, integer, seal, text, unseal, type Env } from './core.ts'
 import { cardConfiguration, cardRead } from './cards.ts'
 import { giftProfile, type GiftProfile } from './gift-profile.ts'
+import { admissionView } from './admission.ts'
 
 type Row = Record<string, unknown>
 type StoredRow = { enabled: number; revision: string; payload: string; updated_at: number }
@@ -74,11 +75,10 @@ export async function paymentView(env: Env) {
   const counts = await env.DB.prepare(`SELECT
     ((SELECT COUNT(*) FROM orders WHERE status IN('queued','running','unknown')) +
      (SELECT COUNT(*) FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention'))) pending,
-    (SELECT COUNT(*) FROM orders WHERE status<>'failed') used,
     (SELECT COUNT(*) FROM secrets WHERE kind='account' AND enabled=1) accounts,
     (SELECT COUNT(*) FROM products WHERE enabled=1 AND currency='bdt' AND
       ((months=3 AND amount_minor=30000 AND stripe_product='prod_TJXJtpzqCpI36N') OR
-       (months=6 AND amount_minor=60000 AND stripe_product='prod_TJXKKNJwZJIhCM'))) products`).first<{ pending: number; used: number; accounts: number; products: number }>()
+       (months=6 AND amount_minor=60000 AND stripe_product='prod_TJXKKNJwZJIhCM'))) products`).first<{ pending: number; accounts: number; products: number }>()
   const native = !!env.NATIVE_EXECUTOR
   const card = settings?.selected_card ?? null
   const checks = [
@@ -95,6 +95,7 @@ export async function paymentView(env: Env) {
   ]
   const ready = checks.every(c => c.ok)
   const effective = await resolvePaymentEnv(env)
+  const admission = await admissionView(effective)
   const execution = !!effective.LOCAL_EXECUTOR && effective.PAYMENTS_ENABLED === 'true' && keyValid(effective.STRIPE_PUBLISHABLE_KEY ?? '')
   return {
     configured: !!settings?.card_id, revision: settings?.revision ?? null,
@@ -104,8 +105,8 @@ export async function paymentView(env: Env) {
     card_checked_at: settings?.card_checked_at ?? null,
     provider_revision: config.revision, selected_provider_revision: settings?.provider_revision ?? null,
     checks, ready_to_enable: ready, execution_ready: execution,
-    accepts_orders: execution && (counts?.used ?? 0) === 0,
-    initial_order_limit: 1, has_unsettled_orders: (counts?.pending ?? 0) > 0,
+    accepts_orders: execution && admission.accepts_orders,
+    admission, has_unsettled_orders: (counts?.pending ?? 0) > 0,
   }
 }
 

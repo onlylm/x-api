@@ -28,7 +28,6 @@ type PaymentView = {
   ready_to_enable: boolean
   execution_ready: boolean
   accepts_orders: boolean
-  initial_order_limit: number
   has_unsettled_orders: boolean
 }
 type PaymentCardResponse = Omit<PaymentCard, 'id'> & { id: string | number }
@@ -180,7 +179,7 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
       setStatusError(''); setCheckedAt(Date.now()); setConfirmOpen(false); setConfirmation('')
       setMessage(kind === 'save' ? '配置已保存，X 付款仍关闭。检查通过后可单独启用。'
         : kind === 'disable' ? 'X 付款已停用。请继续核对未结订单的处理结果。'
-        : next.accepts_orders ? 'X 付款已启用，当前允许首单验收。' : 'X 付款已启用，当前接单状态见下方检查。')
+        : next.accepts_orders ? 'X 付款已启用，当前允许在每日接单额度内接单。' : 'X 付款已启用；新单还须通过上方每日接单设置与未结订单检查。')
     } catch (error) {
       if (!mounted.current) return
       setActionError(errorText(error) + ' 请刷新状态后核对结果。')
@@ -215,7 +214,7 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
           <span className={`status ${view.enabled ? 'status-ACTIVE' : ''}`}>{view.enabled ? 'X 付款已启用' : 'X 付款已关闭'}</span>
           <span>{view.accepts_orders ? '当前可接单' : '当前不接新单'}</span>
           <span>{view.execution_ready ? '执行条件已就绪' : '执行条件未就绪'}</span>
-          <span>首单验收限 {view.initial_order_limit} 笔</span>
+          <span>接单上限在上方“每日接单设置”中调整</span>
         </div>
         <ul className="payment-checks" aria-label="X 付款条件检查">
           {view.checks.map((check) => <li key={check.code}>
@@ -279,7 +278,7 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
         <Dialog size="lg" className="x-modal">
           <form onSubmit={(event) => { event.preventDefault(); void mutate('enable') }}>
             <Dialog.Title className="modal-title">确认启用 X 付款</Dialog.Title>
-            <Dialog.Description className="modal-description">将使用已保存的指定卡支付 X 赠送订单，可能产生真实扣款。首单验收限 1 笔；遇到 3DS 验证需人工处理。</Dialog.Description>
+            <Dialog.Description className="modal-description">将使用已保存的指定卡支付 X 赠送订单，可能产生真实扣款。新增接单还受后台每日额度与接单开关控制；遇到 3DS 验证需人工处理。</Dialog.Description>
             {view?.selected_card && <p className="note">{cardLabel(view.selected_card)}</p>}
             <Input label="输入 ENABLE_PAYMENTS 确认" value={confirmation} autoComplete="off" spellCheck={false} disabled={!!busy} onChange={(event) => setConfirmation(event.target.value)} />
             {!busy && !statusLoading && !canEnable && <p className="notice error" role="alert">当前条件不允许启用，请关闭此窗口并查看最新检查结果。</p>}

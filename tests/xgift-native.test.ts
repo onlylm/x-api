@@ -26,6 +26,7 @@ async function fixture(t: Context) {
   t.after(() => db.close())
   const env: Env = { DB, MASTER_KEY: 'a'.repeat(64), ADMIN_PASSWORD: 'test-admin-password-only', PAYMENTS_ENABLED: 'true', STRIPE_PUBLISHABLE_KEY: 'pk_live_fixture', ASSETS: { fetch: async () => new Response('asset') } }
   env.LOCAL_EXECUTOR = (o, s) => executeNative(env, o, s)
+  db.exec('UPDATE order_admission SET enabled=1')
   const user = await createUser(env, { name: 'Test', email: 'test@example.test', password: 'test-password-fixture' })
   const key = await createKey(env, user.id, 'test')
   await credit(env, user.id, { points: 10000, reference: 'fixture-fund', note: 'Fixture credit' }, 'fixture')
@@ -77,14 +78,14 @@ async function fixture(t: Context) {
   const create = (extra = {}) => createOrder(env, user.id, 'fixture-001', { ...body, ...extra })
   async function tick() { db.exec('UPDATE orders SET next_check=0'); return reconcile(env) }
   async function signedRequest(path: string, body: Record<string, unknown>, nonce = crypto.randomUUID()) {
-    const url = new URL('https://x-api.gptibo.com' + path), raw = JSON.stringify(body), ts = String(Math.floor(Date.now() / 1000)), idem = 'check:fixture'
+    const url = new URL('https://x-api.example.test' + path), raw = JSON.stringify(body), ts = String(Math.floor(Date.now() / 1000)), idem = 'check:fixture'
     return new Request(url, { method: 'POST', body: raw, headers: { 'Content-Type': 'application/json', 'X-Partner-Id': user.id, 'X-Key-Id': key.key_id, 'X-Timestamp': ts, 'X-Nonce': nonce, 'Idempotency-Key': idem, 'X-Signature': await signature(key.secret, 'POST', url, ts, nonce, key.key_id, idem, raw) } })
   }
   return { env, db, user, state, create, tick, signedRequest }
 }
 test('signed eligibility authenticates, normalizes, rejects replay, and never touches wallet or payment APIs', async t => {
   const s = await fixture(t)
-  const unsigned = await worker.fetch(new Request('https://x-api.gptibo.com/v1/eligibility', { method: 'POST', body: '{"username":"receiver"}' }), s.env)
+  const unsigned = await worker.fetch(new Request('https://x-api.example.test/v1/eligibility', { method: 'POST', body: '{"username":"receiver"}' }), s.env)
   assert.equal(unsigned.status, 401)
   const request = await s.signedRequest('/v1/eligibility', { username: '@Receiver' })
   const response = await worker.fetch(request.clone(), s.env)
@@ -95,7 +96,7 @@ test('signed eligibility authenticates, normalizes, rejects replay, and never to
   assert.equal(s.state.cardOpens + s.state.xCreates + s.state.confirms, 0)
   assert.equal(s.db.prepare('SELECT available FROM wallets').get()!.available, 10000)
 })
-test('native create binds recipient identity, point price and one-gift capacity atomically', async t => {
+test('native create binds recipient identity, point price and the configured daily capacity atomically', async t => {
   const s = await fixture(t)
   await assert.rejects(s.create({ expected_points: 1 })); await assert.rejects(s.create({ recipient_id: '999' }))
   const created = await s.create(); assert.equal(created.order.points, 1700)

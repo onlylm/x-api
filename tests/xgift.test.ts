@@ -78,10 +78,10 @@ function setup(t: Context) {
     path: string,
     data?: unknown,
     cookie = '',
-    origin = 'https://x-api.gptibo.com',
+    origin = 'https://x-api.example.test',
   ) =>
     worker.fetch(
-      new Request('https://x-api.gptibo.com' + path, {
+      new Request('https://x-api.example.test' + path, {
         method: data === undefined ? 'GET' : 'POST',
         headers: {
           Origin: origin,
@@ -133,7 +133,7 @@ function setup(t: Context) {
     timestamp = String(Math.floor(Date.now() / 1000)),
     idem = 'signed-order-001',
   ) => {
-    const url = new URL('https://x-api.gptibo.com' + path),
+    const url = new URL('https://x-api.example.test' + path),
       raw = body === undefined ? '' : JSON.stringify(body),
       method = body === undefined ? 'GET' : 'POST'
     const headers = {
@@ -638,7 +638,7 @@ test('tampering with an already signed order body cannot reserve any points', as
     u = await f.user()
   await f.fund(u.id)
   const key = await createKey(f.env, u.id, 'test')
-  const url = new URL('https://x-api.gptibo.com/v1/orders'),
+  const url = new URL('https://x-api.example.test/v1/orders'),
     timestamp = String(Math.floor(Date.now() / 1000)),
     nonce = crypto.randomUUID(),
     idem = 'tampered-order-001'
@@ -730,10 +730,10 @@ test('expired sessions and nonces are cleaned without touching ledger', async (t
 test('production requires HTTPS while local preview rewrites only an explicit loopback origin', async (t) => {
   const f = setup(t)
   const request = () =>
-    new Request('http://x-api.gptibo.com/api/login', {
+    new Request('http://x-api.example.test/api/login', {
       method: 'POST',
       headers: {
-        Origin: 'http://x-api.gptibo.com',
+        Origin: 'http://x-api.example.test',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ email: 'admin', password: f.env.ADMIN_PASSWORD }),

@@ -267,7 +267,7 @@ export function Redeem({ request }: { request: Request }) {
         <a className="login-brand" href="/">
           <span className="brand-mark">X</span>
           <span>
-            GPTibo <b>/</b> X Premium
+            Bugan.cn <b>/</b> X Premium
           </span>
         </a>
         <a className="text-link" href="/">

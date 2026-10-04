@@ -2,12 +2,13 @@ import {
   fail,
   id,
   integer,
-  secureEndpoint,
   sha256,
   text,
   type Env,
 } from './core.ts'
 import { eligibility } from './network.ts'
+import { activeOrdersSql, admissionView, alipaySettlementId, executionReady, newAdmissionSql } from './admission.ts'
+export { executionReady } from './admission.ts'
 export interface Order {
   recipient_id?: string | null
   mode?: 'direct' | 'voucher'
@@ -35,18 +36,6 @@ export interface Order {
   next_check: number
   work_token: string | null
 }
-export function executionReady(env: Env) {
-  try {
-    if (env.LOCAL_EXECUTOR) return env.PAYMENTS_ENABLED === 'true' && /^pk_live_[A-Za-z0-9]+$/.test(env.STRIPE_PUBLISHABLE_KEY ?? '')
-    return (
-      env.PAYMENTS_ENABLED === 'true' &&
-      !!secureEndpoint(env.EXECUTOR_URL) &&
-      (env.EXECUTOR_SECRET?.length ?? 0) >= 32
-    )
-  } catch {
-    return false
-  }
-}
 export function publicOrder(o: Order) {
   return {
     id: o.id,
@@ -65,13 +54,14 @@ export function publicOrder(o: Order) {
   }
 }
 export async function orderCapabilities(env: Env) {
-  const row = env.LOCAL_EXECUTOR
-    ? await env.DB.prepare("SELECT COUNT(*) n FROM orders WHERE status<>'failed'").first<{ n: number }>()
-    : null
-  const ready = executionReady(env)
+  // Preserve the established external-executor API behavior; these limits guard
+  // the native executor's shared payment card.
+  const admission = env.LOCAL_EXECUTOR ? await admissionView(env) : null
+  const ready = admission?.execution_ready ?? executionReady(env)
   return {
     execution_ready: ready,
-    accepts_orders: ready && (!row || row.n === 0),
+    accepts_orders: admission?.accepts_orders ?? ready,
+    reason: admission?.reason ?? (ready ? null : 'execution_unavailable'),
     modes: ['direct', 'voucher'],
   }
 }
@@ -97,7 +87,7 @@ export async function createOrder(
     fail('invalid_mode', '卡密订单请使用卡密兑换入口。')
   if (options.voucherId && !/^vch_[a-f0-9]{32}$/.test(options.voucherId))
     fail('invalid_input', '卡密编号无效。')
-  if (options.alipayCheckoutId && (userId !== 'usr_' + '0'.repeat(28) + 'a11a' ||
+  if (options.alipayCheckoutId && (userId !== alipaySettlementId ||
       !/^chk_[a-f0-9]{32}$/.test(options.alipayCheckoutId) || options.voucherId))
     fail('invalid_input', '支付宝系统结算授权无效。')
   if (!/^[A-Za-z0-9_.:-]{8,128}$/.test(idem))
@@ -112,6 +102,8 @@ export async function createOrder(
     !/^[A-Za-z0-9_.:-]{1,128}$/.test(merchant)
   )
     fail('invalid_input', '订单号或 X 用户名格式无效。')
+  if (options.alipayCheckoutId && (merchant !== 'alipay:' + options.alipayCheckoutId || idem !== merchant))
+    fail('invalid_input', '支付宝结算订单标识不匹配。')
   const checkIdentity = !!env.LOCAL_EXECUTOR || !!options.voucherId || body.recipient_id !== undefined
   const checkPrice = !!env.LOCAL_EXECUTOR || !!options.voucherId || body.expected_points !== undefined
   // Retain the old digest for existing direct API callers and native orders.
@@ -161,11 +153,23 @@ export async function createOrder(
   }
   const orderId = id('ord'),
     now = Date.now()
+  // Paid checkouts already reserved their slot. Admission changes and midnight
+  // must not strand that payment; retain all identity, product, payment revision
+  // and shared-card serialization checks when converting the reservation.
+  const admissionSql = options.alipayCheckoutId
+    ? `NOT EXISTS(${activeOrdersSql})
+      AND NOT EXISTS(SELECT 1 FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention') AND id<>?)
+      AND EXISTS(SELECT 1 FROM alipay_checkouts a WHERE a.id=? AND a.paid_at IS NOT NULL AND a.status='paid'
+        AND a.order_id IS NULL AND a.failure_code IS NULL AND a.product_code=p.code AND a.recipient=? AND a.recipient_id=?
+        AND a.points=COALESCE(up.points,p.points) AND a.currency=p.currency AND a.amount_minor=p.amount_minor
+        AND a.stripe_product=p.stripe_product AND a.months=p.months
+        AND EXISTS(SELECT 1 FROM payment_settings WHERE id=1 AND enabled=1 AND revision=a.outbound_revision))`
+    : newAdmissionSql(now)
   try {
     const row = await env.DB.prepare(
       `INSERT INTO orders(id,user_id,merchant_order_no,idempotency_key,request_hash,product_code,recipient,points,currency,amount_minor,stripe_product,months,created_at,updated_at,recipient_id,mode,voucher_id)
    SELECT ?,u.id,?,?,?,?,?,COALESCE(up.points,p.points),p.currency,p.amount_minor,p.stripe_product,p.months,?,?,?,?,?
-   FROM users u JOIN products p ON p.code=? LEFT JOIN user_prices up ON up.user_id=u.id AND up.product_code=p.code WHERE u.id=? AND u.enabled=1 AND p.enabled=1${checkPrice ? ' AND COALESCE(up.points,p.points)=?' : ''}${env.LOCAL_EXECUTOR ? " AND NOT EXISTS(SELECT 1 FROM orders WHERE status<>'failed') AND (NOT EXISTS(SELECT 1 FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention')) OR EXISTS(SELECT 1 FROM alipay_checkouts a WHERE a.id=? AND a.paid_at IS NOT NULL AND a.status='paid' AND a.product_code=p.code AND a.recipient=? AND a.recipient_id=? AND a.points=COALESCE(up.points,p.points) AND a.currency=p.currency AND a.amount_minor=p.amount_minor AND a.stripe_product=p.stripe_product AND a.months=p.months))" : ''}${env.PAYMENT_SETTINGS ? ' AND EXISTS(SELECT 1 FROM payment_settings WHERE id=1 AND enabled=1 AND revision=?)' : ''} RETURNING *`,
+   FROM users u JOIN products p ON p.code=? LEFT JOIN user_prices up ON up.user_id=u.id AND up.product_code=p.code WHERE u.id=? AND u.enabled=1 AND p.enabled=1${checkPrice ? ' AND COALESCE(up.points,p.points)=?' : ''}${env.LOCAL_EXECUTOR ? ' AND (' + admissionSql + ')' : ''}${env.PAYMENT_SETTINGS ? ' AND EXISTS(SELECT 1 FROM payment_settings WHERE id=1 AND enabled=1 AND revision=?)' : ''} RETURNING *`,
     )
       .bind(
         orderId,
@@ -182,12 +186,12 @@ export async function createOrder(
         product,
         userId,
         ...(checkPrice ? [Number(body.expected_points)] : []),
-        ...(env.LOCAL_EXECUTOR ? [options.alipayCheckoutId ?? '', recipient, recipientId] : []),
+        ...(env.LOCAL_EXECUTOR && options.alipayCheckoutId ? [options.alipayCheckoutId, options.alipayCheckoutId, recipient, recipientId] : []),
         ...(env.PAYMENT_SETTINGS ? [env.PAYMENT_SETTINGS.revision] : []),
       )
       .first<Order>()
     if (!row)
-      return fail('product_unavailable', '商品或账户不可用、点数价格已变化，或当前验收名额已用尽。', 409)
+      return fail('product_unavailable', '商品或账户不可用、点数价格已变化，或接单已暂停、今日额度已用完、原订单仍待处理。', 409)
     return { order: publicOrder(row), created: true }
   } catch (e) {
     const raced = await existing()

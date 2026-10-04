@@ -13,6 +13,7 @@ import { Table } from '@cloudflare/kumo/components/table'
 import { DirectRecharge, Redeem } from './Recharge'
 import { Vouchers } from './Vouchers'
 import { PaymentSettings } from './PaymentSettings'
+import { AdmissionSettings } from './AdmissionSettings'
 import { AlipaySettings } from './AlipaySettings'
 import { Checkout } from './Checkout'
 import {
@@ -608,7 +609,7 @@ function Workspace() {
               ))}
             </dl>
             <p className="note">
-              首单验收最多处理 1 笔真实赠送；指定卡的限额以卡台设置为准，已有订单持续核对。
+              新增接单受后台每日额度与付款状态控制；指定卡的限额以卡台设置为准，已有订单持续核对。
             </p>
           </>
         )
@@ -1131,7 +1132,7 @@ function Workspace() {
         <div className="login-brand">
           <span className="brand-mark">X</span>
           <span>
-            GPTibo <b>/</b> X API
+            Bugan.cn <b>/</b> X API
           </span>
         </div>
         <div className="login-form-wrap">
@@ -1195,7 +1196,7 @@ function Workspace() {
         <a className="brand" href="/">
           <span className="brand-mark">X</span>
           <span>
-            X API<small>GPTibo</small>
+            X API<small>Bugan.cn</small>
           </span>
         </a>
         <div className="nav-group-label">
@@ -1279,6 +1280,7 @@ function Workspace() {
         )}
         <div className="page-content" key={section}>
           {admin && section === 'cards' && <>
+            <AdmissionSettings request={api} onError={onError} />
             <PaymentSettings request={api} onError={onError} />
             <AlipaySettings request={api} onError={onError} />
           </>}
@@ -1537,7 +1539,7 @@ function Cards({ data, pager, form, actionButton, toolbar }: CardsProps) {
       {toolbar('持卡人账单资料', actionButton(giftProfile.configured ? '修改账单资料' : '填写账单资料', configureGift))}
       <p className="note">
         {giftProfile.configured ? '账单资料已保存，接收用户名由每笔商城订单提供。' : '请补齐持卡人姓名、账单邮箱与国家；接收用户名在商城下单时填写。'}
-        {' '}X 付款使用上方选定的已有卡，不会自动开卡、充值或换卡。首单验收限 1 单；保存账单资料不会启用付款。
+        {' '}X 付款使用上方选定的已有卡，不会自动开卡、充值或换卡。新增接单受后台每日额度控制；保存账单资料不会启用付款。
       </p>
       {!config.configured ? (
         <div className="setup-empty">

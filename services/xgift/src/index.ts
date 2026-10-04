@@ -44,6 +44,7 @@ import {
 } from './network.ts'
 import { giftProfile, configureGiftProfile } from './gift-profile.ts'
 import { configurePayments, paymentView, resolvePaymentEnv, setPaymentsEnabled } from './payments.ts'
+import { admissionView, configureAdmission, pauseAdmission } from './admission.ts'
 import { alipayNotification, alipayOrders, alipayView, checkoutCatalog, checkoutEligibility, checkoutStatus,
   configureAlipay, createCheckout, enableAlipay, reconcileAlipay } from './alipay-payments.ts'
 import {
@@ -256,6 +257,9 @@ async function route(request: Request, env: Env): Promise<Response> {
         await cardWrite(env, cardMutation[1] as 'open' | 'recharge', data),
       )
     if (path === '/api/admin/payments' && method === 'GET') return json(await paymentView(env))
+    if (path === '/api/admin/admission' && method === 'GET') return json(await admissionView(await resolvePaymentEnv(env)))
+    if (path === '/api/admin/admission/config' && method === 'POST') return json(await configureAdmission(await resolvePaymentEnv(env), data))
+    if (path === '/api/admin/admission/enabled' && method === 'POST') return json(await pauseAdmission(env, data))
     if (path === '/api/admin/alipay' && method === 'GET') return json(await alipayView(env))
     if (path === '/api/admin/alipay/config' && method === 'POST') return json(await configureAlipay(env, data))
     if (path === '/api/admin/alipay/enabled' && method === 'POST') return json(await enableAlipay(env, data))
@@ -623,7 +627,7 @@ export default {
           ),
         )
       const path = new URL(request.url).pathname
-      const bypassPaymentResolution = path.startsWith('/api/admin/payments') || path.startsWith('/api/admin/alipay') || path === '/api/alipay/notify'
+      const bypassPaymentResolution = path.startsWith('/api/admin/payments') || path.startsWith('/api/admin/admission') || path.startsWith('/api/admin/alipay') || path === '/api/alipay/notify'
       return secure(await route(request, bypassPaymentResolution ? env : await resolvePaymentEnv(env)))
     } catch (e) {
       return secure(

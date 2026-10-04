@@ -1,5 +1,5 @@
 [Unit]
-Description=GPTibo independent X API
+Description=Bugan.cn independent X API
 After=network-online.target
 Wants=network-online.target
 

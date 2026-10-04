@@ -3,6 +3,7 @@ import type { AlipayConfig } from '../server/alipay.ts'
 import { eligibility } from './network.ts'
 import { createOrder, credit, orderCapabilities, type Order } from './orders.ts'
 import { paymentSettings, resolvePaymentEnv } from './payments.ts'
+import { alipaySettlementId, newAdmissionSql } from './admission.ts'
 
 type Row = Record<string, unknown>
 type Settings = { enabled: boolean; revision: string; updated_at: number; config: AlipayConfig }
@@ -17,7 +18,7 @@ type Checkout = {
   created_at: number; expires_at: number; updated_at: number; next_check: number; lease_until: number; work_token: string | null;
 }
 const pendingSql = "SELECT 1 FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention')"
-const settlementId = 'usr_' + '0'.repeat(28) + 'a11a'
+const settlementId = alipaySettlementId
 const money = (cents: number) => `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')}`
 function cents(value: unknown, allowZero = false) {
   if (typeof value !== 'string' || !/^(0|[1-9]\d{0,4})(\.\d{1,2})?$/.test(value))
@@ -223,12 +224,12 @@ export async function createCheckout(env: Env, body: Row) {
       AND EXISTS(SELECT 1 FROM payment_settings WHERE id=1 AND enabled=1 AND revision=?)
       AND EXISTS(SELECT 1 FROM products p JOIN alipay_prices a ON a.product_code=p.code WHERE p.code=? AND p.enabled=1 AND a.enabled=1
         AND a.amount_cents=? AND p.months=? AND p.points=? AND p.currency=? AND p.amount_minor=? AND p.stripe_product=?)
-      AND NOT EXISTS(SELECT 1 FROM orders WHERE status<>'failed') AND NOT EXISTS(${pendingSql}) RETURNING *`)
+      AND (${newAdmissionSql(now)}) RETURNING *`)
       .bind(checkoutId, accessHash, digest, 'xgift_' + requestId, code, String(product.name), Number(product.months), Number(product.points),
         String(product.currency), Number(product.amount_minor), String(product.stripe_product), Number(product.amount_cents), username, recipientId,
         settings.revision, payment.revision, payload, now, expires, now, now + 15000, now + 45000, settings.revision, payment.revision,
         code, expectedAmount, Number(product.months), Number(product.points), String(product.currency), Number(product.amount_minor), String(product.stripe_product)).first<Checkout>()
-    if (!inserted) return fail('checkout_unavailable', '服务状态或验收名额已变化，请刷新。', 409)
+    if (!inserted) return fail('checkout_unavailable', '接单状态、今日额度或原订单处理状态已变化，请刷新。', 409)
     await precreate(env, inserted)
     await env.DB.prepare('UPDATE alipay_checkouts SET lease_until=0 WHERE id=? AND work_token IS NULL').bind(checkoutId).run()
     return publicCheckout(env, (await record(env, checkoutId))!)
