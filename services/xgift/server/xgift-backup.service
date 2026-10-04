@@ -1,0 +1,13 @@
+[Unit]
+Description=Back up X API SQLite database
+
+[Service]
+Type=oneshot
+User=xgift
+Group=xgift
+ExecStart=/opt/node/bin/node --experimental-strip-types /opt/xgift/current/services/xgift/server/backup.ts /srv/xgift/data/xgift.sqlite /srv/xgift/backups
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/xgift

@@ -1,0 +1,25 @@
+[Unit]
+Description=GPTibo independent X API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xgift
+Group=xgift
+WorkingDirectory=/opt/xgift/current
+EnvironmentFile=/etc/xgift/service.env
+ExecStart=/opt/node/bin/node --experimental-strip-types services/xgift/server/main.ts
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=35
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/xgift
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

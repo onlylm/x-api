@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily X API SQLite backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

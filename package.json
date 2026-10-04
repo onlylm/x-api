@@ -1,0 +1,41 @@
+{
+  "name": "gptibo-x-api",
+  "version": "0.4.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "postinstall": "npm ci --prefix services/xgift/server",
+    "build": "npm run xgift:build",
+    "check": "npm run xgift:check",
+    "test": "node --test tests/*.test.ts",
+    "test:gateway": "python tests/xgift_gateway_test.py",
+    "start": "npm run xgift:server",
+    "xgift:check": "tsc -p services/xgift/tsconfig.json && tsc -p services/xgift/tsconfig.web.json",
+    "xgift:build": "npm run xgift:check && vite build --config services/xgift/vite.config.ts",
+    "xgift:frontend": "vite --config services/xgift/vite.config.ts",
+    "xgift:server": "node --experimental-strip-types services/xgift/server/main.ts",
+    "xgift:dev": "npm run xgift:build && wrangler dev --config services/xgift/wrangler.jsonc --port 8791",
+    "xgift:deploy": "npm run xgift:build && wrangler deploy --config services/xgift/wrangler.jsonc"
+  },
+  "dependencies": {
+    "@cloudflare/kumo": "^2.14.0",
+    "@fontsource-variable/geist": "^5.3.0",
+    "@phosphor-icons/react": "^2.1.10",
+    "@tailwindcss/vite": "^4.3.3",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwindcss": "^4.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0",
+    "wrangler": "^4.141.0"
+  }
+}

@@ -1,0 +1,555 @@
+import {
+  createKey,
+  createUser,
+  login,
+  logout,
+  session,
+  setUserEnabled,
+  signedUser,
+} from './auth.ts'
+import {
+  audit,
+  booleanInt,
+  browserWrite,
+  fail,
+  Failure,
+  id,
+  integer,
+  json,
+  parseBody,
+  rawBody,
+  text,
+  passwordHash,
+  token,
+  type Env,
+} from './core.ts'
+import { cleanup, reconcile } from './executor.ts'
+import {
+  cardConfiguration,
+  configureCards,
+  cardRead,
+  cardWrite,
+  cardOperations,
+  resolveCardOperation,
+} from './cards.ts'
+import {
+  proxyTest,
+  quote,
+  saveSecret,
+  secretList,
+  updateAccountLimit,
+  eligibility,
+} from './network.ts'
+import { giftProfile, configureGiftProfile } from './gift-profile.ts'
+import {
+  createOrder,
+  credit,
+  executionReady,
+  getOrder,
+  pagination,
+  products,
+  publicOrder,
+  type Order,
+} from './orders.ts'
+import { configureWebhook, deliverWebhook } from './webhooks.ts'
+async function route(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url),
+    path = url.pathname,
+    method = request.method
+  if (path === '/healthz' && method === 'GET')
+    return json({ ok: true, execution_ready: executionReady(env) })
+  if (!path.startsWith('/api/') && !path.startsWith('/v1/'))
+    return env.ASSETS.fetch(request)
+  if (!['GET', 'POST'].includes(method))
+    return fail('method_not_allowed', '请求方法不支持。', 405)
+  const raw = method === 'POST' ? await rawBody(request) : '',
+    data = method === 'POST' ? parseBody(raw) : {}
+  if (path.startsWith('/v1/')) {
+    const userId = await signedUser(request, env, raw)
+    if (path === '/v1/capabilities' && method === 'GET') {
+      const row = env.LOCAL_EXECUTOR ? await env.DB.prepare("SELECT COUNT(*) n FROM orders WHERE status<>'failed'").first<{ n: number }>() : null
+      return json({ execution_ready: executionReady(env), accepts_orders: executionReady(env) && (!row || row.n === 0) })
+    }
+    if (path === '/v1/eligibility' && method === 'POST')
+    {
+      const now = Date.now()
+      const rate = await env.DB.prepare('INSERT INTO login_limits VALUES(?,1,?) ON CONFLICT(id) DO UPDATE SET attempts=CASE WHEN reset_at<=? THEN 1 ELSE attempts+1 END,reset_at=CASE WHEN reset_at<=? THEN excluded.reset_at ELSE reset_at END RETURNING attempts')
+        .bind('eligibility:' + userId, now + 60000, now, now).first<{ attempts: number }>()
+      if (!rate || rate.attempts > 20) fail('rate_limited', '查询较频繁，请稍后再试。', 429)
+      return json(await eligibility(env, data.username))
+    }
+    if (path === '/v1/products' && method === 'GET')
+      return json(await products(env, userId))
+    if (path === '/v1/balance' && method === 'GET')
+      return json(
+        await env.DB.prepare(
+          'SELECT available,frozen FROM wallets WHERE user_id=?',
+        )
+          .bind(userId)
+          .first(),
+      )
+    if (path === '/v1/orders' && method === 'POST') {
+      const result = await createOrder(
+        env,
+        userId,
+        request.headers.get('Idempotency-Key') ?? '',
+        data,
+      )
+      return json(result.order, result.created ? 201 : 200)
+    }
+    if (path === '/v1/orders' && method === 'GET') {
+      const merchant = url.searchParams.get('merchant_order_no')
+      if (merchant) {
+        const o = await env.DB.prepare(
+          'SELECT * FROM orders WHERE user_id=? AND merchant_order_no=?',
+        )
+          .bind(userId, merchant)
+          .first<Order>()
+        if (!o) return fail('not_found', '订单不存在。', 404)
+        return json(publicOrder(o))
+      }
+      const { offset } = pagination(url)
+      return json(
+        (
+          await env.DB.prepare(
+            'SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 30 OFFSET ?',
+          )
+            .bind(userId, offset)
+            .all<Order>()
+        ).results.map(publicOrder),
+      )
+    }
+    const match = path.match(/^\/v1\/orders\/(ord_[a-f0-9]{32})$/)
+    if (match && method === 'GET')
+      return json(await getOrder(env, userId, match[1]))
+    return fail('not_found', '接口不存在。', 404)
+  }
+  if (method === 'POST') browserWrite(request)
+  if (path === '/api/login' && method === 'POST')
+    return login(request, env, data)
+  if (path === '/api/logout' && method === 'POST') return logout(request, env)
+  if (path === '/api/session' && method === 'GET') {
+    try {
+      return json({ authenticated: true, ...(await session(request, env)) })
+    } catch (e) {
+      if (e instanceof Failure && e.status === 401)
+        return json({ authenticated: false })
+      throw e
+    }
+  }
+  const principal = await session(request, env),
+    admin = principal.role === 'admin',
+    userId = principal.userId
+  if (path.startsWith('/api/admin/')) {
+    if (!admin) return fail('forbidden', '需要管理员权限。', 403)
+    if (path === '/api/admin/gift-profile' && method === 'GET')
+      return json(await giftProfile(env))
+    if (path === '/api/admin/gift-profile' && method === 'POST')
+      return json(await configureGiftProfile(env, data))
+    if (path === '/api/admin/card-provider') {
+      return json(
+        method === 'GET'
+          ? await cardConfiguration(env)
+          : await configureCards(env, data),
+      )
+    }
+    if (path === '/api/admin/card-provider/operations' && method === 'GET')
+      return json(await cardOperations(env, pagination(url).offset))
+    const cardResolve = path.match(
+      /^\/api\/admin\/card-provider\/operations\/(cop_[a-f0-9]{32})\/resolve$/,
+    )
+    if (cardResolve && method === 'POST')
+      return json(await resolveCardOperation(env, cardResolve[1], data))
+    const cardResource = path.match(
+      /^\/api\/admin\/card-provider\/(balance|products|cards)$/,
+    )
+    if (cardResource && method === 'GET')
+      return json(await cardRead(env, cardResource[1], pagination(url).page))
+    const cardDetail = path.match(
+      /^\/api\/admin\/card-provider\/cards\/(\d+)\/(transactions|recharges)$/,
+    )
+    if (cardDetail && method === 'GET')
+      return json(
+        await cardRead(
+          env,
+          cardDetail[2],
+          pagination(url).page,
+          integer(Number(cardDetail[1]), '卡 ID'),
+        ),
+      )
+    const cardMutation = path.match(
+      /^\/api\/admin\/card-provider\/(open|recharge)$/,
+    )
+    if (cardMutation && method === 'POST')
+      return json(
+        await cardWrite(env, cardMutation[1] as 'open' | 'recharge', data),
+      )
+    if (path === '/api/admin/overview' && method === 'GET') {
+      const summary = await env.DB.prepare(
+        "SELECT (SELECT COUNT(*) FROM users) users,(SELECT COALESCE(SUM(available),0) FROM wallets) available,(SELECT COALESCE(SUM(frozen),0) FROM wallets) frozen,(SELECT COUNT(*) FROM orders WHERE status IN('queued','running','unknown')) pending,(SELECT COUNT(*) FROM orders WHERE status='unknown') unknown,(SELECT COUNT(*) FROM webhook_deliveries WHERE status='dead') failed_webhooks",
+      ).first<Record<string, number>>()
+      return json({
+        ...summary,
+        execution_ready: executionReady(env),
+        proxy_gateway_ready:
+          !!env.OUTBOUND_FETCH ||
+          (!!env.OUTBOUND_GATEWAY_URL && !!env.OUTBOUND_GATEWAY_SECRET),
+      })
+    }
+    if (path === '/api/admin/users' && method === 'GET') {
+      const { offset } = pagination(url)
+      return json(
+        (
+          await env.DB.prepare(
+            'SELECT u.id,u.name,u.email,u.enabled,u.created_at,w.available,w.frozen FROM users u JOIN wallets w ON w.user_id=u.id ORDER BY u.created_at DESC LIMIT 30 OFFSET ?',
+          )
+            .bind(offset)
+            .all()
+        ).results,
+      )
+    }
+    if (path === '/api/admin/users' && method === 'POST') {
+      const result = await createUser(env, data)
+      await audit(env, 'admin', 'create_user', result.id)
+      return json(result, 201)
+    }
+    const userMatch = path.match(
+      /^\/api\/admin\/users\/(usr_[a-f0-9]{32})\/(credit|enabled|password|keys|price)$/,
+    )
+    if (userMatch && userMatch[2] === 'keys' && method === 'GET')
+      return json(
+        (
+          await env.DB.prepare(
+            'SELECT id,label,revoked,created_at FROM api_keys WHERE user_id=? ORDER BY created_at DESC',
+          )
+            .bind(userMatch[1])
+            .all()
+        ).results,
+      )
+    const adminRevoke = path.match(
+      /^\/api\/admin\/keys\/(key_[a-f0-9]{32})\/revoke$/,
+    )
+    if (adminRevoke && method === 'POST') {
+      const changed = await env.DB.prepare(
+        'UPDATE api_keys SET revoked=1 WHERE id=? RETURNING id',
+      )
+        .bind(adminRevoke[1])
+        .first()
+      if (!changed) fail('not_found', '密钥不存在。', 404)
+      await audit(env, 'admin', 'revoke_key', adminRevoke[1])
+      return json({ revoked: true })
+    }
+    if (userMatch && method === 'POST') {
+      const [, target, action] = userMatch
+      if (action === 'credit')
+        return json(await credit(env, target, data, 'admin'))
+      if (action === 'enabled') await setUserEnabled(env, target, data.enabled)
+      if (action === 'keys') {
+        const result = await createKey(env, target, data.label)
+        await audit(env, 'admin', 'create_key', result.key_id)
+        return json(result, 201)
+      }
+      if (action === 'password') {
+        const password = text(data.password, '新密码', 256)
+        if (password.length < 12) fail('invalid_input', '密码至少 12 位。')
+        const salt = token()
+        const updated = await env.DB.prepare(
+          'UPDATE users SET password_hash=?,salt=? WHERE id=? RETURNING id',
+        )
+          .bind(await passwordHash(password, salt), salt, target)
+          .first()
+        if (!updated) fail('not_found', '用户不存在。', 404)
+      }
+      if (action === 'price') {
+        const product = text(data.product_code, '商品代码', 64)
+        if (data.points === null)
+          await env.DB.prepare(
+            'DELETE FROM user_prices WHERE user_id=? AND product_code=?',
+          )
+            .bind(target, product)
+            .run()
+        else
+          await env.DB.prepare(
+            'INSERT INTO user_prices VALUES(?,?,?) ON CONFLICT(user_id,product_code) DO UPDATE SET points=excluded.points',
+          )
+            .bind(target, product, integer(data.points, '用户价格'))
+            .run()
+      }
+      await audit(env, 'admin', 'user_' + action, target)
+      return json({ saved: true })
+    }
+    if (path === '/api/admin/products' && method === 'GET')
+      return json(
+        (await env.DB.prepare('SELECT * FROM products ORDER BY months').all())
+          .results,
+      )
+    if (path === '/api/admin/products' && method === 'POST') {
+      const code = text(data.code, '商品代码', 64),
+        currency = text(data.currency, '币种', 3).toLowerCase()
+      if (!/^[a-z]{3}$/.test(currency))
+        fail('invalid_input', '币种需为三位代码。')
+      const row = await env.DB.prepare(
+        'UPDATE products SET points=?,currency=?,amount_minor=?,enabled=? WHERE code=? RETURNING code',
+      )
+        .bind(
+          integer(data.points, '点数价格'),
+          currency,
+          integer(data.amount_minor, '实际支付金额（最小单位）'),
+          booleanInt(data.enabled),
+          code,
+        )
+        .first()
+      if (!row) fail('not_found', '商品不存在。', 404)
+      await audit(env, 'admin', 'update_product', code)
+      return json({ saved: true })
+    }
+    if (path === '/api/admin/secrets' && method === 'GET')
+      return json(await secretList(env))
+    if (path === '/api/admin/secrets' && method === 'POST') {
+      const secretId = id('sec'),
+        kind = text(data.kind, '类型', 16)
+      const result = await saveSecret(env, secretId, kind, data)
+      await audit(env, 'admin', 'create_' + kind, secretId)
+      return json(result, 201)
+    }
+    const secretMatch = path.match(
+      /^\/api\/admin\/secrets\/(sec_[a-f0-9]{32})\/(enabled|replace|test|quote|limit)$/,
+    )
+    if (secretMatch && method === 'POST') {
+      const [, target, action] = secretMatch
+      if (action === 'test') return json(await proxyTest(env, target))
+      if (action === 'quote')
+        return json(await quote(env, target, data.product_code))
+      if (action === 'limit') {
+        const result = await updateAccountLimit(env, target, data.daily_limit)
+        await audit(env, 'admin', 'secret_limit', target)
+        return json(result)
+      }
+      if (action === 'enabled') {
+        const changed = await env.DB.prepare(
+          'UPDATE secrets SET enabled=? WHERE id=? RETURNING id',
+        )
+          .bind(booleanInt(data.enabled), target)
+          .first()
+        if (!changed) fail('not_found', '配置不存在。', 404)
+      }
+      if (action === 'replace') {
+        const row = await env.DB.prepare('SELECT kind FROM secrets WHERE id=?')
+          .bind(target)
+          .first<{ kind: string }>()
+        if (!row) return fail('not_found', '配置不存在。', 404)
+        await saveSecret(env, target, row.kind, data)
+      }
+      await audit(env, 'admin', 'secret_' + action, target)
+      return json({ saved: true })
+    }
+    if (path === '/api/admin/reconcile' && method === 'POST') {
+      const result = await reconcile(env)
+      await audit(env, 'admin', 'reconcile', 'orders')
+      return json(result)
+    }
+    if (path === '/api/admin/orders' && method === 'GET') {
+      const { offset } = pagination(url)
+      return json(
+        (
+          await env.DB.prepare(
+            'SELECT o.*,u.name user_name FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.created_at DESC LIMIT 30 OFFSET ?',
+          )
+            .bind(offset)
+            .all<Order & { user_name: string }>()
+        ).results.map((o) => ({
+          ...publicOrder(o),
+          user_name: o.user_name,
+          user_id: o.user_id,
+        })),
+      )
+    }
+    const cancel = path.match(
+      /^\/api\/admin\/orders\/(ord_[a-f0-9]{32})\/cancel$/,
+    )
+    if (cancel && method === 'POST') {
+      const note = text(data.note, '取消说明', 300)
+      const changed = await env.DB.prepare(
+        "UPDATE orders SET status='failed',failure_code='cancelled_before_execution',updated_at=? WHERE id=? AND status='queued' AND execution_config IS NULL RETURNING id",
+      )
+        .bind(Date.now(), cancel[1])
+        .first()
+      if (!changed) fail('cannot_cancel', '只能取消尚未开始执行的订单。', 409)
+      await audit(env, 'admin', 'cancel_order', cancel[1], note)
+      return json({ cancelled: true })
+    }
+    if (
+      ['/api/admin/ledger', '/api/admin/audit', '/api/admin/webhooks'].includes(
+        path,
+      ) &&
+      method === 'GET'
+    ) {
+      const { offset } = pagination(url),
+        table = path.endsWith('/ledger')
+          ? 'ledger'
+          : path.endsWith('/audit')
+            ? 'audit'
+            : 'webhook_deliveries'
+      const selection =
+        table === 'webhook_deliveries'
+          ? 'order_id,user_id,event_id,url,attempts,next_at,status'
+          : '*'
+      const sort = table === 'webhook_deliveries' ? 'next_at' : 'created_at'
+      return json(
+        (
+          await env.DB.prepare(
+            `SELECT ${selection} FROM ${table} ORDER BY ${sort} DESC LIMIT 30 OFFSET ?`,
+          )
+            .bind(offset)
+            .all()
+        ).results,
+      )
+    }
+    return fail('not_found', '接口不存在。', 404)
+  }
+  if (!userId) return fail('forbidden', '请登录用户账户。', 403)
+  if (path === '/api/me' && method === 'GET')
+    return json(
+      await env.DB.prepare(
+        'SELECT u.id,u.name,u.email,w.available,w.frozen,(SELECT url FROM webhook_configs WHERE user_id=u.id) webhook_url FROM users u JOIN wallets w ON w.user_id=u.id WHERE u.id=?',
+      )
+        .bind(userId)
+        .first(),
+    )
+  if (path === '/api/products' && method === 'GET')
+    return json(await products(env, userId))
+  if (path === '/api/keys' && method === 'GET')
+    return json(
+      (
+        await env.DB.prepare(
+          'SELECT id,label,revoked,created_at FROM api_keys WHERE user_id=? ORDER BY created_at DESC',
+        )
+          .bind(userId)
+          .all()
+      ).results,
+    )
+  if (path === '/api/keys' && method === 'POST') {
+    const result = await createKey(env, userId, data.label)
+    await audit(env, userId, 'create_key', result.key_id)
+    return json(result, 201)
+  }
+  const revoke = path.match(/^\/api\/keys\/(key_[a-f0-9]{32})\/revoke$/)
+  if (revoke && method === 'POST') {
+    const changed = await env.DB.prepare(
+      'UPDATE api_keys SET revoked=1 WHERE id=? AND user_id=? RETURNING id',
+    )
+      .bind(revoke[1], userId)
+      .first()
+    if (!changed) fail('not_found', '密钥不存在。', 404)
+    await audit(env, userId, 'revoke_key', revoke[1])
+    return json({ revoked: true })
+  }
+  if (path === '/api/webhook' && method === 'POST') {
+    const result = await configureWebhook(env, userId, data.url)
+    await audit(env, userId, 'configure_webhook', userId)
+    return json(result)
+  }
+  if (path === '/api/orders' && method === 'POST') {
+    const result = await createOrder(
+      env,
+      userId,
+      text(data.idempotency_key, '幂等键', 128),
+      data,
+    )
+    return json(result.order, result.created ? 201 : 200)
+  }
+  if (path === '/api/orders' && method === 'GET') {
+    const { offset } = pagination(url)
+    return json(
+      (
+        await env.DB.prepare(
+          'SELECT * FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 30 OFFSET ?',
+        )
+          .bind(userId, offset)
+          .all<Order>()
+      ).results.map(publicOrder),
+    )
+  }
+  if (path === '/api/ledger' && method === 'GET') {
+    const { offset } = pagination(url)
+    return json(
+      (
+        await env.DB.prepare(
+          'SELECT kind,available_delta,frozen_delta,note,reference,created_at FROM ledger WHERE user_id=? ORDER BY created_at DESC LIMIT 30 OFFSET ?',
+        )
+          .bind(userId, offset)
+          .all()
+      ).results,
+    )
+  }
+  return fail('not_found', '接口不存在。', 404)
+}
+function secure(response: Response) {
+  const result = new Response(response.body, response)
+  result.headers.set('X-Content-Type-Options', 'nosniff')
+  result.headers.set('Referrer-Policy', 'no-referrer')
+  result.headers.set('X-Frame-Options', 'DENY')
+  result.headers.set(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  )
+  return result
+}
+export default {
+  async fetch(request: Request, env: Env) {
+    try {
+      if (env.LOCAL_ORIGIN && new URL(request.url).protocol === 'http:') {
+        const local = new URL(env.LOCAL_ORIGIN)
+        if (
+          local.protocol !== 'http:' ||
+          !['localhost', '127.0.0.1', '[::1]'].includes(local.hostname)
+        )
+          fail('invalid_configuration', '本地预览地址无效。', 503)
+        const incoming = new URL(request.url)
+        const headers = new Headers(request.headers)
+        if (headers.get('Origin') === incoming.origin)
+          headers.set('Origin', local.origin)
+        request = new Request(
+          local.origin + incoming.pathname + incoming.search,
+          request,
+        )
+        request = new Request(request, { headers })
+      }
+      const url = new URL(request.url)
+      if (
+        url.protocol !== 'https:' &&
+        !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+      )
+        return secure(
+          Response.json(
+            { error: { code: 'https_required', message: '请使用 HTTPS。' } },
+            { status: 403 },
+          ),
+        )
+      return secure(await route(request, env))
+    } catch (e) {
+      return secure(
+        Response.json(
+          {
+            error: {
+              code: e instanceof Failure ? e.code : 'service_unavailable',
+              message:
+                e instanceof Failure
+                  ? e.message
+                  : '服务暂时不可用，请稍后重试。',
+            },
+          },
+          {
+            status: e instanceof Failure ? e.status : 503,
+            headers: { 'Cache-Control': 'no-store' },
+          },
+        ),
+      )
+    }
+  },
+  async scheduled(_event: unknown, env: Env) {
+    await cleanup(env)
+    await reconcile(env)
+    await deliverWebhook(env)
+  },
+}
