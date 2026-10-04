@@ -1163,7 +1163,7 @@ function Workspace() {
             持有卡密？前往兑换套餐 <ArrowRight size={16} />
           </a>
         </div>
-        <footer>用户账户由管理员开通 · x-api.gptibo.com</footer>
+        <footer>用户账户由管理员开通 · {window.location.host}</footer>
       </main>
     )
   const nav: Section[] = admin
@@ -1216,8 +1216,8 @@ function Workspace() {
           })}
         </nav>
         <div className="sidebar-bottom">
-          <a href="https://gptibo.com" target="_blank" rel="noreferrer">
-            打开 GPTibo
+          <a href="/redeem">
+            卡密兑换
             <ArrowSquareOut size={15} />
           </a>
           <span className="account-name">
@@ -1687,7 +1687,7 @@ function Docs() {
     <>
       <div className="section-label">签名接口</div>
       <p className="note">
-        基地址：https://x-api.gptibo.com/v1。每次请求使用新的随机数；重试保留原商户订单号和幂等键。
+        基地址：{window.location.origin + '/v1'}。每次请求使用新的随机数；重试保留原商户订单号和幂等键。
       </p>
       <Grid
         headers={['方法', '路径', '用途']}
