@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import { database } from '../services/xgift/server/database.ts'
 import { configureAlipay, enableAlipay, alipaySettings, alipayView, checkoutCatalog, createCheckout,
-  checkoutStatus, alipayNotification, reconcileAlipay, alipayOrders } from '../services/xgift/src/alipay-payments.ts'
+  checkoutStatus, checkoutEligibility, alipayNotification, reconcileAlipay, alipayOrders } from '../services/xgift/src/alipay-payments.ts'
 import { configureCards, cardConfiguration } from '../services/xgift/src/cards.ts'
 import { configureGiftProfile } from '../services/xgift/src/gift-profile.ts'
 import { configurePayments, setPaymentsEnabled, paymentSettings, resolvePaymentEnv } from '../services/xgift/src/payments.ts'
@@ -16,6 +16,69 @@ import type { AlipayPrecreate, AlipayQueryResult } from '../services/xgift/serve
 import worker from '../services/xgift/src/index.ts'
 
 type Context = Parameters<Parameters<typeof test>[1]>[0]
+
+test('retired sales reject new purchases, configuration and enabling while keeping existing records', async t => {
+  const f = await fixture(t), body = purchase()
+  const original = await createCheckout(f.env, body)
+  delete f.env.ALIPAY_SALES_ENABLED
+  const before = { qr: f.state.precreates.length, x: f.state.xQueries }
+  const catalog = await checkoutCatalog(f.env)
+  assert.equal(catalog.available, false)
+  assert.equal(catalog.retired, true)
+  assert.deepEqual(catalog.products, [])
+  assert.equal((await alipayView(f.env)).enabled, false)
+  assert.equal((await alipayView(f.env)).ready, false)
+  await assert.rejects(createCheckout(f.env, purchase()), failure('alipay_retired', 409))
+  await assert.rejects(checkoutEligibility(f.env, { username: 'Receiver', product_code: 'x-premium-3m' }), failure('alipay_retired', 409))
+  await assert.rejects(configureAlipay(f.env, alipayConfig), failure('alipay_retired', 409))
+  await assert.rejects(enableAlipay(f.env, { enabled: true, confirmation: 'ENABLE_ALIPAY' }), failure('alipay_retired', 409))
+  assert.equal((await createCheckout(f.env, body)).id, original.id)
+  assert.equal((await f.status(body)).id, original.id)
+  assert.equal((await alipayOrders(f.env)).length, 1)
+  assert.deepEqual({ qr: f.state.precreates.length, x: f.state.xQueries }, before)
+  assert.equal((await enableAlipay(f.env, { enabled: false })).enabled, false)
+})
+
+test('retired collection still accepts verified historical callbacks and completes exactly one gift', async t => {
+  const f = await fixture(t), body = purchase()
+  await createCheckout(f.env, body)
+  delete f.env.ALIPAY_SALES_ENABLED
+  const notification = new URLSearchParams(f.notification()).toString()
+  assert.equal(await (await notifyRequest(f.env, notification)).text(), 'success')
+  await f.tick()
+  const orderId = f.row().order_id
+  assert.ok(orderId)
+  f.state.nativeResult = 'succeeded'
+  await reconcile(await resolvePaymentEnv(f.env))
+  await f.tick()
+  assert.equal(f.row().status, 'fulfilled')
+  assert.equal((await f.status(body)).fulfillment_status, 'succeeded')
+  assert.equal(await (await notifyRequest(f.env, notification)).text(), 'success')
+  await f.tick()
+  assert.equal(f.row().order_id, orderId)
+  assert.equal(f.state.precreates.length, 1)
+  assert.equal(f.state.native, 1)
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM ledger WHERE kind='consume' AND order_id=?").get(orderId)!.n, 1)
+})
+
+test('retirement never recreates a lost QR but still settles a verified historical payment', async t => {
+  const f = await fixture(t), body = purchase()
+  f.state.precreateLost = true
+  await createCheckout(f.env, body)
+  delete f.env.ALIPAY_SALES_ENABLED
+  await f.tick()
+  assert.equal(f.state.precreates.length, 1)
+  assert.equal(f.state.queries.length, 1)
+  assert.equal(f.row().status, 'creating')
+  f.state.queryPatch = {}
+  await f.tick()
+  assert.equal(f.state.precreates.length, 1)
+  assert.ok(f.row().paid_at)
+  assert.ok(f.row().order_id, 'historical paid orders must not be abandoned after retirement')
+  assert.equal(f.db.prepare('SELECT count(*) n FROM orders').get()!.n, 1)
+  await f.tick()
+  assert.equal(f.db.prepare('SELECT count(*) n FROM orders').get()!.n, 1)
+})
 const appId = '2021000000000001', sellerId = '2088000000000001'
 const tradeNo = '2026100522000000000000000001'
 const cardConfig = { environment: 'production', transport: 'direct', api_key: 'sk_fixture_card_secret', writes_enabled: false }
@@ -43,6 +106,7 @@ async function fixture(t: Context, enabled = true) {
   const env: Env = {
     DB, MASTER_KEY: 'a'.repeat(64), ADMIN_PASSWORD: 'fixture-admin-password-long-enough',
     PUBLIC_ORIGIN: 'https://x-api.example.test', PAYMENTS_ENABLED: 'false',
+    ALIPAY_SALES_ENABLED: 'true', // Exercise historical channel behavior without enabling it in production.
     ASSETS: { fetch: async () => new Response('asset') },
     NATIVE_EXECUTOR: async (_env, order) => {
       state.native++

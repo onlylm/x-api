@@ -265,7 +265,7 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
         setActionError('启用请求已执行，但最新设置显示 X 付款当前已停用。请核对其他页面或登录会话中的操作，未确认前不要重新启用。')
       } else {
         setMessage(next.accepts_orders ? 'X 付款已启用，当前允许在每日接单额度内接单。'
-          : 'X 付款已启用；新单还须通过上方每日接单设置与未结订单检查。')
+          : 'X 付款已启用；新单仍受“接单设置”的每日额度和同账号未结单检查控制。')
       }
     } catch (error) {
       if (!mounted.current) return
@@ -290,7 +290,7 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
           </Button>
         </div>
       </div>
-      <p className="note payment-intro">后台 / 卡台与卡池。指定主卡支付 X 赠送订单，可自行配置最多 3 张有序备用卡；客户的支付宝收款另行配置。</p>
+      <p className="note payment-intro">指定主卡支付 X 赠送订单，可配置最多 3 张有序备用卡。卡台连接与持卡人资料在“卡台与卡池”中管理。</p>
       {statusError && <p role="alert" className="notice error">状态未确认：{statusError} 请刷新状态。</p>}
       {actionError && <p role="alert" className="notice error">{actionError}</p>}
       {message && <p role="status" className="notice">{message}</p>}
@@ -301,14 +301,17 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
           <span className={`status ${view.enabled ? 'status-ACTIVE' : ''}`}>{view.enabled ? 'X 付款已启用' : 'X 付款已关闭'}</span>
           <span>{view.accepts_orders ? '当前可接单' : '当前不接新单'}</span>
           <span>{view.execution_ready ? '执行条件已就绪' : '执行条件未就绪'}</span>
-          <span>接单上限在上方“每日接单设置”中调整</span>
+          <span>每日额度在“接单设置”中调整</span>
         </div>
+        <details className="settings-checks" open={!view.execution_ready}>
+        <summary>付款条件检查 · {view.checks.filter((check) => check.ok).length} / {view.checks.length} 项通过</summary>
         <ul className="payment-checks" aria-label="X 付款条件检查">
           {view.checks.map((check) => <li key={check.code}>
             <span className={`status ${check.ok ? 'status-ACTIVE' : 'status-unknown'}`}>{check.ok ? '已通过' : '待处理'}</span>
             <span>{check.label}</span>
           </li>)}
         </ul>
+        </details>
         <p className="note payment-meta">
           {checkedAt && <>状态更新于 {time(checkedAt)} · 页面可见时每 30 秒刷新</>}
           {view.card_checked_at && <>；所选卡检查于 {time(view.card_checked_at)}</>}
@@ -318,8 +321,8 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
           <Button variant="secondary" disabled={!!busy || statusLoading} onClick={() => void refreshStatus(true)}>载入最新配置</Button>
         </div>}
         {view.enabled && <p className="note">X 付款启用期间不能修改公钥、主卡或备用卡，请先停用。</p>}
-        {view.has_unsettled_orders && <p className="notice">有未结订单，暂不能修改付款配置。请先在充值订单中核对原单；符合检查条件时仍可恢复付款以处理原单。</p>}
-        {!providerRevision && <p className="notice">尚未接入卡台。请先在下方“卡台连接”中完成接入，再刷新状态并选择已有卡。</p>}
+        {view.has_unsettled_orders && <p className="notice">有未结订单，暂不能修改付款配置。请先在“订单与队列”中核对原单或安全关闭未执行的订单；符合检查条件时仍可恢复付款以处理原单。</p>}
+        {!providerRevision && <p className="notice">尚未接入卡台。请先前往“卡台与卡池”完成卡台连接，再刷新状态并选择已有卡。</p>}
         {providerRevision && cardBindingChanged && !conflict && <p className="notice">卡台连接已更新，原主卡与备用卡不能直接沿用。请从当前卡台重新选择并保存，不会按同一 ID 自动绑定其他卡。</p>}
         {view.source === 'environment' && <p className="note">当前读取环境配置。保存后将使用后台配置，付款保持关闭。</p>}
         <form ref={paymentForm} className="payment-form" onSubmit={(event: FormEvent) => { event.preventDefault(); void mutate('save') }}>

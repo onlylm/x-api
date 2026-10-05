@@ -99,6 +99,12 @@ async function provider(
 async function bindQueued(env: Env, order: Order) {
   if (!await executionReady(env)) return null
   const native = !!env.LOCAL_EXECUTOR
+  // Native payments share the configured card pool. Keep admission independent
+  // of execution, but acquire the FIFO head and global payment slot together in
+  // the database transaction below. A not-yet-due/leased unknown job still owns
+  // the slot; it is not permission to submit the next payment.
+  const queueGate = native ? ` AND NOT EXISTS(SELECT 1 FROM orders WHERE status IN('running','unknown'))
+    AND orders.id=(SELECT id FROM orders WHERE status='queued' ORDER BY created_at,id LIMIT 1)` : ''
   const payment = native ? await paymentBinding(env) : null
   // Persist the chosen card and billing configuration with this execution.
   // A configured payment service may never fall back to legacy automatic funding.
@@ -140,7 +146,7 @@ async function bindQueued(env: Env, order: Order) {
     try {
       await env.DB.batch([
         env.DB.prepare(
-          `INSERT INTO account_slots SELECT ?,?,?,0 WHERE EXISTS(SELECT 1 FROM orders WHERE id=? AND status='queued') AND (SELECT COUNT(*) FROM account_slots WHERE account_id=? AND day=?)<? ON CONFLICT(order_id) DO NOTHING`,
+          `INSERT INTO account_slots SELECT ?,?,?,0 WHERE EXISTS(SELECT 1 FROM orders WHERE id=? AND status='queued'${queueGate}) AND (SELECT COUNT(*) FROM account_slots WHERE account_id=? AND day=?)<? ON CONFLICT(order_id) DO NOTHING`,
         ).bind(
           order.id,
           candidate.id,
@@ -151,7 +157,7 @@ async function bindQueued(env: Env, order: Order) {
           Number(account.daily_limit ?? 300),
         ),
         env.DB.prepare(
-          "UPDATE orders SET status='running',execution_config=?,work_token=?,lease_until=?,updated_at=? WHERE id=? AND status='queued' AND EXISTS(SELECT 1 FROM account_slots WHERE order_id=orders.id AND account_id=?)",
+          `UPDATE orders SET status='running',execution_config=?,work_token=?,lease_until=?,updated_at=? WHERE id=? AND status='queued'${queueGate} AND EXISTS(SELECT 1 FROM account_slots WHERE order_id=orders.id AND account_id=? AND released=0)`,
         ).bind(cipher, work, now + (native ? 180000 : 60000), now, order.id, candidate.id),
       ])
     } catch {
@@ -170,7 +176,7 @@ async function claim(env: Env) {
   const now = Date.now(),
     work = id('work')
   const pending = await env.DB.prepare(
-    "UPDATE orders SET work_token=?,lease_until=? WHERE id=(SELECT id FROM orders WHERE status IN('running','unknown') AND lease_until<=? AND next_check<=? ORDER BY next_check,created_at LIMIT 1) RETURNING *",
+    "UPDATE orders SET work_token=?,lease_until=? WHERE id=(SELECT id FROM orders WHERE status IN('running','unknown') AND lease_until<=? AND next_check<=? ORDER BY next_check,created_at,id LIMIT 1) RETURNING *",
   )
     .bind(work, now + (env.LOCAL_EXECUTOR ? 180000 : 60000), now, now)
     .first<Order>()
@@ -187,7 +193,7 @@ async function claim(env: Env) {
   }
   if (!await executionReady(env)) return null
   const next = await env.DB.prepare(
-    "SELECT * FROM orders WHERE status='queued' ORDER BY created_at LIMIT 1",
+    "SELECT * FROM orders WHERE status='queued' ORDER BY created_at,id LIMIT 1",
   ).first<Order>()
   return next ? bindQueued(env, next) : null
 }

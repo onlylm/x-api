@@ -104,6 +104,8 @@ a {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
 }
 .sidebar nav button {
   display: flex;
@@ -187,7 +189,6 @@ h2 {
 .page-content {
   padding-top: 28px;
   min-height: 70vh;
-  animation: enter 180ms ease-out;
 }
 .metrics {
   display: flex;
@@ -845,6 +846,62 @@ code {
 .alipay-orders .pager { flex-wrap: wrap; }
 .alipay-orders .stack small { color: var(--recharge-muted); }
 .alipay-orders .status { align-self: flex-start; }
+.orders-view-switch { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px; }
+.queue-summary { display: flex; justify-content: space-between; align-items: center; gap: 28px; padding: 22px 0 26px; border-bottom: 1px solid var(--recharge-line); }
+.queue-summary-main { display: flex; flex-direction: column; gap: 10px; }
+.queue-summary-main strong { font-size: 16px; font-weight: 600; }
+.queue-summary-main > span { font-size: 12px; color: #596574; }
+.queue-counts { display: flex; gap: 28px; margin: 0; }
+.queue-counts > div { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; }
+.queue-counts dt { color: #596574; font-size: 12px; }
+.queue-counts dd { margin: 0; font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.orders-toolbar { align-items: flex-start; flex-wrap: wrap; }
+.order-filter { display: flex; flex-wrap: wrap; gap: 5px; }
+.order-filter button { border: 0; background: transparent; border-radius: 6px; padding: 10px 12px; color: #596574; min-height: 40px; }
+.order-filter button:hover { background: #eff2f0; }
+.order-filter button[aria-pressed='true'] { background: #e4ebe7; color: #2d493b; font-weight: 600; }
+.order-search { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; padding: 0 0 24px; }
+.order-search > :first-child { flex: 1; min-width: 220px; max-width: 480px; }
+.order-search button { min-height: 40px; }
+.orders-table table { min-width: 850px; }
+.orders-table td:nth-child(1) { width: 25%; }
+.orders-table td:nth-child(2) { width: 20%; }
+.orders-table td:nth-child(3) { width: 32%; }
+.orders-table td:nth-child(4) { width: 23%; }
+.orders-table .stack > .status { align-self: flex-start; }
+.orders-table .stack small, .order-row-actions small, .orders-workspace .pager span { color: #596574; }
+.order-progress { line-height: 1.7; }
+.order-row-actions { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px; }
+.order-row-actions > small { display: block; flex-basis: 100%; font-size: 11px; line-height: 1.7; }
+.order-row-actions > .note { margin: 0; }
+.payment-page-link { display: inline-flex; align-items: center; gap: 6px; flex-basis: 100%; padding: 8px 0; }
+.orders-workspace .pager { flex-wrap: wrap; }
+.table-skeleton { padding: 48px 18px; color: #596574; background: var(--recharge-surface); text-align: center; }
+.settings-checks { margin: 8px 0 16px; padding: 14px 0; border-block: 1px solid var(--recharge-line); }
+.settings-checks summary { cursor: pointer; font-size: 13px; font-weight: 500; min-height: 28px; }
+.settings-checks[open] summary { margin-bottom: 16px; }
+.settings-checks .payment-checks { margin-bottom: 4px; }
+.payment-backup-fields { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.retired-redeem-link { display: inline-flex; align-items: center; min-height: 44px; padding: 10px 16px; border: 1px solid #cbd5ce; border-radius: 8px; }
+.page-header h1 { margin-top: 0; }
+.page-header p, .note, .table-scroll th, .stack small, .pager span, .sidebar-bottom, .nav-group-label { color: #65717f; }
+.status-queued { color: #4c5865; background: #eef1f4; }
+.alipay-orders { margin-top: 20px; }
+::selection { color: #24382f; background: #dce8df; }
+input, textarea { caret-color: var(--recharge-accent); }
+button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px solid #527461; outline-offset: 3px; }
+@media (max-width: 1100px) {
+  .queue-summary { align-items: flex-start; flex-direction: column; gap: 20px; }
+  .payment-backup-fields { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 540px) {
+  .queue-counts { width: 100%; justify-content: space-between; gap: 12px; }
+  .queue-counts > div { flex-direction: column; gap: 5px; }
+  .orders-toolbar { gap: 16px; }
+  .order-filter button { padding: 9px 10px; }
+  .order-search > :first-child { min-width: 100%; }
+  .orders-workspace .pager span { flex-basis: 100%; }
+}
 @media (max-width: 900px) {
   .alipay-identity-fields, .alipay-key-fields { grid-template-columns: minmax(0, 1fr); }
 }

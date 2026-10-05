@@ -34,7 +34,7 @@ async function fixture(t: Context, enabled = true, dailyLimit = 1) {
   const state = { precreates: 0, native: 0, queryLost: false, closes: 0, fetches: 0 }
   const env: Env = {
     DB, MASTER_KEY: 'a'.repeat(64), ADMIN_PASSWORD: 'admission-test-admin-password', PUBLIC_ORIGIN: origin,
-    PAYMENTS_ENABLED: 'false', ASSETS: { fetch: async () => new Response('asset') },
+    PAYMENTS_ENABLED: 'false', ALIPAY_SALES_ENABLED: 'true', ASSETS: { fetch: async () => new Response('asset') },
     NATIVE_EXECUTOR: async (_env, order) => {
       state.native++
       return { order_id: order.id, status: 'succeeded', evidence: { payment_status: 'paid', gift_status: 'checkout_completed',
@@ -196,15 +196,18 @@ test('Beijing midnight resets successful daily use exactly, independently of UTC
   assert.equal((await f.view()).used, 1, 'UTC midnight must not reset the Beijing day again')
 })
 
-test('unknown orders keep the shared card blocked after midnight even when today has no used quota', async t => {
+test('unknown orders keep execution blocked after midnight while different recipients can queue', async t => {
   let now = Date.parse('2026-10-05T15:59:00Z')
   t.mock.method(Date, 'now', () => now)
   const f = await fixture(t), order = await f.direct(); f.settle(order.order.id, 'unknown')
   now = Date.parse('2026-10-05T16:00:00Z')
   const view = await f.view()
   assert.equal(view.used, 0); assert.equal(view.remaining, 1); assert.equal(view.active_orders, 1)
-  assert.equal(view.reason, 'order_in_progress'); assert.equal(view.accepts_orders, false)
-  await assert.rejects(f.direct('nextuser'), expectFailure('product_unavailable'))
+  assert.equal(view.reason, null); assert.equal(view.accepts_orders, true)
+  assert.equal(view.queue_blocked, true); assert.equal(view.unknown_orders, 1)
+  assert.equal(view.blocked_order_id, order.order.id)
+  const next = await f.direct('nextuser')
+  assert.equal(next.order.status, 'queued')
   await assert.rejects(createCheckout(f.env, purchase()), expectFailure('checkout_unavailable'))
   assert.equal((await f.direct()).created, false, 'Original idempotent reads remain available')
 })
@@ -267,6 +270,29 @@ test('admission pause, a reduced quota and midnight never strand an already paid
     if (change === 'lower') assert.equal((await f.view()).reason, 'daily_limit_reached')
     if (change === 'midnight') assert.equal((await f.view()).accepts_orders, true)
   })
+})
+
+test('historical paid checkouts wait for existing queued gifts to drain without blocking their execution', async t => {
+  const f = await fixture(t, true, 10), body = purchase()
+  await createCheckout(f.env, body)
+  // Model historical queued work from the external-executor mode that predates
+  // native shared-card serialization; it must not be stranded after an upgrade.
+  const legacy: Env = { ...f.env, LOCAL_EXECUTOR: undefined, PAYMENTS_ENABLED: 'true',
+    EXECUTOR_URL: 'https://executor.example.test', EXECUTOR_SECRET: 'fixture-executor-secret-32-characters' }
+  for (const recipient of ['legacyone', 'legacytwo']) await createOrder(legacy, f.user.id, 'legacy:' + recipient, {
+    merchant_order_no: 'legacy:' + recipient, product_code: 'x-premium-3m', recipient,
+  })
+  await f.pay(body); await f.tick()
+  assert.equal(f.checkoutRow(body).order_id, null)
+  assert.equal((await f.view()).reason, 'checkout_in_progress')
+  for (let i = 0; i < 2; i++) await reconcile(await f.effective())
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM orders WHERE status='succeeded'").get()!.n, 2)
+  await f.tick()
+  assert.ok(f.checkoutRow(body).order_id, 'A paid reservation converts once prior queue work settles')
+  await reconcile(await f.effective()); await f.tick()
+  assert.equal(f.checkoutRow(body).status, 'fulfilled')
+  assert.equal(f.state.native, 3)
+  assert.equal((await f.view()).used, 3)
 })
 
 test('pausing new admission preserves an already queued gift and allows original fulfillment', async t => {

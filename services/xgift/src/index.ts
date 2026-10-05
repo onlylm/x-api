@@ -26,6 +26,7 @@ import {
   type Env,
 } from './core.ts'
 import { cleanup, reconcile } from './executor.ts'
+import { adminCheckOrder, adminCloseOrder, adminPaymentPage } from './admin-order-actions.ts'
 import {
   cardConfiguration,
   configureCards,
@@ -438,32 +439,51 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
     if (path === '/api/admin/orders' && method === 'GET') {
       const { offset } = pagination(url)
+      const status = url.searchParams.get('status') ?? '', search = (url.searchParams.get('q') ?? '').trim()
+      if (status && !['queued', 'running', 'unknown', 'active', 'succeeded', 'failed'].includes(status))
+        fail('invalid_input', '订单状态筛选无效。')
+      if (search.length > 128) fail('invalid_input', '订单搜索最多 128 字。')
+      const statusSql = status === 'active' ? "AND o.status IN('queued','running','unknown')" : status ? 'AND o.status=?' : ''
+      const statusValues = status && status !== 'active' ? [status] : []
       return json(
         (
           await env.DB.prepare(
-            'SELECT o.*,u.name user_name FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.created_at DESC LIMIT 30 OFFSET ?',
+            `SELECT o.*,u.name user_name,CASE WHEN o.status='queued' THEN (
+              SELECT COUNT(*) FROM orders q WHERE q.status='queued' AND (q.created_at<o.created_at OR (q.created_at=o.created_at AND q.id<=o.id)))
+              ELSE NULL END queue_position FROM orders o JOIN users u ON u.id=o.user_id
+              WHERE 1=1 ${statusSql} AND (?='' OR instr(o.id,?)>0 OR instr(lower(o.recipient),lower(?))>0 OR instr(o.merchant_order_no,?)>0)
+              ORDER BY ${status === 'queued' ? 'o.created_at,o.id' : 'o.created_at DESC,o.id DESC'} LIMIT 30 OFFSET ?`,
           )
-            .bind(offset)
-            .all<Order & { user_name: string }>()
+            .bind(...statusValues, search, search, search.replace(/^@/, ''), search, offset)
+            .all<Order & { user_name: string; queue_position: number | null }>()
         ).results.map((o) => ({
           ...publicOrder(o),
           user_name: o.user_name,
           user_id: o.user_id,
+          queue_position: o.queue_position,
         })),
       )
+    }
+    const orderAction = path.match(/^\/api\/admin\/orders\/(ord_[a-f0-9]{32})\/(payment-page|check|close)$/)
+    if (orderAction) {
+      const [, orderId, action] = orderAction
+      if (action === 'payment-page' && method === 'GET') {
+        await limit(env, 'order-payment-page:admin', 30)
+        return json(await adminPaymentPage(env, orderId))
+      }
+      if (action === 'check' && method === 'POST') {
+        await limit(env, 'order-query:admin', 20)
+        return json(await adminCheckOrder(env, orderId))
+      }
+      if (action === 'close' && method === 'POST') return json(await adminCloseOrder(env, orderId, data))
+      return fail('method_not_allowed', '请求方法不支持。', 405)
     }
     const cancel = path.match(
       /^\/api\/admin\/orders\/(ord_[a-f0-9]{32})\/cancel$/,
     )
     if (cancel && method === 'POST') {
       const note = text(data.note, '取消说明', 300)
-      const changed = await env.DB.prepare(
-        "UPDATE orders SET status='failed',failure_code='cancelled_before_execution',updated_at=? WHERE id=? AND status='queued' AND execution_config IS NULL RETURNING id",
-      )
-        .bind(Date.now(), cancel[1])
-        .first()
-      if (!changed) fail('cannot_cancel', '只能取消尚未开始执行的订单。', 409)
-      await audit(env, 'admin', 'cancel_order', cancel[1], note)
+      await adminCloseOrder(env, cancel[1], { reason: note, confirmation: 'CLOSE_ORDER' }, true)
       return json({ cancelled: true })
     }
     if (

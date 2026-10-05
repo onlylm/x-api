@@ -14,7 +14,7 @@ import { DirectRecharge, Redeem } from './Recharge'
 import { Vouchers } from './Vouchers'
 import { PaymentSettings } from './PaymentSettings'
 import { AdmissionSettings } from './AdmissionSettings'
-import { AlipaySettings } from './AlipaySettings'
+import { AdminOrders } from './AdminOrders'
 import { Checkout } from './Checkout'
 import { orderFailureDescription } from './order-failures'
 import {
@@ -85,11 +85,13 @@ const labels: Record<string, string> = {
 const sections = {
   overview: ['概览', '账户余额与服务状态', ChartBar],
   users: ['用户管理', '开通账户、入账点数及设置用户价格', Users],
-  orders: ['充值订单', '查询进度与核对原订单', ListChecks],
+  orders: ['订单与队列', '多单排队、逐笔付款，集中处理需要核对的原订单', ListChecks],
   vouchers: ['卡密管理', '生成套餐卡密、查看兑换记录及撤销未用卡密', Key],
   ledger: ['点数流水', '充值、冻结、消费与退回记录', Receipt],
   products: ['商品配置', '点数售价与预期支付金额', SlidersHorizontal],
-  cards: ['卡台与卡池', '支付宝收款、X 付款与卡台资产管理', CreditCard],
+  admission: ['接单设置', '每日额度与新订单开关，不改变已有订单', SlidersHorizontal],
+  payment: ['X 付款设置', '执行状态、Stripe 公钥与指定付款卡', CreditCard],
+  cards: ['卡台与卡池', '卡台连接、持卡人资料与卡池资产', CreditCard],
   secrets: ['账号与出口', '管理 X 赠送账号和代理连接', Plugs],
   keys: ['接口密钥', '生成或撤销签名密钥', Key],
   docs: ['接口文档', '通过签名接口创建和查询订单', BookOpen],
@@ -425,7 +427,7 @@ function Workspace() {
             }
           })
         }
-      } else if (section === 'docs') result = {}
+      } else if (['docs', 'admission', 'payment'].includes(section) || (admin && section === 'orders')) result = {}
       else
         result = {
           rows: await api<Row[]>(
@@ -577,6 +579,9 @@ function Workspace() {
     </div>
   )
   function content(): ReactNode {
+    if (admin && section === 'admission') return <AdmissionSettings request={api} onError={onError} />
+    if (admin && section === 'payment') return <PaymentSettings request={api} onError={onError} />
+    if (admin && section === 'orders') return <AdminOrders request={api} onError={onError} refreshVersion={refresh} />
     if (section === 'overview') {
       if (admin)
         return (
@@ -1139,7 +1144,6 @@ function Workspace() {
           </span>
         </div>
         <div className="login-form-wrap">
-          <div className="eyebrow">独立充值服务</div>
           <h1>登录工作区</h1>
           <p>管理点数、赠送订单与接口密钥。</p>
           <form onSubmit={login}>
@@ -1168,9 +1172,6 @@ function Workspace() {
             </Button>
           </form>
           <div className="login-purchase-links">
-            <a className="login-redeem-link text-link" href="/buy">
-              支付宝扫码购买套餐 <ArrowRight size={16} />
-            </a>
             <a className="login-redeem-link text-link" href="/redeem">
               持有卡密？前往兑换套餐 <ArrowRight size={16} />
             </a>
@@ -1182,12 +1183,14 @@ function Workspace() {
   const nav: Section[] = admin
     ? [
         'overview',
-        'users',
         'orders',
         'vouchers',
+        'admission',
+        'payment',
+        'cards',
+        'users',
         'ledger',
         'products',
-        'cards',
         'secrets',
         'webhooks',
         'audit',
@@ -1229,10 +1232,6 @@ function Workspace() {
           })}
         </nav>
         <div className="sidebar-bottom">
-          <a href="/buy">
-            扫码购买
-            <ArrowSquareOut size={15} />
-          </a>
           <a href="/redeem">
             卡密兑换
             <ArrowSquareOut size={15} />
@@ -1260,13 +1259,10 @@ function Workspace() {
       <main className="main">
         <header className="page-header">
           <div>
-            <div className="eyebrow">
-              X API <span>/</span> {admin ? '平台管理' : '用户工作区'}
-            </div>
             <h1>{sections[section][0]}</h1>
             <p>{sections[section][1]}</p>
           </div>
-          <Button
+          {!(admin && ['orders', 'admission', 'payment'].includes(section)) && <Button
             variant="secondary"
             aria-label="刷新当前页面"
             disabled={loading}
@@ -1274,7 +1270,7 @@ function Workspace() {
           >
             <ArrowClockwise size={17} />
             刷新
-          </Button>
+          </Button>}
         </header>
         {notice && (
           <div className="notice" role="status">
@@ -1282,11 +1278,6 @@ function Workspace() {
           </div>
         )}
         <div className="page-content" key={section}>
-          {admin && section === 'cards' && <>
-            <AdmissionSettings request={api} onError={onError} />
-            <PaymentSettings request={api} onError={onError} />
-            <AlipaySettings request={api} onError={onError} />
-          </>}
           {loading ? (
             <div className="loading" role="status">
               正在加载…

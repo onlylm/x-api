@@ -1,4 +1,7 @@
 const descriptions: Record<string, string> = {
+  x_query_failed: 'X 账号或赠送查询未完成，请核对原单。若尚未创建付款页面，可由管理员尝试安全关闭。',
+  cancelled_before_execution: '管理员在创建付款页面前关闭了订单，冻结点数已释放；卡密兑换记录继续保留。',
+  cancelled_by_admin: '管理员已关闭订单，冻结点数已释放。',
   payment_cards_exhausted: '本轮指定的主卡与备用卡均暂不可用，请管理员处理。系统不会自动充值或重新从主卡开始尝试。',
   payment_card_unverified: '付款卡资料或身份未能确认，已保留原卡等待核对，不会据此自动切换备用卡。',
   card_frozen: '当前付款卡已冻结，请管理员核对原订单和卡状态。',

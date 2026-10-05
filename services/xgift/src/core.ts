@@ -13,10 +13,13 @@ export interface Database {
 }
 export interface Env {
   NATIVE_EXECUTOR?: (env: Env, order: import('./orders.ts').Order, snapshot: import('./executor.ts').Snapshot) => Promise<import('./executor.ts').Result>
+  NATIVE_ORDER_QUERY?: (env: Env, order: import('./orders.ts').Order, snapshot: import('./executor.ts').Snapshot) => Promise<import('./executor.ts').Result>
   PAYMENT_SETTINGS?: import('./payments.ts').PaymentSettings
   PAYMENTS_LOCKED?: string
   PUBLIC_ORIGIN?: string
   ALIPAY_CLIENT?: typeof import('../server/alipay.ts').createAlipayClient
+  /** Legacy-channel compatibility only; production does not enable new Alipay sales. */
+  ALIPAY_SALES_ENABLED?: string
   LOCAL_EXECUTOR?: (order: import('./orders.ts').Order, snapshot: import('./executor.ts').Snapshot) => Promise<import('./executor.ts').Result>
   STRIPE_PUBLISHABLE_KEY?: string
   DB: Database

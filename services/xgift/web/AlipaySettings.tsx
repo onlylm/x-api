@@ -5,6 +5,7 @@ import { Dialog } from '@cloudflare/kumo/components/dialog'
 import { Table } from '@cloudflare/kumo/components/table'
 import { ArrowClockwise, ArrowSquareOut, ArrowLeft, ArrowRight } from '@phosphor-icons/react'
 import type { Request } from './Recharge'
+import { legacyPaymentStatus } from './order-ui'
 
 type Price = { product_code: string; name: string; months: number; amount_cny: string; enabled: boolean }
 type AlipayView = {
@@ -243,13 +244,9 @@ type AlipayOrder = {
   created_at: number
   updated_at: number
 }
-const orderStatus: Record<string, string> = {
-  creating: '正在创建', pending: '待付款', paid: '已付款', closed: '已关闭', failed: '失败',
-  fulfilled: '赠送已完成', attention: '待人工核对',
-}
 const orderTime = (value: number | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—'
 
-function AlipayOrders({ request, onError }: { request: Request; onError: (error: unknown) => void }) {
+export function AlipayOrders({ request, onError }: { request: Request; onError: (error: unknown) => void }) {
   const [page, setPage] = useState(1), [rows, setRows] = useState<AlipayOrder[]>([])
   const [loading, setLoading] = useState(true), [error, setError] = useState('')
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
@@ -281,10 +278,10 @@ function AlipayOrders({ request, onError }: { request: Request; onError: (error:
   }, [load])
   return <div className="alipay-orders">
     <div className="toolbar">
-      <h2>支付宝收款订单</h2>
+      <h2>历史收款记录</h2>
       <Button variant="ghost" disabled={loading} onClick={() => void load()}><ArrowClockwise size={16} />{loading ? '刷新中…' : '刷新收款订单'}</Button>
     </div>
-    <p className="note">收款与 X 赠送结果分别核对。已关联赠送单的最终结果，请在“充值订单”中按订单号查询。</p>
+    <p className="note">收款与 X 赠送结果分别保留。关联赠送单的最终结果，请切回“赠送订单与队列”查看；这里不会创建新收款。</p>
     {error && <p role="alert" className="notice error">收款订单未能刷新：{error} 请重试刷新。</p>}
     <div className="table-scroll" aria-busy={loading}>
       <Table>
@@ -294,18 +291,16 @@ function AlipayOrders({ request, onError }: { request: Request; onError: (error:
             <Table.Cell><span className="stack"><code>{row.out_trade_no || row.id}</code><span>@{row.recipient.replace(/^@/, '')}</span>{row.trade_no && <small>支付宝交易号：{row.trade_no}</small>}</span></Table.Cell>
             <Table.Cell><span className="stack"><span>{row.product_name} · {row.months} 个月</span><strong>¥{row.amount_cny}</strong></span></Table.Cell>
             <Table.Cell><span className="stack">
-              <span className={`status ${row.status === 'attention' || row.failure_code ? 'status-unknown' : row.paid_at ? 'status-ACTIVE' : ''}`}>
-                {row.status === 'attention' || row.failure_code
-                  ? row.paid_at ? '已付款待人工处理' : '待人工核对'
-                  : row.status === 'paid' && !row.paid_at ? '付款待核对' : orderStatus[row.status] || row.status}
+              <span className={`status ${['closed', 'failed'].includes(row.status) ? '' : row.status === 'attention' || row.failure_code ? 'status-unknown' : row.paid_at ? 'status-ACTIVE' : ''}`}>
+                {legacyPaymentStatus(row.status, row.paid_at, row.failure_code)}
               </span>
               {row.paid_at && <small>付款于 {orderTime(row.paid_at)}</small>}
               {row.failure_code && <small>{row.failure_code}</small>}
             </span></Table.Cell>
-            <Table.Cell>{row.order_id ? <code>{row.order_id}</code> : row.paid_at ? '已付款，尚未关联赠送单' : '付款后自动创建'}</Table.Cell>
+            <Table.Cell>{row.order_id ? <code>{row.order_id}</code> : row.paid_at ? '已付款，尚未关联赠送单' : ['closed', 'failed'].includes(row.status) ? '未创建赠送单' : '等待原单付款结果'}</Table.Cell>
             <Table.Cell><span className="stack"><span>{orderTime(row.created_at)}</span><small>{orderTime(row.updated_at)}</small></span></Table.Cell>
           </Table.Row>)}
-          {!rows.length && <Table.Row><Table.Cell colSpan={5}><div className="empty" role="status">{loading ? '正在读取收款订单…' : error ? '尚未取得订单记录，请刷新重试。' : '本页暂无收款订单。客户付款后，可在这里核对收款和关联赠送单。'}</div></Table.Cell></Table.Row>}
+          {!rows.length && <Table.Row><Table.Cell colSpan={5}><div className="empty" role="status">{loading ? '正在读取历史收款…' : error ? '尚未取得订单记录，请刷新重试。' : '本页没有历史收款记录。新订单请使用卡密兑换。'}</div></Table.Cell></Table.Row>}
         </Table.Body>
       </Table>
     </div>

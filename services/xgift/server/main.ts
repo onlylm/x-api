@@ -8,7 +8,7 @@ import { server } from './http.ts'
 import worker from '../src/index.ts'
 import type { Env } from '../src/core.ts'
 import { createAlipayClient } from './alipay.ts'
-import { executeNative } from './native-executor.ts'
+import { executeNative, queryNativeOrder } from './native-executor.ts'
 
 const { MASTER_KEY, ADMIN_PASSWORD, PUBLIC_ORIGIN, DATABASE_PATH } = process.env
 if (
@@ -35,6 +35,7 @@ const env: Env = {
   PUBLIC_ORIGIN,
   PAYMENTS_LOCKED: process.env.PAYMENTS_LOCKED ?? 'false',
   NATIVE_EXECUTOR: executeNative,
+  NATIVE_ORDER_QUERY: queryNativeOrder,
   ALIPAY_CLIENT: createAlipayClient,
   CARD_DEFAULT_TRANSPORT: 'direct',
   OUTBOUND_FETCH: proxyFetch,

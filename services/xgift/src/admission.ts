@@ -33,31 +33,38 @@ export function dailyUsageSql(now: number) {
 }
 
 // Embed this predicate in the INSERT itself. A preliminary capability read can
-// explain a pause, but cannot reserve quota or protect the shared payment card.
+// explain a pause, but cannot reserve quota. The executor separately serializes
+// the shared payment card; admitting a queue must never start a second payment.
 export function newAdmissionSql(now: number) {
   return `EXISTS(SELECT 1 FROM order_admission WHERE id=1 AND enabled=1 AND ${dailyUsageSql(now)}<daily_limit)
-    AND NOT EXISTS(${activeOrdersSql}) AND NOT EXISTS(${pendingCheckoutsSql})`
+    AND NOT EXISTS(${pendingCheckoutsSql})`
 }
 
 export async function admissionView(env: Env) {
   const now = Date.now(), day = admissionDay(now)
   const row = await env.DB.prepare(`SELECT enabled,daily_limit,revision,updated_at,${dailyUsageSql(now)} used,
     (SELECT COUNT(*) FROM orders WHERE status IN('queued','running','unknown')) active_orders,
+    (SELECT COUNT(*) FROM orders WHERE status='queued') queued_orders,
+    (SELECT COUNT(*) FROM orders WHERE status='running') executing_orders,
+    (SELECT COUNT(*) FROM orders WHERE status='unknown') unknown_orders,
+    (SELECT id FROM orders WHERE status='unknown' ORDER BY created_at,id LIMIT 1) blocked_order_id,
     (SELECT COUNT(*) FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention')) pending_checkouts
-    FROM order_admission WHERE id=1`).first<Settings & { used: number; active_orders: number; pending_checkouts: number }>()
+    FROM order_admission WHERE id=1`).first<Settings & { used: number; active_orders: number; queued_orders: number;
+      executing_orders: number; unknown_orders: number; blocked_order_id: string | null; pending_checkouts: number }>()
   if (!row) return fail('admission_configuration_missing', '接单设置尚未初始化，请完成数据库升级。', 503)
   const ready = executionReady(env)
-  const reason = !row.enabled ? 'paused' : !ready ? 'execution_unavailable' : row.active_orders > 0 ? 'order_in_progress' :
+  const reason = !row.enabled ? 'paused' : !ready ? 'execution_unavailable' :
     row.pending_checkouts > 0 ? 'checkout_in_progress' : row.used >= row.daily_limit ? 'daily_limit_reached' : null
   const messages = {
     paused: '新接单已暂停；已接订单继续按原付款设置处理。',
     execution_unavailable: 'X 付款尚未就绪或已暂停。',
-    order_in_progress: '仍有处理或待核对的赠送订单，等待原订单结果后再接单。',
     checkout_in_progress: '仍有待付款或待核对的支付宝购买，等待原购买结果后再接单。',
     daily_limit_reached: '北京时间今日接单额度已用完。',
   }
   return { revision: row.revision, enabled: !!row.enabled, daily_limit: row.daily_limit, timezone: 'Asia/Shanghai' as const,
     used: row.used, remaining: Math.max(0, row.daily_limit - row.used), active_orders: row.active_orders,
+    queued_orders: row.queued_orders, executing_orders: row.executing_orders, unknown_orders: row.unknown_orders,
+    queue_blocked: row.unknown_orders > 0 || (!ready && row.queued_orders > 0), blocked_order_id: row.blocked_order_id,
     pending_checkouts: row.pending_checkouts, accepts_orders: reason === null, execution_ready: ready,
     reason, reason_message: reason ? messages[reason] : null, updated_at: row.updated_at,
     day_start: day.start, next_reset_at: day.end }

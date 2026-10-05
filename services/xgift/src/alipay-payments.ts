@@ -19,6 +19,8 @@ type Checkout = {
 }
 const pendingSql = "SELECT 1 FROM alipay_checkouts WHERE status IN('creating','pending','paid','attention')"
 const settlementId = alipaySettlementId
+const salesEnabled = (env: Env) => env.ALIPAY_SALES_ENABLED === 'true'
+const retiredMessage = '本站已停止扫码购买，请使用卡密兑换。已有订单仍可查询。'
 const money = (cents: number) => `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, '0')}`
 function cents(value: unknown, allowZero = false) {
   if (typeof value !== 'string' || !/^(0|[1-9]\d{0,4})(\.\d{1,2})?$/.test(value))
@@ -62,14 +64,15 @@ export async function alipayView(env: Env) {
     { code: 'prices', label: '至少一个已启用套餐有人民币售价', ok: list.some(p => p.enabled && p.product_enabled && Number(p.amount_cents) > 0) },
     { code: 'outbound', label: 'X 指定卡支付已就绪', ok: capability.execution_ready && !!effective.PAYMENT_SETTINGS?.card_id },
   ]
-  return { configured: !!settings, enabled: settings?.enabled ?? false, revision: settings?.revision ?? null,
+  return { configured: !!settings, enabled: salesEnabled(env) && (settings?.enabled ?? false), retired: !salesEnabled(env), revision: settings?.revision ?? null,
     environment: settings?.config.environment ?? 'sandbox', app_id: settings?.config.app_id ?? '', seller_id: settings?.config.seller_id ?? '',
     has_app_private_key: !!settings?.config.app_private_key, has_alipay_public_key: !!settings?.config.alipay_public_key,
     notify_url: notify, prices: list.map(p => ({ product_code: p.product_code, name: p.name, months: p.months,
       amount_cny: Number(p.amount_cents) > 0 ? money(Number(p.amount_cents)) : '', enabled: !!p.enabled })),
-    checks, ready: checks.every(c => c.ok), unsettled_count: pending?.n ?? 0 }
+    checks, ready: salesEnabled(env) && checks.every(c => c.ok), unsettled_count: pending?.n ?? 0 }
 }
 export async function configureAlipay(env: Env, body: Row) {
+  if (!salesEnabled(env)) return fail('alipay_retired', retiredMessage, 409)
   const old = await alipaySettings(env)
   if (body.revision !== (old?.revision ?? null)) return fail('alipay_config_conflict', '配置已变化，请刷新后再保存。', 409)
   if (old?.enabled) return fail('alipay_must_be_paused', '请先暂停支付宝收款，再修改配置。', 409)
@@ -113,6 +116,7 @@ export async function enableAlipay(env: Env, body: Row) {
     await audit(env, 'admin', 'pause_alipay', 'alipay')
     return { paused: true, enabled: false }
   }
+  if (!salesEnabled(env)) return fail('alipay_retired', retiredMessage, 409)
   if (body.confirmation !== 'ENABLE_ALIPAY') return fail('confirmation_required', '请输入 ENABLE_ALIPAY 确认开放真实收款。')
   const settings = await alipaySettings(env)
   if (!settings || body.revision !== settings.revision) return fail('alipay_config_conflict', '请先保存配置并刷新页面。', 409)
@@ -124,6 +128,7 @@ export async function enableAlipay(env: Env, body: Row) {
   return alipayView(env)
 }
 export async function checkoutCatalog(env: Env) {
+  if (!salesEnabled(env)) return { available: false, retired: true, reason: retiredMessage, payment_label: '历史支付宝订单', products: [] }
   const settings = await alipaySettings(env), effective = await resolvePaymentEnv(env)
   const caps = await orderCapabilities(effective)
   const busy = !!(await env.DB.prepare(pendingSql + ' LIMIT 1').first())
@@ -134,6 +139,7 @@ export async function checkoutCatalog(env: Env) {
       .map(p => ({ code: p.product_code, name: p.name, months: p.months, price_cny: money(Number(p.amount_cents)) })) }
 }
 export async function checkoutEligibility(env: Env, body: Row) {
+  if (!salesEnabled(env)) return fail('alipay_retired', retiredMessage, 409)
   const catalog = await checkoutCatalog(env)
   if (!catalog.available || !catalog.products.some(p => p.code === body.product_code)) return fail('checkout_unavailable', '当前套餐暂不可购买，请稍后再试。', 409)
   return eligibility(env, body.username)
@@ -163,6 +169,9 @@ async function configFor(env: Env, row: Checkout): Promise<AlipayConfig> {
   return JSON.parse(await unseal(env, 'alipay-checkout:' + row.id, row.config_payload))
 }
 async function precreate(env: Env, row: Checkout) {
+  // Retirement forbids recreating a payment QR even for a previously lost response.
+  // Queries, signed notifications and fulfillment of already-paid history remain active.
+  if (!salesEnabled(env)) return
   const settings = await alipaySettings(env)
   // Pausing collection prevents creating new QR codes, not processing already paid invoices.
   if (!settings?.enabled || settings.revision !== row.provider_revision || Date.now() >= row.expires_at) return
@@ -200,6 +209,7 @@ export async function createCheckout(env: Env, body: Row) {
     if (previous.request_hash !== digest) return fail('checkout_conflict', '这次购买已绑定原套餐和账号，请查询原订单。', 409)
     return publicCheckout(env, previous)
   }
+  if (!salesEnabled(env)) return fail('alipay_retired', retiredMessage, 409)
   const catalog = await checkoutCatalog(env)
   if (!catalog.available) return fail('checkout_unavailable', '当前暂不接受新的扫码购买，请稍后再试。', 409)
   const check = await eligibility(env, username)

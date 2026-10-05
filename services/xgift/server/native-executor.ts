@@ -9,10 +9,17 @@ import { assertPaymentAllowed, type PaymentBinding } from '../src/payments.ts'
 // X merchant published by x_gift_bot setup.go. Validate every returned payment page against it.
 export const X_MERCHANT = 'acct_1Ika5JA3KZ32dPo1'
 type Json = Record<string, any>
-interface Job { stage: string; session?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding
+interface Job { stage: string; session?: string; session_url?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding
   candidate_index?: number; rejected_cards?: { card_id: number; reason: string }[]; candidates_exhausted?: boolean; tokenization_started?: boolean }
 const sessionPattern = /^cs_live_[A-Za-z0-9]+$/
 const successUrl = (o: Order) => `https://x.com/${o.recipient}/gift-premium/success`
+export function validatedCheckoutUrl(value: unknown, session: unknown) {
+  if (typeof value !== 'string' || value.length > 8192 || typeof session !== 'string' || !sessionPattern.test(session)) throw new Error('invalid_checkout_url')
+  const url = new URL(value)
+  if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com' || url.port || url.username || url.password ||
+      !['/c/pay/' + session, '/pay/' + session].includes(url.pathname)) throw new Error('invalid_checkout_url')
+  return url.href
+}
 export function guardPage(p: Json, order: Order, session: string, before: boolean) {
   const amount = order.amount_minor, currency = order.currency
   if (p.session_id !== session || p.account_settings?.account_id !== X_MERCHANT || p.livemode !== true || p.mode !== 'payment' || p.currency !== currency || p.line_item_group?.currency !== currency || p.success_url !== successUrl(order) || p.cancel_url !== successUrl(order).replace('/success', '')) throw new Error('checkout_identity_mismatch')
@@ -35,11 +42,18 @@ async function stripe(key: string, method: string, path: string, fields: Record<
 }
 async function save(env: Env, order: Order, job: Job, change?: { from_card_id: number; to_card_id: number | null; reason: string }) {
   const now = Date.now()
-  const update = env.DB.prepare('INSERT INTO native_jobs VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET stage=excluded.stage,payload=excluded.payload,updated_at=excluded.updated_at')
-    .bind(order.id, job.stage, await seal(env, 'native:' + order.id, JSON.stringify(job)), now)
-  if (change) await env.DB.batch([update, env.DB.prepare('INSERT INTO audit VALUES(?,?,?,?,?,?)')
-    .bind(id('audit'), 'system', change.to_card_id === null ? 'payment_cards_exhausted' : 'payment_card_failover', order.id, JSON.stringify(change), now)])
+  const payload = await seal(env, 'native:' + order.id, JSON.stringify(job))
+  // Fence replaced workers: a closed order cannot persist another write-ahead stage.
+  const update = env.DB.prepare(`INSERT INTO native_jobs SELECT ?,?,?,? WHERE EXISTS(
+    SELECT 1 FROM orders WHERE id=? AND status IN('running','unknown') AND work_token IS ? AND lease_until>?)
+    ON CONFLICT(order_id) DO UPDATE SET stage=excluded.stage,payload=excluded.payload,updated_at=excluded.updated_at`)
+    .bind(order.id, job.stage, payload, now, order.id, order.work_token, now)
+  if (change) await env.DB.batch([update, env.DB.prepare(`INSERT INTO audit SELECT ?,?,?,?,?,? WHERE EXISTS(
+    SELECT 1 FROM native_jobs WHERE order_id=? AND payload=?)`)
+    .bind(id('audit'), 'system', change.to_card_id === null ? 'payment_cards_exhausted' : 'payment_card_failover', order.id, JSON.stringify(change), now, order.id, payload)])
   else await update.run()
+  if (!await env.DB.prepare('SELECT 1 FROM native_jobs WHERE order_id=? AND payload=?').bind(order.id, payload).first())
+    throw new Failure('order_busy', '原订单已由其他操作接管，请刷新状态。', 409)
 }
 async function prepareWrite(env: Env, order: Order, job: Job, stage: string) {
   const previous = job.stage
@@ -174,8 +188,7 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
       }, true)
       const s = result.onetimepurchase_gift
       if (s?.session_status !== 'Unpaid' || !sessionPattern.test(s.session_id)) throw new Error('invalid_checkout')
-      const url = new URL(s.session_url)
-      if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com' || url.username || url.password || !url.pathname.endsWith('/pay/' + s.session_id)) throw new Error('invalid_checkout_url')
+      job.session_url = validatedCheckoutUrl(s.session_url, s.session_id)
       job.session = s.session_id; job.stage = 'session'; await save(env, order, job); return running()
     }
     if (job.stage === 'creating' || job.stage === 'tokenizing') return unknown('original_request_unconfirmed')
@@ -250,4 +263,31 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
   } catch (error) {
     return unknown(error instanceof Failure ? error.code : error instanceof CardCheckError ? error.reason : 'execution_requires_reconciliation')
   }
+}
+
+/** Read-only admin reconciliation. Never advance preparation or submit payment. */
+export async function queryNativeOrder(env: Env, order: Order, _snapshot: Snapshot): Promise<Result> {
+  const unknown = (failure_code: string): Result => ({ order_id: order.id, status: 'unknown', failure_code })
+  const row = await env.DB.prepare('SELECT payload FROM native_jobs WHERE order_id=?').bind(order.id).first<{ payload: string }>()
+  if (!row) return { order_id: order.id, status: 'running', failure_code: 'payment_not_started' }
+  try {
+    const job = JSON.parse(await unseal(env, 'native:' + order.id, row.payload)) as Job
+    if (job.stage === 'preflight' && !job.session) return { order_id: order.id, status: 'running', failure_code: 'payment_not_started' }
+    if (!job.session || !sessionPattern.test(job.session)) return unknown('original_request_unconfirmed')
+    if (!/^pk_live_[A-Za-z0-9]+$/.test(job.key)) return unknown('execution_configuration_missing')
+    // URL alone is not proof: bind exact merchant, recipient, one-time product and price.
+    if (!job.proof) return unknown('checkout_proof_missing')
+    guardPage(job.proof, order, job.session, true)
+    const poll = await stripe(job.key, 'GET', `payment_pages/${job.session}/poll`)
+    if (poll.session_id !== job.session || poll.livemode !== true || poll.is_sandbox_merchant !== false || poll.mode !== 'payment' ||
+        poll.success_url !== successUrl(order) || (poll.currency !== undefined && poll.currency !== order.currency) ||
+        (poll.amount !== undefined && poll.amount !== order.amount_minor) || (poll.account_id !== undefined && poll.account_id !== X_MERCHANT))
+      return unknown('payment_evidence_mismatch')
+    if (poll.state !== 'succeeded' || poll.payment_object_status !== 'succeeded')
+      return unknown(poll.payment_object_status === 'requires_action' ? 'payment_requires_action' : 'payment_pending')
+    return { order_id: order.id, status: 'succeeded', evidence: {
+      payment_status: 'paid', gift_status: 'checkout_completed', recipient: order.recipient, product_code: order.product_code,
+      currency: order.currency, amount_minor: order.amount_minor, receipt_id: job.session,
+    } }
+  } catch { return unknown('payment_query_failed') }
 }

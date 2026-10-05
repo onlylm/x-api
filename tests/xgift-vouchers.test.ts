@@ -113,8 +113,13 @@ test('anonymous capabilities expose availability, reason and modes and follow sh
   const full = await f.call('/api/capabilities')
   assert.equal(full.status, 200)
   assert.deepEqual(await full.json(), {
-    data: { execution_ready: true, accepts_orders: false, reason: 'order_in_progress', modes: ['direct', 'voucher'] },
+    data: { execution_ready: true, accepts_orders: false, reason: 'daily_limit_reached', modes: ['direct', 'voucher'] },
   })
+  f.db.exec('UPDATE order_admission SET daily_limit=2')
+  const queueAvailable = await f.call('/api/capabilities')
+  assert.deepEqual(await queueAvailable.json(), {
+    data: { execution_ready: true, accepts_orders: true, reason: null, modes: ['direct', 'voucher'] },
+  }, 'A queued gift does not block another recipient when daily capacity remains')
   assert.equal(f.upstream.calls, 1, 'capability checks must not query upstream accounts')
 })
 

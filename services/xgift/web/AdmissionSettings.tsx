@@ -13,6 +13,10 @@ type AdmissionView = {
   used: number
   remaining: number
   active_orders: number
+  queued_orders: number
+  executing_orders: number
+  unknown_orders: number
+  queue_blocked: boolean
   pending_checkouts: number
   accepts_orders: boolean
   execution_ready: boolean
@@ -149,7 +153,7 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
           </Button>
         </div>
       </div>
-      <p className="note payment-intro">卡密兑换、商户直充与支付宝扫码购买共享每日额度，按北京时间每日 00:00 重置。此处只控制新增接单，不会开启或停用 X 付款、支付宝收款。</p>
+      <p className="note payment-intro">卡密兑换与商户直充共享每日额度，按北京时间每日 00:00 重置。允许多单入队，付款逐笔执行；此处只控制新增接单，不会开启或停用 X 付款。</p>
       {statusError && <p role="alert" className="notice error">状态未确认：{statusError} 下方如有数据，仅为上次确认结果；请刷新状态。</p>}
       {actionError && <p role="alert" className="notice error">{actionError}</p>}
       {message && <p role="status" className="notice">{message}</p>}
@@ -164,10 +168,10 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
         </div>
         {view.reason_message && <p className="notice" role="status">{view.reason_message}</p>}
         <ul className="payment-checks" aria-label="新增接单条件">
-          <li><span className={`status ${view.execution_ready ? 'status-ACTIVE' : 'status-unknown'}`}>{view.execution_ready ? '已就绪' : '待处理'}</span><span>X 付款执行条件{view.execution_ready ? '已就绪' : '未就绪，请检查下方 X 付款配置'}</span></li>
+          <li><span className={`status ${view.execution_ready ? 'status-ACTIVE' : 'status-unknown'}`}>{view.execution_ready ? '已就绪' : '待处理'}</span><span>X 付款执行条件{view.execution_ready ? '已就绪' : '未就绪，请前往“X 付款设置”检查'}</span></li>
           <li><span className={`status ${view.remaining > 0 ? 'status-ACTIVE' : 'status-unknown'}`}>{view.remaining > 0 ? '有额度' : '已用完'}</span><span>北京时间今日接单额度</span></li>
-          <li><span className={`status ${view.active_orders === 0 ? 'status-ACTIVE' : 'status-unknown'}`}>{view.active_orders === 0 ? '无阻断' : '待核对'}</span><span>处理中 / 待核对的赠送订单 {view.active_orders} 笔</span></li>
-          <li><span className={`status ${view.pending_checkouts === 0 ? 'status-ACTIVE' : 'status-unknown'}`}>{view.pending_checkouts === 0 ? '无阻断' : '待处理'}</span><span>待付款 / 待核对的支付宝购买 {view.pending_checkouts} 笔</span></li>
+          <li><span className="status">按序执行</span><span>排队 {view.queued_orders} 笔 · 执行 {view.executing_orders} 笔 · 待处理 {view.unknown_orders} 笔</span></li>
+          <li><span className={`status ${view.queue_blocked ? 'status-unknown' : 'status-ACTIVE'}`}>{view.queue_blocked ? '执行暂停' : '逐笔付款'}</span><span>{view.queue_blocked ? '待处理原单不会清空；前往“订单与队列”处理' : '不同账号可排队，同一账号未结单仍禁止重复下单'}</span></li>
         </ul>
         <p className="note payment-meta">下次重置：{beijingTime(view.next_reset_at)}（北京时间）。零点只重置每日额度，不会清除待核对订单。<br />
           {checkedAt && <>状态确认于 {beijingTime(checkedAt)}（北京时间）· 页面可见时每 30 秒刷新</>}
@@ -188,7 +192,7 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
               <option value="enabled">开放新增接单（保存时需确认）</option>
             </select>
           </label>
-          <p id="admission-limit-help" className="note payment-policy">请输入 1–10000 的整数。未结束的扫码购买会预占额度；成功订单计入当日额度。降低上限或暂停接单不会取消已有订单、退款或重复扣款。未确认的付款结果仍须核对原单。</p>
+          <p id="admission-limit-help" className="note payment-policy">请输入 1–10000 的整数。排队及执行中的订单预占额度，成功订单计入当日额度。降低上限或暂停接单不会取消已有订单；需要取消的订单请到“订单与队列”安全关闭。历史未结束收款如有预占，仍按原单核对。</p>
           {!validLimit && <p className="notice error payment-policy" role="alert">每日上限必须是 1–10000 的整数。</p>}
           {validLimit && Number(draft.dailyLimit) < view.used && <p className="notice payment-policy">新上限低于今日已占用额度；保存后今日不再接新单，不会取消已有订单。</p>}
           <div className="payment-save-row">
@@ -201,7 +205,7 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
         <Dialog size="lg" className="x-modal">
           <form onSubmit={(event) => { event.preventDefault(); void mutate('save') }}>
             <Dialog.Title className="modal-title">确认开放每日接单</Dialog.Title>
-            <Dialog.Description className="modal-description">每日上限将设为 {draft?.dailyLimit} 笔，北京时间 00:00 重置。X 付款须已就绪，扫码购买另需启用支付宝收款；接受的订单可能产生真实扣款。已有未结订单仍会阻止新增接单。</Dialog.Description>
+            <Dialog.Description className="modal-description">每日上限将设为 {draft?.dailyLimit} 笔，北京时间 00:00 重置。X 付款须已就绪，接受的订单将排队逐笔执行，可能产生真实扣款。不同账号可入队；同一账号的未结订单仍会阻止重复下单。</Dialog.Description>
             <Input label="输入 UPDATE_ORDER_LIMITS 确认" value={confirmation} autoComplete="off" spellCheck={false}
               disabled={!!busy} onChange={(event) => setConfirmation(event.target.value)} />
             {!busy && !loading && !canSave && <p className="notice error" role="alert">配置或状态已变化，请关闭此窗口并刷新接单状态后核对。</p>}
