@@ -1,0 +1,43 @@
+.redeem-flow .redeem-wrap { width: min(600px, 100%); padding-block: 48px; }
+.redeem-flow .recharge-intro { max-width: 65ch; }
+.redeem-flow .recharge-steps { padding-bottom: 24px; margin-block: 28px 32px; border-bottom: 1px solid var(--recharge-line); }
+.redeem-flow .recharge-steps [data-complete] { color: var(--recharge-accent); }
+.redeem-flow .recharge-steps [data-complete] > span { background: var(--recharge-confirm); color: var(--recharge-accent); }
+.redeem-stage h2, .redeem-confirmation h2, .redeem-order-stage h2 { font-size: 18px; line-height: 1.5; font-weight: 600; }
+.redeem-stage h2:focus, .redeem-confirmation h2:focus, .redeem-order-stage h2:focus { outline: 2px solid var(--recharge-accent); outline-offset: 5px; }
+.redeem-stage > .note { margin-block: 10px 22px; }
+.redeem-stage .recharge-form { margin: 0; }
+.redeem-completed-step { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding-bottom: 24px; margin-bottom: 30px; border-bottom: 1px solid var(--recharge-line); }
+.redeem-completed-step > div { display: flex; flex-direction: column; min-width: 0; gap: 8px; }
+.redeem-completed-step span, .redeem-completed-step small { color: var(--recharge-muted); font-size: 12px; line-height: 1.7; }
+.redeem-completed-step strong { color: var(--recharge-ink); font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.redeem-completed-step > button { flex-shrink: 0; }
+.redeem-confirmation { padding: 24px; background: var(--recharge-confirm); border-radius: 12px; }
+.redeem-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.redeem-confirm-details { margin: 24px 0; }
+.redeem-confirm-details > div { display: flex; flex-direction: column; gap: 8px; margin-top: 20px; }
+.redeem-confirm-details dt { font-size: 12px; color: var(--recharge-muted); }
+.redeem-confirm-details dd { margin: 0; color: var(--recharge-ink); font-size: 16px; font-weight: 500; overflow-wrap: anywhere; }
+.redeem-confirm-details > div:first-child dd { font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+.redeem-confirmation > button { width: 100%; margin-top: 6px; }
+.redeem-result-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.redeem-order-stage .recharge-result { margin-top: 0; }
+.redeem-order-stage .recharge-details { margin-block: 20px 16px; }
+.redeem-flow .redeem-binding-note { margin-block: 12px; }
+.redeem-flow .redeem-poll-status { font-size: 12px; font-variant-numeric: tabular-nums; }
+.redeem-next { display: flex; align-items: flex-start; gap: 16px; padding-top: 22px; margin-top: 24px; border-top: 1px solid var(--recharge-line); }
+.redeem-next > button { flex-shrink: 0; }
+.redeem-next > .note { margin: 0; font-size: 12px; }
+.redeem-flow .redeem-privacy-note { margin-top: 32px; padding-top: 22px; border-top: 1px solid var(--recharge-line); font-size: 12px; }
+.redeem-flow button { min-height: 44px; }
+@media (max-width: 540px) {
+  .redeem-flow .redeem-wrap { padding-block: 32px; }
+  .redeem-flow .recharge-steps { gap: 12px; margin-top: 24px; }
+  .redeem-flow .recharge-steps li { flex: 1; flex-direction: column; align-items: flex-start; gap: 10px; }
+  .redeem-completed-step { gap: 10px; align-items: flex-start; }
+  .redeem-confirmation { padding: 20px; }
+  .redeem-section-heading { align-items: flex-start; gap: 8px; }
+  .redeem-order-stage .recharge-result-heading { align-items: flex-start; flex-wrap: wrap; }
+  .redeem-result-actions { justify-content: flex-start; }
+  .redeem-next { flex-direction: column; gap: 10px; }
+}

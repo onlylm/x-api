@@ -86,13 +86,40 @@ export async function issueVouchers(env: Env, body: Record<string, unknown>) {
   }
 }
 
-export async function listVouchers(env: Env, offset: number) {
+export type VoucherFilters = { status?: string; q?: string; user_id?: string }
+
+export async function listVouchers(env: Env, offset: number, filters: VoucherFilters = {}) {
+  if (!Number.isSafeInteger(offset) || offset < 0)
+    fail('invalid_input', '卡密分页参数无效。')
+  const status = filters.status?.trim() ?? ''
+  const query = filters.q?.trim() ?? ''
+  const owner = filters.user_id?.trim() ?? ''
+  if (!['', 'available', 'active', 'redeemed', 'revoked', 'expired'].includes(status))
+    fail('invalid_input', '卡密状态筛选无效。')
+  if (query.length > 80 || owner.length > 80)
+    fail('invalid_input', '商户或批次查询不能超过 80 个字符。')
+  const conditions: string[] = [], values: (string | number)[] = []
+  const now = Date.now()
+  if (status === 'available' || status === 'active' || status === 'expired') {
+    conditions.push(`v.status='active' AND v.expires_at${status === 'expired' ? '<=' : '>'}?`)
+    values.push(now)
+  } else if (status) {
+    conditions.push('v.status=?')
+    values.push(status)
+  }
+  if (owner) { conditions.push('v.user_id=?'); values.push(owner) }
+  if (query) {
+    const pattern = `%${query.replace(/[\\%_]/g, '\\$&')}%`
+    conditions.push("(v.batch_label LIKE ? ESCAPE '\\' OR v.batch_id LIKE ? ESCAPE '\\' OR u.name LIKE ? ESCAPE '\\' OR v.user_id LIKE ? ESCAPE '\\')")
+    values.push(pattern, pattern, pattern, pattern)
+  }
   const rows = (await env.DB.prepare(
     `SELECT v.id,v.batch_id,v.batch_label,v.user_id,u.name user_name,v.product_code,p.name product_name,p.months,
      v.last_four,v.status,v.order_id,v.created_at,v.expires_at,v.redeemed_at,v.revoked_at,v.revocation_note,o.status order_status
      FROM vouchers v JOIN users u ON u.id=v.user_id JOIN products p ON p.code=v.product_code
-     LEFT JOIN orders o ON o.id=v.order_id ORDER BY v.created_at DESC,v.id LIMIT 30 OFFSET ?`,
-  ).bind(offset).all<Pick<VoucherRecord, 'status' | 'expires_at'> & Record<string, unknown>>()).results
+     LEFT JOIN orders o ON o.id=v.order_id ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
+     ORDER BY v.created_at DESC,v.id LIMIT 30 OFFSET ?`,
+  ).bind(...values, offset).all<Pick<VoucherRecord, 'status' | 'expires_at'> & Record<string, unknown>>()).results
   return rows.map(row => ({ ...row, state: state(row) }))
 }
 

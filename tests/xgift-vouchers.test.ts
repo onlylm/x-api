@@ -9,6 +9,7 @@ import { createOrder, credit } from '../services/xgift/src/orders.ts'
 import { saveSecret } from '../services/xgift/src/network.ts'
 import { sha256, type Env } from '../services/xgift/src/core.ts'
 import worker from '../services/xgift/src/index.ts'
+import { issueVouchers, listVouchers, revokeVoucher } from '../services/xgift/src/vouchers.ts'
 
 type Context = Parameters<Parameters<typeof test>[1]>[0]
 type Issued = { id: string; code: string; product_code: string; expires_at: number }
@@ -89,6 +90,93 @@ async function fixture(t: Context, points = 1000) {
   }
   return { db, env, owner, upstream, call, login, admin, issue, inspect, redeem, wallet, native }
 }
+
+test('voucher management filters before pagination and preserves literal merchant and batch searches', async t => {
+  const f = await fixture(t)
+  const other = await createUser(f.env, { name: 'Second merchant', email: 'second-voucher@example.test', password })
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const target = await issueVouchers(f.env, { user_id: f.owner.id, product_code: 'x-premium-3m', quantity: 35, batch_label: '交付 %_\\ 批次' })
+  now += 1000
+  await issueVouchers(f.env, { user_id: other.id, product_code: 'x-premium-6m', quantity: 35, batch_label: 'Other batch' })
+  assert.ok((await listVouchers(f.env, 0)).every(row => row.user_id === other.id), 'newer records occupy the first unfiltered page')
+  const first = await listVouchers(f.env, 0, { q: '交付 %_\\ 批次', status: 'available' })
+  const second = await listVouchers(f.env, 30, { q: '交付 %_\\ 批次', status: 'available' })
+  assert.equal(first.length, 30)
+  assert.equal(second.length, 5)
+  assert.equal(new Set([...first, ...second].map(row => row.id)).size, 35)
+  assert.deepEqual(new Set([...first, ...second].map(row => row.id)), new Set(target.vouchers.map(row => row.id)))
+  assert.equal((await listVouchers(f.env, 60, { q: target.batch_id })).length, 0)
+  assert.ok((await listVouchers(f.env, 0, { q: f.owner.name })).every(row => row.user_id === f.owner.id))
+  assert.equal((await listVouchers(f.env, 0, { q: f.owner.id })).length, 30)
+  assert.equal((await listVouchers(f.env, 0, { q: '%' })).length, 30, 'percent is literal, not a wildcard')
+  assert.equal((await listVouchers(f.env, 30, { q: '交付 %_' })).length, 5, 'search punctuation is literal, not a wildcard')
+  assert.equal((await listVouchers(f.env, 0, { q: "' OR 1=1 --" })).length, 0, 'search is parameterized')
+  assert.equal((await listVouchers(f.env, 0, { user_id: other.id, q: target.batch_id })).length, 0, 'owner and query conditions intersect')
+  assert.equal((await listVouchers(f.env, 0, { user_id: f.owner.id, status: 'active' })).length, 30)
+  const resultText = JSON.stringify(first)
+  assert.doesNotMatch(resultText, /code_hash|password|secret|PRIVATE-X/)
+  for (const voucher of target.vouchers) assert.ok(!resultText.includes(voucher.code))
+  assert.equal(f.upstream.calls, 0)
+  assert.deepEqual(f.wallet(), { available: 1000, frozen: 0 })
+})
+
+test('voucher management separates expiration boundary from redeemed and revoked states without mutating records', async t => {
+  const f = await fixture(t)
+  const short = await issueVouchers(f.env, { user_id: f.owner.id, product_code: 'x-premium-3m', quantity: 3, expires_in_days: 1 })
+  const long = await issueVouchers(f.env, { user_id: f.owner.id, product_code: 'x-premium-6m', quantity: 1, expires_in_days: 3 })
+  await revokeVoucher(f.env, short.vouchers[1].id, { note: 'No longer required' })
+  assert.ok((await f.redeem(short.vouchers[2].code)).ok)
+  const snapshot = f.db.prepare('SELECT * FROM vouchers ORDER BY id').all()
+  const originalWallet = f.wallet(), calls = f.upstream.calls
+  t.mock.method(Date, 'now', () => short.vouchers[0].expires_at)
+  const expired = await listVouchers(f.env, 0, { status: 'expired' })
+  const available = await listVouchers(f.env, 0, { status: 'available' })
+  const redeemed = await listVouchers(f.env, 0, { status: 'redeemed' })
+  const revoked = await listVouchers(f.env, 0, { status: 'revoked' })
+  assert.deepEqual(expired.map(row => row.id), [short.vouchers[0].id])
+  assert.equal(expired[0].state, 'expired')
+  assert.deepEqual(available.map(row => row.id), [long.vouchers[0].id])
+  assert.equal(available[0].state, 'available')
+  assert.deepEqual(redeemed.map(row => row.id), [short.vouchers[2].id])
+  assert.equal(redeemed[0].state, 'redeemed')
+  assert.ok(redeemed[0].order_id)
+  assert.deepEqual(revoked.map(row => row.id), [short.vouchers[1].id])
+  assert.equal(revoked[0].state, 'revoked')
+  assert.deepEqual(f.db.prepare('SELECT * FROM vouchers ORDER BY id').all(), snapshot)
+  assert.deepEqual(f.wallet(), originalWallet)
+  assert.equal(f.upstream.calls, calls)
+  for (const filters of [{ status: 'unknown' }, { q: 'a'.repeat(81) }, { user_id: 'a'.repeat(81) }]) {
+    await assert.rejects(listVouchers(f.env, 0, filters), error => (error as { status?: number }).status === 400)
+  }
+  await assert.rejects(listVouchers(f.env, -1), error => (error as { status?: number }).status === 400)
+})
+
+test('voucher management endpoints keep filtered records and merchant lookup admin-only', async t => {
+  const f = await fixture(t)
+  const issued = await f.issue({ batch_label: '需要查找的交付批次' })
+  const userCookie = await f.login(f.owner.email, password)
+  const query = '?page=1&status=available&q=' + encodeURIComponent(issued.batch_id)
+  assert.equal((await f.call('/api/admin/vouchers' + query)).status, 401)
+  assert.equal((await f.call('/api/admin/vouchers' + query, undefined, userCookie)).status, 403)
+  const matches = await f.call('/api/admin/vouchers' + query, undefined, f.admin)
+  assert.equal(matches.status, 200)
+  assert.deepEqual((await matches.json()).data.map((row: { id: string }) => row.id), [issued.vouchers[0].id])
+  const missing = await f.call('/api/admin/vouchers?q=missing-batch', undefined, f.admin)
+  assert.deepEqual((await missing.json()).data, [])
+  assert.equal((await f.call('/api/admin/vouchers?status=invalid', undefined, f.admin)).status, 400)
+  assert.equal((await f.call('/api/admin/users?q=Voucher', undefined, userCookie)).status, 403)
+  const merchants = await f.call('/api/admin/users?q=' + encodeURIComponent(f.owner.id), undefined, f.admin)
+  assert.equal(merchants.status, 200)
+  const values = (await merchants.json()).data
+  assert.equal(values.length, 1)
+  assert.equal(values[0].id, f.owner.id)
+  assert.equal(values[0].available, 1000)
+  assert.equal(values[0].enabled, 1)
+  assert.doesNotMatch(JSON.stringify(values), /password|secret|salt|hash/)
+  assert.equal(f.upstream.calls, 0)
+})
+
 
 test('anonymous capabilities expose availability, reason and modes and follow shared daily admission', async t => {
   const f = await fixture(t)

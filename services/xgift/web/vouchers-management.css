@@ -1,0 +1,55 @@
+.voucher-management { min-width: 0; }
+.voucher-management .voucher-create { margin-bottom: 36px; padding-bottom: 28px; border-bottom: 1px solid var(--recharge-line); }
+.voucher-generation-form { display: grid; grid-template-columns: minmax(250px, 1fr) minmax(300px, 1.4fr); gap: 28px; }
+.voucher-owner-picker { min-width: 0; margin: 0; padding: 0; border: 0; display: grid; gap: 12px; align-content: start; }
+.voucher-owner-picker legend { padding: 0; margin-bottom: 12px; font-weight: 600; color: var(--recharge-ink); }
+.voucher-owner-picker select { width: 100%; text-overflow: ellipsis; }
+.voucher-owner-summary { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 12px 0; border-bottom: 1px solid var(--recharge-line); }
+.voucher-owner-summary span, .voucher-owner-pager { font-size: 12px; color: #596574; font-variant-numeric: tabular-nums; }
+.voucher-owner-pager { display: flex; align-items: center; gap: 8px; }
+.voucher-owner-pager > span { margin-right: auto; }
+.voucher-issue-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-content: start; }
+.voucher-issue-fields > :nth-child(1), .voucher-issue-fields > :nth-child(2), .voucher-generate-action { grid-column: 1 / -1; }
+.voucher-generate-action { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.voucher-management .note { color: #65717f; }
+.voucher-management input, .voucher-management select, .voucher-management button { min-height: 44px; }
+.voucher-management .text-link { display: inline-flex; align-items: center; gap: 6px; }
+.voucher-records > .toolbar { align-items: start; }
+.voucher-records > .toolbar .note { margin: 8px 0 0; }
+.voucher-record-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-bottom: 20px; }
+.voucher-record-filters > :first-child { flex: 1 1 290px; min-width: 0; }
+.voucher-record-filters > .form-field { flex: 0 1 160px; min-width: 130px; }
+.voucher-record-table table { min-width: 760px; }
+.voucher-record-table th:nth-child(1) { width: 25%; }
+.voucher-record-table .stack > .status { align-self: start; }
+.voucher-record-detail { margin-top: 10px; font-size: 12px; color: #596574; }
+.voucher-record-detail summary { display: list-item; cursor: pointer; width: fit-content; padding: 6px 0; }
+.voucher-record-detail summary:hover { color: var(--recharge-accent); }
+.voucher-record-detail dl { margin: 10px 0 0; display: grid; gap: 10px; }
+.voucher-record-detail dl > div { display: grid; gap: 4px; }
+.voucher-record-detail dt { color: #65717f; }
+.voucher-record-detail dd { margin: 0; overflow-wrap: anywhere; }
+.voucher-record-detail code { font-size: 11px; }
+.voucher-management .pager { flex-wrap: wrap; }
+.voucher-batch-dialog .secret-output { width: 100%; margin: 12px 0; }
+.voucher-saved-confirm { display: flex; align-items: start; gap: 10px; line-height: 1.6; padding: 12px 0; }
+.voucher-saved-confirm input { width: 18px; height: 18px; margin: 3px 0 0; flex-shrink: 0; accent-color: var(--recharge-accent); }
+.voucher-copy-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+.voucher-batch-dialog button { min-height: 44px; }
+.voucher-management input, .voucher-management textarea { caret-color: var(--recharge-accent); }
+.voucher-management select:disabled { cursor: default; background: var(--recharge-surface); }
+.voucher-management :is(input, select, button, summary, a):focus-visible, .voucher-batch-dialog :is(input, button, textarea):focus-visible { outline: 2px solid #527461; outline-offset: 3px; }
+@media (max-width: 1000px) {
+  .voucher-generation-form { grid-template-columns: minmax(0, 1fr); }
+  .voucher-issue-fields > :nth-child(1), .voucher-issue-fields > :nth-child(2) { grid-column: auto; }
+}
+@media (max-width: 540px) {
+  .voucher-issue-fields { grid-template-columns: minmax(0, 1fr); }
+  .voucher-record-filters > :first-child { flex-basis: 100%; }
+  .voucher-record-filters > .form-field { flex: 1 1 100%; }
+  .voucher-record-filters > button { flex: 1 1 auto; }
+  .voucher-generate-action > button, .voucher-copy-actions > button { width: 100%; }
+  .voucher-records > .toolbar { gap: 16px; flex-wrap: wrap; }
+  .voucher-management .pager > span { flex-basis: 100%; }
+  .voucher-owner-pager { flex-wrap: wrap; }
+}

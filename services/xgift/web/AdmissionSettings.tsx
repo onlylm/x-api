@@ -4,6 +4,7 @@ import { Input } from '@cloudflare/kumo/components/input'
 import { Dialog } from '@cloudflare/kumo/components/dialog'
 import { ArrowClockwise } from '@phosphor-icons/react'
 import type { Request } from './Recharge'
+import { useUnsavedChanges } from './unsaved-changes'
 
 type AdmissionView = {
   revision: string
@@ -90,6 +91,7 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
   }, [refresh])
 
   const dirty = !!draft && isDirty(draft)
+  useUnsavedChanges(dirty || !!busy)
   const conflict = !!draft && !!view && draft.revision !== view.revision
   const validLimit = !!draft && /^[1-9][0-9]{0,4}$/.test(draft.dailyLimit) && Number(draft.dailyLimit) <= 10000
   const canSave = !!view && !!draft && dirty && validLimit && !conflict && !statusError && !loading && !busy
@@ -153,7 +155,7 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
           </Button>
         </div>
       </div>
-      <p className="note payment-intro">卡密兑换与商户直充共享每日额度，按北京时间每日 00:00 重置。允许多单入队，付款逐笔执行；此处只控制新增接单，不会开启或停用 X 付款。</p>
+      <p className="note payment-intro">只控制新订单的接收。已有订单继续按原付款设置处理。</p>
       {statusError && <p role="alert" className="notice error">状态未确认：{statusError} 下方如有数据，仅为上次确认结果；请刷新状态。</p>}
       {actionError && <p role="alert" className="notice error">{actionError}</p>}
       {message && <p role="status" className="notice">{message}</p>}
@@ -161,12 +163,14 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
         {loading ? '正在读取每日接单设置…' : '尚未取得接单设置，请刷新状态重试。仍可使用“暂停新增接单”。'}
       </div> : <>
         <div className="payment-status" aria-live="polite">
-          <span className={`status ${view.enabled ? 'status-ACTIVE' : ''}`}>{view.enabled ? '接单开关已开放' : '新增接单已暂停'}</span>
-          <span>{view.accepts_orders ? '当前可接新单' : '当前不接新单'}</span>
+          <span className={`status ${view.accepts_orders ? 'status-ACTIVE' : 'status-unknown'}`}>{view.accepts_orders ? '当前可接新单' : '当前不接新单'}</span>
           <span>今日已占用 {view.used} / {view.daily_limit} 笔</span>
           <span>今日剩余 {view.remaining} 笔</span>
         </div>
-        {view.reason_message && <p className="notice" role="status">{view.reason_message}</p>}
+        {view.reason_message && <p className="notice" role="status">{view.reason_message}{!view.execution_ready && <> <a href="#payment" className="text-link">检查付款设置</a></>}</p>}
+        {view.queue_blocked && <p className="notice">执行队列需要处理，已接收订单不会丢失。<a href="#orders?status=active" className="text-link">查看待处理订单</a></p>}
+        <details className="settings-checks">
+        <summary>查看运行条件与额度规则</summary>
         <ul className="payment-checks" aria-label="新增接单条件">
           <li><span className={`status ${view.execution_ready ? 'status-ACTIVE' : 'status-unknown'}`}>{view.execution_ready ? '已就绪' : '待处理'}</span><span>X 付款执行条件{view.execution_ready ? '已就绪' : '未就绪，请前往“X 付款设置”检查'}</span></li>
           <li><span className={`status ${view.remaining > 0 ? 'status-ACTIVE' : 'status-unknown'}`}>{view.remaining > 0 ? '有额度' : '已用完'}</span><span>北京时间今日接单额度</span></li>
@@ -176,6 +180,8 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
         <p className="note payment-meta">下次重置：{beijingTime(view.next_reset_at)}（北京时间）。零点只重置每日额度，不会清除待核对订单。<br />
           {checkedAt && <>状态确认于 {beijingTime(checkedAt)}（北京时间）· 页面可见时每 30 秒刷新</>}
         </p>
+        <p className="note">卡密兑换与商户直充共用额度。排队与执行订单预占额度，付款确认后计入当日额度；历史收款如仍有预占，继续按原单核对。接单开关：{view.enabled ? '开放' : '暂停'}。</p>
+        </details>
         {conflict && <div className="notice error" role="alert">
           接单设置已在其他页面发生变化。请载入最新配置后重新调整；这会替换当前未保存的输入。
           <Button variant="secondary" disabled={!!busy || loading} onClick={() => void refresh(true)}>载入最新接单设置</Button>
@@ -192,7 +198,7 @@ export function AdmissionSettings({ request, onError }: { request: Request; onEr
               <option value="enabled">开放新增接单（保存时需确认）</option>
             </select>
           </label>
-          <p id="admission-limit-help" className="note payment-policy">请输入 1–10000 的整数。排队及执行中的订单预占额度，成功订单计入当日额度。降低上限或暂停接单不会取消已有订单；需要取消的订单请到“订单与队列”安全关闭。历史未结束收款如有预占，仍按原单核对。</p>
+          <p id="admission-limit-help" className="note payment-policy">1–10000 笔，北京时间每日 00:00 重置。降低上限或暂停接单，不会取消已有订单。</p>
           {!validLimit && <p className="notice error payment-policy" role="alert">每日上限必须是 1–10000 的整数。</p>}
           {validLimit && Number(draft.dailyLimit) < view.used && <p className="notice payment-policy">新上限低于今日已占用额度；保存后今日不再接新单，不会取消已有订单。</p>}
           <div className="payment-save-row">

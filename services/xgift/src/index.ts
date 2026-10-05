@@ -26,7 +26,7 @@ import {
   type Env,
 } from './core.ts'
 import { cleanup, reconcile } from './executor.ts'
-import { adminCheckOrder, adminCloseOrder, adminPaymentPage } from './admin-order-actions.ts'
+import { adminCheckOrder, adminCloseOrder, adminOrderCapabilities, adminPaymentPage } from './admin-order-actions.ts'
 import {
   cardConfiguration,
   configureCards,
@@ -208,7 +208,9 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (path.startsWith('/api/admin/')) {
     if (!admin) return fail('forbidden', '需要管理员权限。', 403)
     if (path === '/api/admin/vouchers' && method === 'GET')
-      return json(await listVouchers(env, pagination(url).offset))
+      return json(await listVouchers(env, pagination(url).offset, {
+        status: url.searchParams.get('status') ?? '', q: url.searchParams.get('q') ?? '', user_id: url.searchParams.get('user_id') ?? '',
+      }))
     if (path === '/api/admin/vouchers' && method === 'POST') {
       await limit(env, 'voucher-issue:admin', 5)
       return json(await issueVouchers(env, data), 201)
@@ -287,12 +289,16 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
     if (path === '/api/admin/users' && method === 'GET') {
       const { offset } = pagination(url)
+      const search = (url.searchParams.get('q') ?? '').trim()
+      if (search.length > 80) fail('invalid_input', '商户搜索最多 80 字。')
       return json(
         (
           await env.DB.prepare(
-            'SELECT u.id,u.name,u.email,u.enabled,u.created_at,w.available,w.frozen FROM users u JOIN wallets w ON w.user_id=u.id ORDER BY u.created_at DESC LIMIT 30 OFFSET ?',
+            `SELECT u.id,u.name,u.email,u.enabled,u.created_at,w.available,w.frozen FROM users u JOIN wallets w ON w.user_id=u.id
+             WHERE (?='' OR instr(lower(u.name),lower(?))>0 OR instr(lower(u.id),lower(?))>0)
+             ORDER BY u.created_at DESC,u.id DESC LIMIT 30 OFFSET ?`,
           )
-            .bind(offset)
+            .bind(search, search, search, offset)
             .all()
         ).results,
       )
@@ -445,8 +451,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (search.length > 128) fail('invalid_input', '订单搜索最多 128 字。')
       const statusSql = status === 'active' ? "AND o.status IN('queued','running','unknown')" : status ? 'AND o.status=?' : ''
       const statusValues = status && status !== 'active' ? [status] : []
-      return json(
-        (
+      const listed = (
           await env.DB.prepare(
             `SELECT o.*,u.name user_name,CASE WHEN o.status='queued' THEN (
               SELECT COUNT(*) FROM orders q WHERE q.status='queued' AND (q.created_at<o.created_at OR (q.created_at=o.created_at AND q.id<=o.id)))
@@ -456,13 +461,14 @@ async function route(request: Request, env: Env): Promise<Response> {
           )
             .bind(...statusValues, search, search, search.replace(/^@/, ''), search, offset)
             .all<Order & { user_name: string; queue_position: number | null }>()
-        ).results.map((o) => ({
+        ).results
+      return json(await Promise.all(listed.map(async (o) => ({
           ...publicOrder(o),
           user_name: o.user_name,
           user_id: o.user_id,
           queue_position: o.queue_position,
-        })),
-      )
+          actions: await adminOrderCapabilities(env, o),
+        }))))
     }
     const orderAction = path.match(/^\/api\/admin\/orders\/(ord_[a-f0-9]{32})\/(payment-page|check|close)$/)
     if (orderAction) {

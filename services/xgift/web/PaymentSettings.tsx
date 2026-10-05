@@ -4,6 +4,7 @@ import { Input } from '@cloudflare/kumo/components/input'
 import { Dialog } from '@cloudflare/kumo/components/dialog'
 import { ArrowClockwise, ArrowLeft, ArrowRight } from '@phosphor-icons/react'
 import type { Request } from './Recharge'
+import { useUnsavedChanges } from './unsaved-changes'
 
 type PaymentCard = {
   id: string
@@ -90,6 +91,8 @@ const time = (value: number) => new Date(value).toLocaleString('zh-CN', { hour12
 export function PaymentSettings({ request, onError }: { request: Request; onError: (error: unknown) => void }) {
   const [view, setView] = useState<PaymentView | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
+  const [keyEditing, setKeyEditing] = useState(false)
+  const [backupSlots, setBackupSlots] = useState(0)
   const [retainedCards, setRetainedCards] = useState<PaymentCard[]>([])
   const [cards, setCards] = useState<PaymentCard[]>([])
   const [page, setPage] = useState(1), [total, setTotal] = useState(0)
@@ -205,6 +208,8 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
 
   const dirty = !!draft && (draft.key.trim() !== draft.originalKey || draft.cardId !== draft.originalCardId
     || draft.backupIds.filter(Boolean).join(',') !== draft.originalBackupIds.filter(Boolean).join(','))
+  useUnsavedChanges(dirty || !!busy)
+  const visibleBackups = Math.min(3, Math.max(backupSlots, ...(draft?.backupIds.map((id, index) => id ? index + 1 : 0) ?? [0])))
   const conflict = !!view && !!draft && (view.revision !== draft.revision || view.provider_revision !== draft.providerRevision)
   const cardBindingChanged = !!view?.selected_card && view.selected_provider_revision !== view.provider_revision
   const selectionCurrent = !!draft && draft.providerRevision === providerRevision
@@ -252,6 +257,7 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
         setCards([]); setTotal(0); setCardsCheckedAt(null); setCardsError(''); setCardsMessage('')
       }
       setView(next); setDraft(draftFrom(next)); setRetainedCards(currentSavedCards(next))
+      setKeyEditing(false); setBackupSlots(next.backup_card_ids.length)
       setStatusError(''); setCheckedAt(Date.now()); setConfirmOpen(false); setConfirmation('')
       if (kind === 'save') {
         if (next.enabled)
@@ -321,14 +327,17 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
           <Button variant="secondary" disabled={!!busy || statusLoading} onClick={() => void refreshStatus(true)}>载入最新配置</Button>
         </div>}
         {view.enabled && <p className="note">X 付款启用期间不能修改公钥、主卡或备用卡，请先停用。</p>}
-        {view.has_unsettled_orders && <p className="notice">有未结订单，暂不能修改付款配置。请先在“订单与队列”中核对原单或安全关闭未执行的订单；符合检查条件时仍可恢复付款以处理原单。</p>}
-        {!providerRevision && <p className="notice">尚未接入卡台。请先前往“卡台与卡池”完成卡台连接，再刷新状态并选择已有卡。</p>}
+        {view.has_unsettled_orders && <p className="notice">有未结订单，暂不能修改付款配置。<a href="#orders?status=active" className="text-link">处理原订单</a>；符合检查条件时仍可恢复付款。</p>}
+        {!providerRevision && <p className="notice">尚未接入卡台。<a href="#cards" className="text-link">完成卡台连接</a>后，再选择已有卡。</p>}
         {providerRevision && cardBindingChanged && !conflict && <p className="notice">卡台连接已更新，原主卡与备用卡不能直接沿用。请从当前卡台重新选择并保存，不会按同一 ID 自动绑定其他卡。</p>}
         {view.source === 'environment' && <p className="note">当前读取环境配置。保存后将使用后台配置，付款保持关闭。</p>}
         <form ref={paymentForm} className="payment-form" onSubmit={(event: FormEvent) => { event.preventDefault(); void mutate('save') }}>
-          <Input label="Stripe 发布公钥" name="stripe_publishable_key" value={draft.key}
+          {keyEditing || !draft.originalKey ? <Input label="Stripe 发布公钥" name="stripe_publishable_key" value={draft.key}
             onChange={(event) => { setDraft({ ...draft, key: event.target.value }); setMessage('') }}
-            disabled={locked} autoComplete="off" spellCheck={false} placeholder="pk_live_…" required />
+            disabled={locked} autoComplete="off" spellCheck={false} placeholder="pk_live_…" required /> : <div className="saved-setting">
+              <span>Stripe 发布公钥</span><strong>已配置</strong>
+              <Button type="button" variant="ghost" disabled={locked} onClick={() => setKeyEditing(true)}>更换公钥</Button>
+            </div>}
           <div className="payment-card-field">
             <label className="form-field" htmlFor="payment-card-select">指定付款主卡
               <select id="payment-card-select" value={selectionCurrent ? draft.cardId : ''}
@@ -360,9 +369,9 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
           </div>
           <fieldset className="payment-policy payment-backups">
             <legend>指定备用卡（可选）</legend>
-            <p className="note">仅在付款准备阶段明确确认当前卡不可用时，依次尝试你指定的备用卡。卡台网络异常、3DS 或付款结果未知时，不会自动换卡重试。未设置备用卡时只使用主卡。</p>
+            <p className="note">仅在尚未提交付款、明确确认当前卡不可用时按顺序切换。3DS、网络异常或扣款未知时不自动换卡。</p>
             <div className="payment-backup-fields">
-            {[0, 1, 2].map((index) => <label key={index} className="form-field" htmlFor={`payment-backup-card-${index}`}>
+            {[0, 1, 2].filter((index) => index < visibleBackups).map((index) => <label key={index} className="form-field" htmlFor={`payment-backup-card-${index}`}>
               备用卡 {index + 1}（可选）
               <select id={`payment-backup-card-${index}`} value={selectionCurrent ? draft.backupIds[index] : ''}
                 disabled={locked || !providerRevision || cardsLoading || !!cardsError}
@@ -377,10 +386,16 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
                   {cardLabel(card)}{!cards.some((listed) => listed.id === card.id) ? ' · 未在本页（保留原选择）' : ''}
                 </option>)}
               </select>
+              <Button type="button" variant="ghost" size="sm" disabled={locked} onClick={() => {
+                const backupIds = [...draft.backupIds]; backupIds.splice(index, 1); backupIds.push('')
+                setDraft({ ...draft, backupIds }); setBackupSlots(Math.max(0, visibleBackups - 1)); setMessage('')
+              }}>移除备用卡 {index + 1}</Button>
             </label>)}
             </div>
+            {visibleBackups < 3 && <Button type="button" variant="secondary" disabled={locked || !providerRevision} onClick={() => setBackupSlots(visibleBackups + 1)}>添加备用卡</Button>}
+            {visibleBackups === 0 && <p className="note">当前仅使用主卡。</p>}
             {!uniqueSelection && <p className="notice error" role="alert">主卡和备用卡不能重复，请重新选择。</p>}
-            <p className="note">按备用卡 1 → 2 → 3 的顺序使用，空项会在保存时略过。清空全部备用卡并保存后，将恢复仅使用主卡。</p>
+            {visibleBackups > 0 && <p className="note">最多 3 张，按排列顺序使用。移除后需保存生效。</p>}
           </fieldset>
           <p className="note payment-policy">主卡与备用卡都须为 ACTIVE 状态，余额不少于 10 USD。保存与启用时逐张只读同步核验；保存不会扣款或启用付款。不会自动开卡、充值，或使用未指定的其他卡。</p>
           <div className="payment-save-row">

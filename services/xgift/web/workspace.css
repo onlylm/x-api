@@ -1,0 +1,52 @@
+.sidebar .grouped-navigation { margin-top: 30px; gap: 18px; }
+.grouped-navigation .nav-primary { display: grid; gap: 4px; }
+.sidebar .grouped-navigation a { display: flex; align-items: center; gap: 11px; min-height: 42px; padding: 10px 12px; border-radius: 7px; color: #52606b; font-size: 13px; }
+.sidebar .grouped-navigation a:hover { background: #eceef0; color: #28362f; }
+.sidebar .grouped-navigation a[aria-current='page'] { background: #e4ebe7; color: #2d493b; font-weight: 600; }
+.nav-folder { padding-top: 12px; border-top: 1px solid #e1e5e8; }
+.nav-folder summary { padding: 10px 12px; color: #52606b; font-size: 12px; min-height: 40px; cursor: pointer; }
+.nav-folder[open] summary { margin-bottom: 4px; }
+.nav-folder a { margin-top: 3px; }
+.brand small { color: #65717f; }
+.operations-home h2 { margin: 0 0 12px; font-size: 18px; font-weight: 600; }
+.operations-status { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 4px 0 28px; }
+.operations-status .status { margin-bottom: 18px; display: inline-flex; }
+.operations-status p { margin: 0; color: #52606b; line-height: 1.8; max-width: 65ch; }
+.workspace-action-link { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 18px; border-radius: 8px; color: white; background: #334c42; white-space: nowrap; font-weight: 500; }
+.workspace-action-link:hover { background: #24382f; }
+.operations-numbers { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); margin: 0; padding: 22px 0; border-block: 1px solid #e1e5e8; gap: 24px; font-variant-numeric: tabular-nums; }
+.operations-numbers dt { color: #52606b; font-size: 13px; }
+.operations-numbers dd { margin: 8px 0 0; font-size: 24px; font-weight: 600; }
+.operations-numbers small { font-size: 14px; font-weight: 400; color: #52606b; }
+.operations-numbers a:hover { text-decoration: underline; text-underline-offset: 5px; }
+.operations-tasks { margin: 32px 0; }
+.operations-tasks h2 { font-size: 15px; }
+.operations-links { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 24px; }
+.operations-links a { display: flex; flex-direction: column; gap: 8px; padding: 14px 0; min-height: 64px; }
+.operations-links strong { font-size: 14px; font-weight: 500; text-decoration: underline; text-underline-offset: 4px; text-decoration-color: #aab8af; }
+.operations-links a:hover strong { text-decoration-color: #334c42; }
+.operations-links span { color: #52606b; font-size: 12px; }
+.operations-home .notice .text-link, .payment-settings .notice .text-link { display: inline-flex; align-items: center; min-height: 40px; margin-left: 12px; }
+.saved-setting { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 0; align-self: start; }
+.saved-setting > span { flex-basis: 100%; font-size: 13px; }
+.saved-setting strong { font-weight: 500; color: #334c42; }
+.payment-backup-fields { margin-bottom: 12px; }
+.payment-backup-fields .form-field button { justify-self: start; }
+.settings-checks > .note { max-width: 72ch; }
+.payment-settings select:focus-visible, .grouped-navigation summary:focus-visible { outline: 2px solid #527461; outline-offset: 3px; }
+@media (max-width: 720px) {
+  .sidebar .grouped-navigation { display: flex; flex-wrap: wrap; flex-direction: row; overflow: visible; margin-top: 20px; gap: 4px 18px; }
+  .grouped-navigation .nav-primary { display: flex; flex-basis: 100%; gap: 4px; }
+  .sidebar .grouped-navigation a { min-height: 44px; padding: 10px; font-size: 12px; white-space: normal; }
+  .nav-primary a { flex: 1; justify-content: center; }
+  .nav-folder { border-top: 0; padding-top: 0; flex: 1; min-width: 140px; }
+  .nav-folder[open] { padding-bottom: 8px; }
+  .nav-folder summary { min-height: 44px; }
+  .operations-status { flex-direction: column; align-items: stretch; gap: 18px; }
+  .workspace-action-link { align-self: start; }
+  .operations-numbers { gap: 12px; }
+  .operations-numbers dd { font-size: 22px; }
+  .operations-numbers small { font-size: 12px; }
+  .operations-links { grid-template-columns: minmax(0,1fr); gap: 4px; }
+  .operations-links a { border-bottom: 1px solid #e1e5e8; }
+}

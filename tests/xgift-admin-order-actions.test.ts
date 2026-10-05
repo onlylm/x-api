@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import { database } from '../services/xgift/server/database.ts'
 import { executeNative, queryNativeOrder, validatedCheckoutUrl, X_MERCHANT } from '../services/xgift/server/native-executor.ts'
-import { adminCheckOrder, adminCloseOrder, adminPaymentPage } from '../services/xgift/src/admin-order-actions.ts'
+import { adminCheckOrder, adminCloseOrder, adminOrderCapabilities, adminPaymentPage } from '../services/xgift/src/admin-order-actions.ts'
 import { createUser } from '../services/xgift/src/auth.ts'
 import { credit, type Order } from '../services/xgift/src/orders.ts'
 import { saveSecret } from '../services/xgift/src/network.ts'
@@ -249,4 +249,82 @@ test('admin list filters and searches by bound parameters and reports true FIFO 
   assert.equal((await f.api('/api/admin/orders?status=notvalid', undefined, admin)).status, 400)
   const injection = await f.api('/api/admin/orders?q=' + encodeURIComponent("' OR 1=1 --"), undefined, admin)
   assert.deepEqual((await injection.json()).data, [])
+})
+
+test('admin action capabilities are read-only, private, and never expose execution or payment secrets', async t => {
+  const f = await fixture(t), order = await f.order('unknown'); await f.job(order)
+  const admin = await f.login(), merchant = await f.login(f.user.email, 'fixture-user-password')
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('Capabilities must not contact any provider') })
+  f.env.NATIVE_ORDER_QUERY = async () => { throw new Error('Capabilities must not poll or settle an order') }
+  const before = JSON.stringify({ orders: f.db.prepare('SELECT * FROM orders').all(), jobs: f.db.prepare('SELECT * FROM native_jobs').all(),
+    ledger: f.db.prepare('SELECT * FROM ledger').all(), audit: f.db.prepare('SELECT * FROM audit').all() })
+  assert.equal((await f.api('/api/admin/orders')).status, 401)
+  assert.equal((await f.api('/api/admin/orders', undefined, merchant)).status, 403)
+  const response = await f.api('/api/admin/orders', undefined, admin), body = await response.text()
+  assert.equal(response.status, 200)
+  const row = JSON.parse(body).data[0]
+  assert.equal(row.actions.check, true); assert.equal(row.actions.payment_page, true); assert.equal(row.actions.close, false)
+  assert.doesNotMatch(body, /execution_config|work_token|lease_until|checkout\.stripe|original-checkout-options|pk_live|pm_fixture|fixture-cookie|fixture-csrf/)
+  assert.doesNotMatch(await (await f.api('/api/orders', undefined, merchant)).text(), /"actions"|reason_code|payment_page/)
+  assert.equal(JSON.stringify({ orders: f.db.prepare('SELECT * FROM orders').all(), jobs: f.db.prepare('SELECT * FROM native_jobs').all(),
+    ledger: f.db.prepare('SELECT * FROM ledger').all(), audit: f.db.prepare('SELECT * FROM audit').all() }), before)
+})
+
+test('action hints respect live workers, terminal orders, and queued close constraints', async t => {
+  const f = await fixture(t), queued = await f.order(), running = await f.order('running', 'other')
+  assert.deepEqual(await adminOrderCapabilities(f.env, queued), {
+    check: false, payment_page: false, close: true, reason_code: 'queued', message: '按接收顺序等待执行，尚未付款。',
+  })
+  await f.job(running)
+  for (const status of ['running', 'unknown'] as const) {
+    const result = await adminOrderCapabilities(f.env, { ...running, status, lease_until: Date.now() + 60000 })
+    assert.equal(result.reason_code, 'executing'); assert.equal(result.check, false)
+    assert.equal(result.payment_page, false); assert.equal(result.close, false)
+  }
+  for (const status of ['succeeded', 'failed'] as const) {
+    const result = await adminOrderCapabilities(f.env, { ...running, status })
+    assert.equal(result.check, false); assert.equal(result.payment_page, false); assert.equal(result.close, false)
+  }
+  assert.equal((await adminOrderCapabilities(f.env, { ...queued, execution_config: running.execution_config })).close, false)
+  await f.job(queued, { stage: 'creating' })
+  assert.equal((await adminOrderCapabilities(f.env, queued)).close, false)
+})
+
+test('only proven original submitted checkouts advertise a payment page and never advertise close', async t => {
+  const f = await fixture(t), order = await f.order('unknown')
+  const noPayment = await adminOrderCapabilities(f.env, order)
+  assert.equal(noPayment.close, true); assert.equal(noPayment.payment_page, false)
+  await f.job(order, { stage: 'preflight', session: undefined, method: undefined, submitted_at: undefined, proof: undefined })
+  assert.equal((await adminOrderCapabilities(f.env, order)).close, true)
+  for (const stage of ['creating', 'session', 'funding', 'funded', 'tokenizing', 'tokenized']) {
+    await f.job(order, { stage })
+    const result = await adminOrderCapabilities(f.env, order)
+    assert.equal(result.close, false, stage); assert.equal(result.payment_page, false, stage)
+  }
+  for (const stage of ['submitted', 'paid']) {
+    await f.job(order, { stage })
+    const result = await adminOrderCapabilities(f.env, { ...order, failure_code: 'payment_requires_action' })
+    assert.equal(result.close, false); assert.equal(result.payment_page, true); assert.equal(result.reason_code, 'payment_requires_action')
+  }
+  for (const patch of [
+    { proof: { ...page(), currency: 'usd' } }, { submitted_at: undefined }, { method: 'invalid' },
+    { session_url: 'https://checkout.stripe.com.evil.example/c/pay/' + sessionId },
+    { session_url: 'https://checkout.stripe.com/c/pay/cs_live_other' },
+  ]) {
+    await f.job(order, patch)
+    const result = await adminOrderCapabilities(f.env, order)
+    assert.equal(result.close, false); assert.equal(result.payment_page, false)
+  }
+})
+
+test('missing, external or inconsistent execution evidence fails capability display closed', async t => {
+  const f = await fixture(t), order = await f.order('unknown')
+  for (const execution_config of [null, 'invalid', await seal(f.env, 'execution:' + order.id, JSON.stringify({ ...f.snapshot, endpoint: 'https://external.example.test' }))]) {
+    const result = await adminOrderCapabilities(f.env, { ...order, execution_config })
+    assert.equal(result.check, false); assert.equal(result.payment_page, false); assert.equal(result.close, false)
+  }
+  await f.job(order)
+  f.db.prepare("UPDATE native_jobs SET stage='preflight' WHERE order_id=?").run(order.id)
+  const result = await adminOrderCapabilities(f.env, order)
+  assert.equal(result.check, false); assert.equal(result.payment_page, false); assert.equal(result.close, false)
 })

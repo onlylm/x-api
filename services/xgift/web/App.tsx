@@ -17,6 +17,10 @@ import { AdmissionSettings } from './AdmissionSettings'
 import { AdminOrders } from './AdminOrders'
 import { Checkout } from './Checkout'
 import { orderFailureDescription } from './order-failures'
+import { hasUnsavedChanges } from './unsaved-changes'
+import { adminSections, merchantSections, workspaceHref, workspaceRoute } from './workspace-route'
+import { OperationsHome } from './OperationsHome'
+import { orderStateText, orderProduct } from './order-ui'
 import {
   ArrowClockwise,
   ArrowSquareOut,
@@ -83,7 +87,7 @@ const labels: Record<string, string> = {
   release: '退回',
 }
 const sections = {
-  overview: ['概览', '账户余额与服务状态', ChartBar],
+  overview: ['工作台', '先处理异常，再查看今日进度', ChartBar],
   users: ['用户管理', '开通账户、入账点数及设置用户价格', Users],
   orders: ['订单与队列', '多单排队、逐笔付款，集中处理需要核对的原订单', ListChecks],
   vouchers: ['卡密管理', '生成套餐卡密、查看兑换记录及撤销未用卡密', Key],
@@ -125,9 +129,9 @@ async function api<T = Row>(path: string, body?: Row): Promise<T> {
     )
   return data.data as T
 }
-function Status({ value }: { value: unknown }) {
+function Status({ value, label }: { value: unknown; label?: string }) {
   const key = s(value)
-  return <span className={`status status-${key}`}>{labels[key] ?? key}</span>
+  return <span className={`status status-${key}`}>{label ?? labels[key] ?? key}</span>
 }
 function Stack({ top, bottom }: { top: unknown; bottom?: unknown }) {
   return (
@@ -355,8 +359,8 @@ export default function App() {
 
 function Workspace() {
   const [principal, setPrincipal] = useState<Principal | null>(null),
-    [section, setSection] = useState<Section>('overview'),
-    [page, setPage] = useState(1)
+    [section, setSection] = useState<Section>(() => workspaceRoute(window.location.hash).section),
+    [page, updatePage] = useState(() => workspaceRoute(window.location.hash).page)
   const [data, setData] = useState<Row>({}),
     [loading, setLoading] = useState(true),
     [notice, setNotice] = useState(''),
@@ -365,9 +369,52 @@ function Workspace() {
   const [loginBusy, setLoginBusy] = useState(false)
   const generation = useRef(0),
     principalRef = useRef(principal)
+  principalRef.current = principal
+  const locationRef = useRef({ section, hash: window.location.hash || '#overview' })
+  const rememberedLocations = useRef<Record<string, string>>({})
+  const modalRef = useRef(modal)
+  modalRef.current = modal
+  function hasPendingWork() {
+    return hasUnsavedChanges() || !!modalRef.current?.fields?.length || !!modalRef.current?.sensitive
+  }
   useEffect(() => {
-    principalRef.current = principal
+    function routeChanged(event?: HashChangeEvent) {
+      const next = workspaceRoute(window.location.hash)
+      const previous = locationRef.current
+      const previousHash = event?.oldURL ? new URL(event.oldURL).hash || '#overview' : previous.hash
+      if (next.section !== previous.section && hasPendingWork() && !window.confirm('当前有未保存的内容或尚未保存的一次性凭证。仍要离开此页吗？')) {
+        window.history.replaceState(null, '', previousHash)
+        locationRef.current = { ...previous, hash: previousHash }
+        return
+      }
+      const user = principalRef.current
+      const permitted: readonly string[] = user?.role === 'admin' ? adminSections : merchantSections
+      if (user?.authenticated && !permitted.includes(next.section)) {
+        window.history.replaceState(null, '', '#overview')
+        next.section = 'overview'; next.page = 1
+      }
+      rememberedLocations.current[previous.section] = previousHash
+      locationRef.current = { section: next.section, hash: window.location.hash || '#overview' }
+      setSection(next.section)
+      if (!['orders', 'vouchers'].includes(next.section) || user?.role !== 'admin') updatePage(next.page)
+      if (next.section !== previous.section) { setLoading(true); setNotice(''); setModal(null) }
+    }
+    function beforeLeave(event: BeforeUnloadEvent) {
+      if (hasPendingWork()) { event.preventDefault(); event.returnValue = '' }
+    }
+    window.addEventListener('hashchange', routeChanged)
+    window.addEventListener('beforeunload', beforeLeave)
+    routeChanged()
+    return () => {
+      window.removeEventListener('hashchange', routeChanged)
+      window.removeEventListener('beforeunload', beforeLeave)
+    }
   }, [principal])
+  function setPage(value: number | ((current: number) => number)) {
+    const next = typeof value === 'function' ? value(page) : value
+    window.location.hash = workspaceHref(section, next)
+    updatePage(next)
+  }
   const admin = principal?.role === 'admin',
     base = admin ? '/api/admin' : '/api'
   function onError(error: unknown) {
@@ -399,7 +446,7 @@ function Workspace() {
       let result: Row
       if (section === 'overview')
         result = admin
-          ? await api(base + '/overview')
+          ? await Promise.all([api(base + '/overview'), api('/api/admin/admission')]).then(([summary, admission]) => ({ ...summary, admission }))
           : {
               me: await api('/api/me'),
               products: await api<Row[]>('/api/products'),
@@ -427,7 +474,7 @@ function Workspace() {
             }
           })
         }
-      } else if (['docs', 'admission', 'payment'].includes(section) || (admin && section === 'orders')) result = {}
+      } else if (['docs', 'admission', 'payment'].includes(section) || (admin && ['orders', 'vouchers'].includes(section))) result = {}
       else
         result = {
           rows: await api<Row[]>(
@@ -463,7 +510,8 @@ function Workspace() {
     await api(path, body)
     reload()
   }
-  function reload() {
+  function reload(confirmDiscard = false) {
+    if (confirmDiscard && hasPendingWork() && !window.confirm('刷新会放弃当前未保存的内容。是否继续？')) return
     setLoading(true)
     setNotice('')
     setRefresh((v) => v + 1)
@@ -584,41 +632,7 @@ function Workspace() {
     if (admin && section === 'orders') return <AdminOrders request={api} onError={onError} refreshVersion={refresh} />
     if (section === 'overview') {
       if (admin)
-        return (
-          <>
-            <Metrics
-              items={[
-                ['用户数量', n(data.users)],
-                ['可用点数', n(data.available)],
-                ['冻结点数', n(data.frozen)],
-              ]}
-            />
-            <div className="section-label">运行状态</div>
-            <dl className="details">
-              {[
-                [
-                  '自动赠送',
-                  data.execution_ready ? '已开放' : '未配置或已暂停',
-                ],
-                [
-                  '代理出口能力',
-                  data.proxy_gateway_ready ? '已配置' : '未配置',
-                ],
-                ['处理中的订单', n(data.pending)],
-                ['结果待核对', n(data.unknown)],
-                ['回调投递失败', n(data.failed_webhooks)],
-              ].map(([label, value]) => (
-                <div key={s(label)}>
-                  <dt>{s(label)}</dt>
-                  <dd>{s(value)}</dd>
-                </div>
-              ))}
-            </dl>
-            <p className="note">
-              新增接单受后台每日额度与付款状态控制；指定卡的限额以卡台设置为准，已有订单持续核对。
-            </p>
-          </>
-        )
+        return <OperationsHome summary={data} />
       const me = (data.me ?? {}) as Row
       return (
         <>
@@ -798,10 +812,10 @@ function Workspace() {
             render={(r) => [
               <Stack top={r.merchant_order_no} bottom={date(r.created_at)} />,
               <Stack top={'@' + s(r.recipient)} bottom={r.user_name ?? ''} />,
-              s(r.product_code),
+              orderProduct(s(r.product_code)),
               r.mode === 'voucher' ? '卡密兑换' : '直充',
               s(r.points),
-              <Status value={r.status} />,
+              <Status value={r.status} label={orderStateText({ status: s(r.status), failure_code: r.failure_code ? s(r.failure_code) : null })} />,
               <>
                 <Stack top={r.receipt ?? r.failure_code} bottom={r.id} />
                 {orderFailureDescription(r.failure_code) && <p className="note">{orderFailureDescription(r.failure_code)}</p>}
@@ -828,11 +842,11 @@ function Workspace() {
       return (
         <>
           <Vouchers
-            rows={rows}
             request={api}
+            onError={onError}
             onChanged={() => setRefresh((v) => v + 1)}
+            refreshVersion={refresh}
           />
-          {pager(rows.length === 30)}
         </>
       )
     if (section === 'ledger')
@@ -1118,8 +1132,6 @@ function Workspace() {
     const body = Object.fromEntries(new FormData(e.currentTarget))
     try {
       await api('/api/login', body)
-      setSection('overview')
-      setPage(1)
       setLoading(true)
       setPrincipal(await api<Principal>('/api/session'))
     } catch (err) {
@@ -1180,56 +1192,33 @@ function Workspace() {
         <footer>用户账户由管理员开通 · {window.location.host}</footer>
       </main>
     )
-  const nav: Section[] = admin
-    ? [
-        'overview',
-        'orders',
-        'vouchers',
-        'admission',
-        'payment',
-        'cards',
-        'users',
-        'ledger',
-        'products',
-        'secrets',
-        'webhooks',
-        'audit',
-      ]
-    : ['overview', 'orders', 'keys', 'ledger', 'docs']
+  function navItem(key: Section) {
+    const Icon = sections[key][2]
+    return <a key={key} href={rememberedLocations.current[key] || workspaceHref(key)} aria-current={section === key ? 'page' : undefined}>
+      <Icon size={19} />{sections[key][0]}
+    </a>
+  }
   return (
     <div className="workspace">
       <aside className="sidebar">
-        <a className="brand" href="/">
+        <a className="brand" href="#overview">
           <span className="brand-mark">X</span>
           <span>
             X API<small>Bugan.cn</small>
           </span>
         </a>
-        <div className="nav-group-label">
-          {admin ? '平台管理' : '用户工作区'}
-        </div>
-        <nav aria-label="主导航">
-          {nav.map((key) => {
-            const Icon = sections[key][2]
-            return (
-              <button
-                key={key}
-                aria-current={section === key ? 'page' : undefined}
-                onClick={() => {
-                  setSection(key)
-                  setPage(1)
-                  setModal(null)
-                  if (section !== key || page !== 1) {
-                    setLoading(true)
-                    setNotice('')
-                  }
-                }}
-              >
-                <Icon size={19} />
-                {sections[key][0]}
-              </button>
-            )
-          })}
+        <nav aria-label="主导航" className="grouped-navigation">
+          {admin ? <>
+            <div className="nav-primary">{(['overview', 'orders', 'vouchers'] as Section[]).map(navItem)}</div>
+            <details className="nav-folder" open={['admission', 'payment', 'cards', 'secrets', 'products'].includes(section)}>
+              <summary>运行设置</summary>
+              {(['admission', 'payment', 'cards', 'secrets', 'products'] as Section[]).map(navItem)}
+            </details>
+            <details className="nav-folder" open={['users', 'ledger', 'webhooks', 'audit'].includes(section)}>
+              <summary>账户与记录</summary>
+              {(['users', 'ledger', 'webhooks', 'audit'] as Section[]).map(navItem)}
+            </details>
+          </> : merchantSections.map(navItem)}
         </nav>
         <div className="sidebar-bottom">
           <a href="/redeem">
@@ -1243,6 +1232,7 @@ function Workspace() {
             variant="ghost"
             onClick={() =>
               act(async () => {
+                if (hasPendingWork() && !window.confirm('退出会放弃未保存的内容。是否继续退出？')) return
                 await api('/api/logout', {})
                 setPrincipal({ authenticated: false })
                 setModal(null)
@@ -1266,7 +1256,7 @@ function Workspace() {
             variant="secondary"
             aria-label="刷新当前页面"
             disabled={loading}
-            onClick={reload}
+            onClick={() => reload(true)}
           >
             <ArrowClockwise size={17} />
             刷新

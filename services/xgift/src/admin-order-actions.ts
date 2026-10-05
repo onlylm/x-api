@@ -24,6 +24,63 @@ async function nativeJob(env: Env, order: Order) {
   return job
 }
 
+export type AdminOrderCapabilities = {
+  check: boolean
+  payment_page: boolean
+  close: boolean
+  reason_code: string
+  message: string
+}
+
+const hasNotStartedPayment = (job: Record<string, any> | null) => !job ||
+  (job.stage === 'preflight' && !job.session && !job.session_url && !job.method && !job.submitted_at && !job.tokenization_started)
+
+/** Admin-only display hints from persisted evidence. No claims, HTTP requests,
+ * provider queries or financial writes. Action endpoints still recheck state. */
+export async function adminOrderCapabilities(env: Env, order: Order): Promise<AdminOrderCapabilities> {
+  const unavailable = (reason_code: string, message: string): AdminOrderCapabilities =>
+    ({ check: false, payment_page: false, close: false, reason_code, message })
+  if (order.status === 'succeeded') return unavailable('completed', '赠送付款已完成，可核对接收账号权益。')
+  if (order.status === 'failed') return unavailable('ended', '订单已结束，无需继续执行。')
+  if (order.lease_until > Date.now()) return unavailable('executing', '系统正在执行，请等待本笔结果。')
+  try {
+    if (order.status === 'queued') {
+      if (order.execution_config) return unavailable('state_changed', '执行状态已变化，请刷新原单。')
+      const job = await nativeJob(env, order)
+      return hasNotStartedPayment(job)
+        ? { ...unavailable('queued', '按接收顺序等待执行，尚未付款。'), close: true }
+        : unavailable('original_request_unconfirmed', '原请求结果需要核对，请保留订单。')
+    }
+    if (!active(order)) return unavailable('unsupported_state', '请保留原单并核对执行状态。')
+    await snapshotFor(env, order)
+    const job = await nativeJob(env, order), check = !!env.NATIVE_ORDER_QUERY
+    if (hasNotStartedPayment(job)) return {
+      check, payment_page: false, close: true, reason_code: 'payment_not_started',
+      message: '未创建付款会话，可继续核对或安全关闭。',
+    }
+    let payment_page = false
+    if (job && ['submitted', 'paid'].includes(job.stage)) {
+      try {
+        guardPage(job.proof, order, job.session, true)
+        if (job.submitted_at && /^pm_[A-Za-z0-9]+$/.test(job.method ?? '')) {
+          validatedCheckoutUrl(job.session_url ?? job.proof?.url, job.session)
+          payment_page = true
+        }
+      } catch { /* Incomplete evidence must never advertise a manual payment path. */ }
+    }
+    return { check, payment_page, close: false,
+      reason_code: payment_page && order.failure_code === 'payment_requires_action' ? 'payment_requires_action' : 'reconcile_original',
+      message: payment_page && order.failure_code === 'payment_requires_action'
+        ? '原付款需要验证，可获取原付款页完成验证。'
+        : check ? '付款结果待确认，请先核对原单。' : '原付款尚待确认，请保留订单并检查查询服务。',
+    }
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'unsupported_execution')
+      return unavailable('external_execution', '该历史订单由外部执行端处理，请到原执行端核对。')
+    return unavailable('evidence_unavailable', '原单执行证据暂不可用，请保留订单并刷新核对。')
+  }
+}
+
 /** This endpoint only reveals the original hosted page to an authenticated admin.
  * It never creates/reinitializes a checkout, and must never be added to publicOrder. */
 export async function adminPaymentPage(env: Env, orderId: string) {
@@ -118,7 +175,7 @@ export async function adminCloseOrder(env: Env, orderId: string, data: Record<st
     const job = await nativeJob(env, order)
     // A live checkout can still be paid outside this service. Without merchant
     // permission to expire it, "unpaid" is not enough to release this order.
-    if (job && (job.stage !== 'preflight' || job.session || job.session_url || job.method || job.submitted_at || job.tokenization_started))
+    if (!hasNotStartedPayment(job))
       return fail('cannot_close_payment_started', '原付款可能已创建或已提交，不能仅关闭本地订单。请先核对原单；需要验证时打开原付款页面。只有确认未创建付款的订单可安全关闭，防止关闭后仍被扣款。', 409)
     if (!claimed && existing.execution_config)
       return fail('cannot_close_execution_bound', '订单已绑定执行配置，请刷新并先核对原单。', 409)
