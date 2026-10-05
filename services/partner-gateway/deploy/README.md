@@ -96,6 +96,22 @@ verify只针对首次停用/空库验收；以后有订单或商品开启将按�
 
 当前脚本没有独立开售命令、常规升级命令或人工回滚命令；不要直接修改状态文件绕过门闩。
 
+### 已审 CRLF 准备中断的受限恢复
+
+`resume-prepared` 仅支持2026-10-05已核实的一次换行误判：原Nginx仍为26个CRLF、raw SHA `66b2fada568a7a2a63d111ac0f88ef99055642c799fc5ee589e54f4c44d67a45`，normalized SHA `060b85f1b35c62e6a2c1236e036dea06919ce573d9fef6182748631c1d85380b`，state仍preparing，独立环境和依赖准备完成但无数据库、unit、路由include、current链接和门闩。其他失败不能使用此入口。
+
+发布者先只读记录原state中的脚本SHA、新service.env及bootstrap-metadata.json的SHA（不输出文件内容），上传本次修复的deploy-gateway.py，然后执行：
+
+```sh
+python3 /opt/x-partner-gateway-release/deploy-gateway.py resume-prepared \
+  --artifact <原始已上传且SHA对应state的tar绝对路径> \
+  --previous-script-sha256 <原state.bundle_hashes中的脚本SHA> \
+  --config-sha256 <已核实的新service.env SHA> \
+  --metadata-sha256 <已核实的bootstrap-metadata.json SHA>
+```
+
+恢复核对原归一化备份、旧服务身份、其余bundle哈希及隔离配置。因旧版在失败前未保存code_manifest，严格要求原始tar哈希等于state.artifact_sha256，在临时目录安全解包生成参照manifest并逐文件匹配已安装代码；原有manifest若存在也必须匹配，生产依赖另用只读npm ls校核。不会重新安装或覆盖密钥。保留两份旧normalized备份，另以wx创建两份raw备份，更新状态指向raw备份并转prepared。Nginx本身不改、不reload。随后再单独审查install。并发变更或中途已有raw备份均拒绝恢复。
+
 ## Quefa Caddy 独立映射脚本
 
 `deploy-caddy-route.py` 只在 Quefa 154.198.43.105 上使用，不能在X服务器运行。它只在 api.quefa.cn 现有唯一 `route` 块最前增加 `/bluev/*` handle，位于原 legacy_admin、finance_admin 和兜底handle之前，避免被原route的兜底吞掉；显式固定剥离前缀、补 `/partner`、HTTPS反代的执行顺序，保留查询字符串及正文，不覆盖API Key。

@@ -2,11 +2,13 @@
 import importlib.util
 from contextlib import closing
 import io
+import json
 from pathlib import Path
 import sqlite3
 import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("deploy_gateway", Path(__file__).with_name("deploy-gateway.py"))
@@ -49,6 +51,104 @@ def tar_entries(extra=(), omit=()):
 
 
 class DeploymentGuards(unittest.TestCase):
+    def test_crlf_roundtrip_preserves_raw_backup_candidate_and_rollback_bytes(self):
+        original = NGINX.replace("\n", "\r\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            site = root / "site"
+            site.write_bytes(original.encode())
+            self.assertEqual(deploy.read_exact(site), original)
+            deploy.write_new(root / "backup", deploy.read_exact(site))
+            self.assertEqual((root / "backup").read_bytes(), site.read_bytes())
+            candidate = deploy.candidate_site(original)
+            marker = "  include " + str(deploy.ROUTES) + ";\r\n\r\n"
+            self.assertEqual(candidate.replace(marker, ""), original)
+            self.assertNotIn("\n", candidate.replace("\r\n", ""))
+            deploy.atomic_write(site, candidate)
+            self.assertEqual(site.read_bytes(), candidate.encode())
+            deploy.atomic_write(site, deploy.read_exact(root / "backup"))
+            self.assertEqual(site.read_bytes(), original.encode())
+
+    def test_reviewed_resume_preserves_but_does_not_rewrite_normalized_backups(self):
+        original = NGINX.replace("\n", "\r\n").encode()
+        normalized = NGINX.encode()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            site = root / "site"
+            site.write_bytes(original)
+            (root / "nginx-xgift.conf").write_bytes(normalized)
+            candidate = deploy.candidate_site(NGINX).encode()
+            (root / "nginx-candidate.conf").write_bytes(candidate)
+            (root / "original-state.json").write_text(json.dumps({"xgift": "same"}))
+            state = dict(status="preparing", backup=str(root), original_services={"xgift": "same"},
+                         original_nginx_sha256=deploy.sha(normalized), candidate_nginx_sha256=deploy.sha(candidate))
+            with patch.multiple(deploy, SITE=site, REVIEWED_CRLF_RAW_SHA=deploy.sha(original),
+                                REVIEWED_CRLF_NORMALIZED_SHA=deploy.sha(normalized),
+                                REVIEWED_CRLF_COUNT=original.count(b"\r\n")):
+                self.assertEqual(deploy.reviewed_resume_site(state).encode(), original)
+                self.assertEqual((root / "nginx-xgift.conf").read_bytes(), normalized)
+                site.write_bytes(original + b"# concurrent edit\r\n")
+                with self.assertRaisesRegex(deploy.DeploymentError, "not_reviewed_crlf"):
+                    deploy.reviewed_resume_site(state)
+
+    def test_resume_rejects_non_preparing_state_before_any_io(self):
+        for status in ("prepared", "installing", "installed", "rolled_back"):
+            with self.subTest(status=status), self.assertRaisesRegex(deploy.DeploymentError, "requires_preparing"):
+                deploy.reviewed_resume_site({"status": status})
+
+    def test_resume_rejects_concurrent_site_change_before_new_backup_or_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "releases" / "tested-release"
+            dependency = release / "node_modules/fastify/package.json"
+            dependency.parent.mkdir(parents=True)
+            dependency.write_text("{}")
+            data = root / "data-root"
+            (data / "data").mkdir(parents=True)
+            bundle = {name: "a" * 64 for name in deploy.BUNDLE_FILES}
+            state = dict(status="preparing", release_id="tested-release", release=str(release),
+                         backup=str(Path("/opt/backups/x-partner-gateway-tested-release")),
+                         bundle_hashes=bundle, code_manifest={"dist/server.js": "hash"})
+            args = SimpleNamespace(previous_script_sha256="a" * 64, config_sha256="b" * 64, metadata_sha256="c" * 64, artifact="unused")
+            with patch.multiple(deploy, ROOT=root, DATA=data, DATABASE=data / "data/gateway.sqlite", UNIT=root / "unit", ROUTES=root / "route", SALES_GATE=root / "sales", WORKER_GATE=root / "worker"), patch.object(deploy, "load_state", return_value=state), patch.object(deploy, "reviewed_resume_site", side_effect=[NGINX, NGINX + "# concurrent"]), patch.object(deploy, "bundle_hashes", return_value=bundle), patch.object(deploy, "code_manifest", return_value=state["code_manifest"]), patch.object(deploy, "verify_resume_artifact", return_value=state["code_manifest"]), patch.object(deploy, "verify_resume_configuration"), patch.object(deploy, "assert_original_unchanged"), patch.object(deploy, "check_port"), patch.object(deploy, "old_health"), patch.object(deploy, "run"), patch.object(deploy, "write_new") as write, patch.object(deploy, "save_state") as save:
+                with self.assertRaisesRegex(deploy.DeploymentError, "concurrent_change"):
+                    deploy.resume_prepared(args)
+                write.assert_not_called()
+                save.assert_not_called()
+
+    def test_resume_rebuilds_missing_manifest_from_original_archive_and_rejects_release_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "original.tar"
+            with tarfile.open(artifact, "w") as archive:
+                for name in REQUIRED:
+                    entry = tarfile.TarInfo(name)
+                    entry.size = 2
+                    archive.addfile(entry, io.BytesIO(b"{}"))
+            release = root / "release"
+            deploy.extract_release(artifact, release)
+            dependency = release / "node_modules/fastify/package.json"
+            dependency.parent.mkdir(parents=True)
+            dependency.write_text("{}")
+            state = dict(artifact_sha256=deploy.file_sha(artifact), release=str(release))
+            with patch.object(deploy, "run") as run:
+                verified = deploy.verify_resume_artifact(state, str(artifact))
+                self.assertEqual(verified, deploy.code_manifest(release))
+                self.assertIn("ls", run.call_args.args[0])
+                (release / "dist/server.js").write_bytes(b"changed")
+                with self.assertRaisesRegex(deploy.DeploymentError, "artifact_release_mismatch"):
+                    deploy.verify_resume_artifact(state, str(artifact))
+
+    def test_resume_rejects_changed_configuration_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "service.env").write_bytes(b"changed config")
+            (root / "bootstrap-metadata.json").write_bytes(b"{}")
+            args = SimpleNamespace(config_sha256="a" * 64, metadata_sha256="b" * 64)
+            with patch.object(deploy, "CONFIG", root), patch.object(deploy, "check_protected_file"):
+                with self.assertRaisesRegex(deploy.DeploymentError, "configuration_changed"):
+                    deploy.verify_resume_configuration(args)
+
     def test_inserts_only_include_preserving_original_bytes(self):
         candidate = deploy.candidate_site(NGINX)
         marker = "  include " + str(deploy.ROUTES) + ";\n\n"

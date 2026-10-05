@@ -1,6 +1,7 @@
 """First deployment of the isolated X partner gateway; no original-service restart."""
 from __future__ import annotations
 import argparse
+import base64
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
@@ -38,6 +39,9 @@ DIRECT_BASE = "https://x.aifu.me/partner"
 PACKAGE_FILES = {"package.json", "package-lock.json"}
 BUNDLE_FILES = ("deploy-gateway.py", "configure-env.mjs", "nginx-partner.conf",
                 "x-partner-gateway.service", "products.json")
+REVIEWED_CRLF_RAW_SHA = "66b2fada568a7a2a63d111ac0f88ef99055642c799fc5ee589e54f4c44d67a45"
+REVIEWED_CRLF_NORMALIZED_SHA = "060b85f1b35c62e6a2c1236e036dea06919ce573d9fef6182748631c1d85380b"
+REVIEWED_CRLF_COUNT = 26
 
 
 class DeploymentError(RuntimeError):
@@ -71,10 +75,16 @@ def file_sha(path):
     return sha(path.read_bytes())
 
 
+def read_exact(path):
+    # Path.read_text performs universal-newline normalization; Nginx baselines
+    # and rollback copies must retain the original bytes, including CRLF.
+    return path.read_bytes().decode("utf-8")
+
+
 def atomic_write(path, text, mode=0o600, uid=None, gid=None):
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent,
                                          prefix="." + path.name + ".", delete=False) as handle:
             temporary = Path(handle.name)
             os.chmod(temporary, mode)
@@ -90,7 +100,7 @@ def atomic_write(path, text, mode=0o600, uid=None, gid=None):
 
 
 def write_new(path, text, mode=0o600, uid=None, gid=None):
-    with path.open("x", encoding="utf-8") as handle:
+    with path.open("x", encoding="utf-8", newline="") as handle:
         os.chmod(path, mode)
         if uid is not None:
             os.chown(path, uid, gid)
@@ -162,11 +172,12 @@ def candidate_site(original):
             "unexpected_nginx_site")
     require(original.count("proxy_pass http://127.0.0.1:8791;") == 1,
             "original_xgift_proxy_ambiguous")
-    pattern = re.compile(r"^(?P<indent>[ \t]*)location\s+/\s*\{\s*$", re.MULTILINE)
+    pattern = re.compile(r"^(?P<indent>[ \t]*)location[ \t]+/[ \t]*\{[ \t]*\r?$", re.MULTILINE)
     matches = list(pattern.finditer(original))
     require(len(matches) == 1, "nginx_default_location_ambiguous")
     match = matches[0]
-    insertion = match.group("indent") + "include " + str(ROUTES) + ";\n\n"
+    newline = "\r\n" if match.group(0).endswith("\r") else "\n"
+    insertion = match.group("indent") + "include " + str(ROUTES) + ";" + newline + newline
     return original[:match.start()] + insertion + original[match.start():]
 
 
@@ -276,7 +287,7 @@ def prepare(args):
         require(not path.exists() and not path.is_symlink(), "first_install_target_exists:" + str(path))
     require(re.match(r"v2[4-9]\.", run([NODE, "--version"]).strip()), "node24_required")
     require(SITE.is_file() and not SITE.is_symlink(), "nginx_site_not_regular")
-    original = SITE.read_text(encoding="utf-8")
+    original = read_exact(SITE)
     candidate = candidate_site(original)
     baseline = original_identity()
     old_health()
@@ -308,6 +319,7 @@ def prepare(args):
         cwd=release, timeout=240)
     require((release / "node_modules/fastify/package.json").exists(), "production_dependencies_missing")
     state["code_manifest"] = code_manifest(release)
+    save_state(state)
     uid, gid = create_service_user()
     CONFIG.mkdir(mode=0o750)
     os.chown(CONFIG, 0, gid)
@@ -337,6 +349,134 @@ def prepare(args):
 
 def load_state():
     return json.loads(STATE.read_text(encoding="utf-8"))
+
+
+def reviewed_resume_site(state):
+    require(state["status"] == "preparing", "resume_requires_preparing")
+    require(SITE.is_file() and not SITE.is_symlink(), "nginx_site_not_regular")
+    raw = SITE.read_bytes()
+    require(sha(raw) == REVIEWED_CRLF_RAW_SHA and raw.count(b"\r\n") == REVIEWED_CRLF_COUNT,
+            "resume_not_reviewed_crlf_site")
+    normalized = raw.replace(b"\r\n", b"\n")
+    require(sha(normalized) == REVIEWED_CRLF_NORMALIZED_SHA
+            and state["original_nginx_sha256"] == REVIEWED_CRLF_NORMALIZED_SHA,
+            "resume_normalized_baseline_mismatch")
+    backup = Path(state["backup"])
+    require((backup / "nginx-xgift.conf").read_bytes() == normalized,
+            "resume_original_backup_changed")
+    candidate = (backup / "nginx-candidate.conf").read_bytes()
+    require(sha(candidate) == state["candidate_nginx_sha256"]
+            and candidate == candidate_site(normalized.decode("utf-8")).encode(),
+            "resume_candidate_backup_changed")
+    require(json.loads(read_exact(backup / "original-state.json")) == state["original_services"],
+            "resume_service_backup_changed")
+    return raw.decode("utf-8")
+
+
+def verify_resume_configuration(args):
+    env_path = CONFIG / "service.env"
+    metadata_path = CONFIG / "bootstrap-metadata.json"
+    check_protected_file(env_path)
+    check_protected_file(metadata_path)
+    require(file_sha(env_path) == args.config_sha256, "resume_configuration_changed")
+    require(file_sha(metadata_path) == args.metadata_sha256, "resume_metadata_changed")
+    expected = dict(alipayProduction=True, alipayFieldsComplete=True, independentSecretsGenerated=True,
+                    masterKeyCopied=False, partnerDestination="https://x.aifu.me",
+                    canonicalBase=PUBLIC_BASE, productsEnabled=False, workersEnabled=False)
+    require(json.loads(read_exact(metadata_path)) == expected, "resume_metadata_not_closed")
+    values = {}
+    for line in read_exact(env_path).splitlines():
+        key, separator, value = line.partition("=")
+        require(separator and re.fullmatch(r"[A-Z][A-Z0-9_]*", key) and key not in values,
+                "resume_environment_format_invalid")
+        values[key] = json.loads(value)
+        require(isinstance(values[key], str), "resume_environment_format_invalid")
+    required = dict(NODE_ENV="production", HOST="127.0.0.1", PORT="3110", PUBLIC_BASE_URL=PUBLIC_BASE,
+                    DATABASE_PATH=str(DATABASE), PRODUCT_CATALOG_PATH=str(CONFIG / "products.json"),
+                    PLATFORM_WEBHOOK_ENABLED="false", PAYMENT_PROVIDER="alipay", X_API_MODE="live",
+                    X_API_BASE_URL="https://x.aifu.me", ALIPAY_NOTIFY_URL=PUBLIC_BASE + "/callbacks/alipay",
+                    ALIPAY_GATEWAY="https://openapi.alipay.com/gateway.do", ZOVO_MODE="mock",
+                    PARTNER_SALES_GATE_FILE=str(SALES_GATE), QUEFA_WORKER_GATE_FILE=str(WORKER_GATE))
+    require(all(values.get(key) == value for key, value in required.items()) and "MASTER_KEY" not in values,
+            "resume_environment_not_isolated")
+    secrets = [values.get(key, "") for key in ("PLATFORM_API_KEY", "PLATFORM_WEBHOOK_SECRET", "ADMIN_TOKEN", "EMAIL_HMAC_KEY", "X_API_SECRET")]
+    require(all(len(value) >= 32 for value in secrets) and len(set(secrets)) == len(secrets),
+            "resume_independent_secrets_invalid")
+    require(len(base64.b64decode(values.get("SESSION_ENCRYPTION_KEY", ""), validate=True)) == 32,
+            "resume_session_key_invalid")
+    require(values.get("ALIPAY_PRIVATE_KEY", "").startswith("-----BEGIN PRIVATE KEY-----")
+            and values.get("ALIPAY_PUBLIC_KEY", "").startswith("-----BEGIN PUBLIC KEY-----"),
+            "resume_payment_keys_not_normalized")
+    require(file_sha(CONFIG / "products.json") == file_sha(BUNDLE / "products.json"),
+            "resume_products_changed")
+
+
+def verify_resume_artifact(state, artifact_path):
+    artifact = Path(artifact_path)
+    require(artifact.is_absolute() and artifact.is_file() and not artifact.is_symlink()
+            and file_sha(artifact) == state["artifact_sha256"], "resume_original_artifact_changed")
+    # The interrupted older prepare did not persist its in-memory code manifest.
+    # Rebuild that evidence from the pinned original archive, never trust the
+    # existing release merely because a prior hash record is missing.
+    with tempfile.TemporaryDirectory(prefix="x-partner-resume-verify-") as temporary:
+        reference = Path(temporary) / "reference"
+        extract_release(artifact, reference)
+        verified = code_manifest(reference)
+    require(verified == code_manifest(Path(state["release"])), "resume_artifact_release_mismatch")
+    if state.get("code_manifest"):
+        require(verified == state["code_manifest"], "resume_recorded_code_manifest_changed")
+    require((Path(state["release"]) / "node_modules/fastify/package.json").is_file(),
+            "resume_dependencies_missing")
+    run(["/opt/node/bin/npm", "ls", "--omit=dev", "--json"], cwd=Path(state["release"]), timeout=45)
+    return verified
+
+
+def resume_prepared(args):
+    state = load_state()
+    raw_original = reviewed_resume_site(state)
+    require(re.fullmatch(r"[a-z0-9][a-z0-9-]{5,63}", state["release_id"]), "resume_release_id_invalid")
+    require(Path(state["release"]) == ROOT / "releases" / state["release_id"]
+            and Path(state["backup"]) == Path("/opt/backups") / ("x-partner-gateway-" + state["release_id"]),
+            "resume_state_paths_unexpected")
+    for value in (args.previous_script_sha256, args.config_sha256, args.metadata_sha256):
+        require(re.fullmatch(r"[a-f0-9]{64}", value), "resume_expected_hash_invalid")
+    current_bundle = bundle_hashes()
+    old_bundle = state["bundle_hashes"]
+    require(set(old_bundle) == set(current_bundle)
+            and old_bundle["deploy-gateway.py"] == args.previous_script_sha256
+            and all(current_bundle[name] == old_bundle[name] for name in BUNDLE_FILES if name != "deploy-gateway.py"),
+            "resume_unreviewed_bundle_change")
+    verified_manifest = verify_resume_artifact(state, args.artifact)
+    for path in (DATABASE, ROOT / "current", UNIT, ROUTES, SALES_GATE, WORKER_GATE):
+        require(not path.exists() and not path.is_symlink(), "resume_installation_or_sales_already_started")
+    require(not list((DATA / "data").iterdir()), "resume_data_directory_not_empty")
+    verify_resume_configuration(args)
+    assert_original_unchanged(state)
+    check_port()
+    old_health()
+    run(["systemd-analyze", "verify", str(BUNDLE / "x-partner-gateway.service")], timeout=30)
+    # Recheck every mutable input immediately before creating new backups/state.
+    require(reviewed_resume_site(state) == raw_original, "resume_nginx_concurrent_change")
+    require(code_manifest(Path(state["release"])) == verified_manifest, "resume_code_concurrent_change")
+    verify_resume_configuration(args)
+    assert_original_unchanged(state)
+    raw_candidate = candidate_site(raw_original)
+    backup = Path(state["backup"])
+    for name in ("nginx-xgift.raw.conf", "nginx-candidate.raw.conf"):
+        require(not (backup / name).exists() and not (backup / name).is_symlink(), "resume_raw_backup_exists")
+    write_new(backup / "nginx-xgift.raw.conf", raw_original)
+    write_new(backup / "nginx-candidate.raw.conf", raw_candidate)
+    state["crlf_recovery"] = dict(normalized_original_sha256=state["original_nginx_sha256"],
+                                  normalized_candidate_sha256=state["candidate_nginx_sha256"],
+                                  previous_script_sha256=args.previous_script_sha256)
+    state.update(status="prepared", original_nginx_sha256=sha(raw_original.encode()),
+                 candidate_nginx_sha256=sha(raw_candidate.encode()), bundle_hashes=current_bundle,
+                 code_manifest=verified_manifest,
+                 original_nginx_backup="nginx-xgift.raw.conf", candidate_nginx_backup="nginx-candidate.raw.conf",
+                 config_sha256=args.config_sha256, products_sha256=file_sha(CONFIG / "products.json"))
+    save_state(state)
+    emit("prepared", recovered_reviewed_crlf=True, original_services_unchanged=True,
+         normalized_backups_preserved=True, credentials_regenerated=False, sales_enabled=False, workers_enabled=False)
 
 
 def assert_prepared(state):
@@ -403,7 +543,7 @@ def rollback_first_install(state):
     run(["systemctl", "stop", SERVICE])
     run(["systemctl", "disable", SERVICE])
     if current_hash == state["candidate_nginx_sha256"]:
-        original = (Path(state["backup"]) / "nginx-xgift.conf").read_text(encoding="utf-8")
+        original = read_exact(Path(state["backup"]) / state.get("original_nginx_backup", "nginx-xgift.conf"))
         require(sha(original.encode()) == state["original_nginx_sha256"], "rollback_backup_changed")
         atomic_write(SITE, original, state["original_nginx_mode"])
         run(["nginx", "-t"])
@@ -435,7 +575,7 @@ def install():
         require(file_sha(SITE) == state["original_nginx_sha256"], "nginx_changed_before_install")
         ROUTES.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         write_new(ROUTES, (BUNDLE / "nginx-partner.conf").read_text(encoding="utf-8"), 0o644)
-        candidate = (Path(state["backup"]) / "nginx-candidate.conf").read_text(encoding="utf-8")
+        candidate = read_exact(Path(state["backup"]) / state.get("candidate_nginx_backup", "nginx-candidate.conf"))
         require(sha(candidate.encode()) == state["candidate_nginx_sha256"], "nginx_candidate_backup_changed")
         atomic_write(SITE, candidate, state["original_nginx_mode"])
         run(["nginx", "-t"])
@@ -464,6 +604,11 @@ def main():
     prepare_parser.add_argument("--release-id", required=True)
     prepare_parser.add_argument("--platform-webhook-url", default="")
     sub.add_parser("install")
+    resume = sub.add_parser("resume-prepared")
+    resume.add_argument("--artifact", required=True)
+    resume.add_argument("--previous-script-sha256", required=True)
+    resume.add_argument("--config-sha256", required=True)
+    resume.add_argument("--metadata-sha256", required=True)
     verification = sub.add_parser("verify")
     verification.add_argument("--canonical", action="store_true")
     args = parser.parse_args()
@@ -478,6 +623,8 @@ def main():
                 prepare(args)
             elif args.action == "install":
                 install()
+            elif args.action == "resume-prepared":
+                resume_prepared(args)
             else:
                 verify(args.canonical)
         except Exception as error:
