@@ -1,0 +1,30 @@
+[Unit]
+Description=Isolated BlueV integration sandbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xbluevsandbox
+Group=xbluevsandbox
+WorkingDirectory=/opt/x-bluev-sandbox/current
+EnvironmentFile=/etc/x-bluev-sandbox/service.env
+ExecStart=/opt/node/bin/node dist/bluev-sandbox-server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/x-bluev-sandbox
+InaccessiblePaths=/etc/xgift /srv/xgift /etc/x-partner-gateway /srv/x-partner-gateway /etc/x-platform-orders
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=384M
+CPUQuota=35%
+Nice=10
+LimitNOFILE=2048
+
+[Install]
+WantedBy=multi-user.target
