@@ -1,4 +1,6 @@
-# 隔离蓝V网关发布计划（已生成脚本，未执行）
+# 隔离蓝V网关发布设计
+
+2026-10-05已完成隔离待联调发布；实际执行结果及尚未开售边界见 [发布记录](RELEASE-20261005.md)。下文保留部署设计，不是实时状态。
 
 目标：合作方继续使用 api.quefa.cn，在我们 X 服务器收款并履约；不改 AI京东旧交易程序、不重启原 xgift。
 
@@ -12,7 +14,7 @@
 - Node24 /opt/node/bin/node，独立 SQLite，无旧 GPT 商品或 GPT 上游凭据。
 - canonical PUBLIC_BASE_URL=https://api.quefa.cn/bluev；支付宝新通知地址追加 /callbacks/alipay。
 - X Nginx 只插入一个专用 include，只执行 nginx 配置检查和 reload。原 xgift 与 nginx 主进程 PID/开始时间前后必须不变。
-- Quefa Caddy 映射是另一份独立变更，必须先核对线上配置；本目录脚本不接触 Quefa 服务器。
+- Quefa Caddy 映射由本目录独立的 `deploy-caddy-route.py` 执行；X端脚本不接触 Quefa 服务器。
 
 ## 默认关闭边界
 
@@ -43,4 +45,4 @@ PARTNER_SALES_GATE_FILE 必须由应用对新订单动态检查，关闭后不�
 
 ## 交付
 
-实际操作与本地验证参阅 README.md。当前目录仅包含本地生成的发布脚本和测试；本代理没有执行服务器发布或真实支付。
+操作与本地验证参阅 README.md，执行记录参阅 RELEASE-20261005.md。发布不等于完成真实付款验收，未确认开售前不得对消费者开放购买。
