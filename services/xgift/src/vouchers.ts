@@ -54,16 +54,22 @@ function customerView(voucher: VoucherRecord, order?: Order) {
   }
 }
 
-export async function issueVouchers(env: Env, body: Record<string, unknown>) {
-  const userId = text(body.user_id, '扣点账户', 80)
+/** Only server-side session code may supply this scope; never read it from a request body. */
+export type MerchantVoucherScope = { userId: string }
+
+export async function issueVouchers(env: Env, body: Record<string, unknown>, scope?: MerchantVoucherScope) {
+  const userId = text(scope ? scope.userId : body.user_id, '扣点账户', 80)
   const productCode = text(body.product_code, '商品代码', 64)
   const quantity = integer(body.quantity ?? body.count, '生成数量', 1, 100)
   const days = integer(body.expires_in_days ?? 30, '有效天数', 1, 365)
   const batchLabel = body.batch_label === undefined || body.batch_label === '' ? '' : text(body.batch_label, '批次名称', 80)
   const owner = await env.DB.prepare('SELECT id FROM users WHERE id=? AND enabled=1').bind(userId).first()
   if (!owner) fail('invalid_owner', '扣点账户不存在或已停用。', 409)
-  const product = await env.DB.prepare('SELECT code FROM products WHERE code=?').bind(productCode).first()
-  if (!product) fail('invalid_product', '商品不存在。', 404)
+  const product = await env.DB.prepare('SELECT code FROM products WHERE code=?' + (scope ? ' AND enabled=1' : '')).bind(productCode).first()
+  if (!product) {
+    if (scope) fail('product_unavailable', '当前套餐未开放发卡，请选择已启用的套餐。', 409)
+    fail('invalid_product', '商品不存在。', 404)
+  }
 
   const batchId = id('vbatch'), now = Date.now(), expiresAt = now + days * 86400000
   const vouchers = await Promise.all(Array.from({ length: quantity }, async () => {
@@ -76,7 +82,7 @@ export async function issueVouchers(env: Env, body: Record<string, unknown>) {
       'INSERT INTO vouchers(id,batch_id,batch_label,user_id,product_code,code_hash,last_four,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)',
     ).bind(voucher.id, batchId, batchLabel, userId, productCode, voucher.codeHash, voucher.code.slice(-4), now, expiresAt)),
     env.DB.prepare('INSERT INTO audit VALUES(?,?,?,?,?,?)').bind(
-      id('audit'), 'admin', 'issue_vouchers', batchId,
+      id('audit'), scope ? userId : 'admin', 'issue_vouchers', batchId,
       JSON.stringify({ user_id: userId, product_code: productCode, quantity, expires_at: expiresAt, batch_label: batchLabel }), now,
     ),
   ])
@@ -88,12 +94,12 @@ export async function issueVouchers(env: Env, body: Record<string, unknown>) {
 
 export type VoucherFilters = { status?: string; q?: string; user_id?: string }
 
-export async function listVouchers(env: Env, offset: number, filters: VoucherFilters = {}) {
+export async function listVouchers(env: Env, offset: number, filters: VoucherFilters = {}, scope?: MerchantVoucherScope) {
   if (!Number.isSafeInteger(offset) || offset < 0)
     fail('invalid_input', '卡密分页参数无效。')
   const status = filters.status?.trim() ?? ''
   const query = filters.q?.trim() ?? ''
-  const owner = filters.user_id?.trim() ?? ''
+  const owner = scope ? text(scope.userId, '所属商户', 80) : filters.user_id?.trim() ?? ''
   if (!['', 'available', 'active', 'redeemed', 'revoked', 'expired'].includes(status))
     fail('invalid_input', '卡密状态筛选无效。')
   if (query.length > 80 || owner.length > 80)
@@ -123,17 +129,19 @@ export async function listVouchers(env: Env, offset: number, filters: VoucherFil
   return rows.map(row => ({ ...row, state: state(row) }))
 }
 
-export async function revokeVoucher(env: Env, voucherId: string, body: Record<string, unknown>) {
+export async function revokeVoucher(env: Env, voucherId: string, body: Record<string, unknown>, scope?: MerchantVoucherScope) {
   const note = text(body.note, '撤销说明', 300)
+  const owner = scope ? text(scope.userId, '所属商户', 80) : null
+  const ownerSql = owner ? ' AND user_id=?' : '', ownerValues = owner ? [owner] : []
   const changed = await env.DB.prepare(
-    "UPDATE vouchers SET status='revoked',revoked_at=?,revocation_note=? WHERE id=? AND status='active' AND order_id IS NULL RETURNING id",
-  ).bind(Date.now(), note, voucherId).first()
+    `UPDATE vouchers SET status='revoked',revoked_at=?,revocation_note=? WHERE id=?${ownerSql} AND status='active' AND order_id IS NULL RETURNING id`,
+  ).bind(Date.now(), note, voucherId, ...ownerValues).first()
   if (!changed) {
-    const existing = await env.DB.prepare('SELECT status FROM vouchers WHERE id=?').bind(voucherId).first<{ status: string }>()
+    const existing = await env.DB.prepare('SELECT status FROM vouchers WHERE id=?' + ownerSql).bind(voucherId, ...ownerValues).first<{ status: string }>()
     if (!existing) fail('not_found', '卡密不存在。', 404)
     fail('cannot_revoke', '卡密已兑换或已撤销，不能再次撤销。', 409)
   }
-  await audit(env, 'admin', 'revoke_voucher', voucherId, note)
+  await audit(env, owner ?? 'admin', 'revoke_voucher', voucherId, note)
   return { revoked: true }
 }
 

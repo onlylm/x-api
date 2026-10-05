@@ -18,7 +18,7 @@ import { AdminOrders } from './AdminOrders'
 import { Checkout } from './Checkout'
 import { orderFailureDescription } from './order-failures'
 import { hasUnsavedChanges } from './unsaved-changes'
-import { adminSections, merchantSections, workspaceHref, workspaceRoute } from './workspace-route'
+import { adminSections, merchantSections, hasOwnPagination, workspaceHref, workspaceRoute } from './workspace-route'
 import { OperationsHome } from './OperationsHome'
 import { orderStateText, orderProduct } from './order-ui'
 import {
@@ -396,7 +396,7 @@ function Workspace() {
       rememberedLocations.current[previous.section] = previousHash
       locationRef.current = { section: next.section, hash: window.location.hash || '#overview' }
       setSection(next.section)
-      if (!['orders', 'vouchers'].includes(next.section) || user?.role !== 'admin') updatePage(next.page)
+      if (!hasOwnPagination(next.section, user?.role === 'admin')) updatePage(next.page)
       if (next.section !== previous.section) { setLoading(true); setNotice(''); setModal(null) }
     }
     function beforeLeave(event: BeforeUnloadEvent) {
@@ -474,7 +474,7 @@ function Workspace() {
             }
           })
         }
-      } else if (['docs', 'admission', 'payment'].includes(section) || (admin && ['orders', 'vouchers'].includes(section))) result = {}
+      } else if (['docs', 'admission', 'payment', 'vouchers'].includes(section) || (admin && section === 'orders')) result = {}
       else
         result = {
           rows: await api<Row[]>(
@@ -842,6 +842,7 @@ function Workspace() {
       return (
         <>
           <Vouchers
+            scope={admin ? 'admin' : 'merchant'}
             request={api}
             onError={onError}
             onChanged={() => setRefresh((v) => v + 1)}
@@ -1250,9 +1251,9 @@ function Workspace() {
         <header className="page-header">
           <div>
             <h1>{sections[section][0]}</h1>
-            <p>{sections[section][1]}</p>
+            <p>{!admin && section === 'vouchers' ? '生成并交付自己的套餐卡密，查看兑换进度' : sections[section][1]}</p>
           </div>
-          {!(admin && ['orders', 'admission', 'payment'].includes(section)) && <Button
+          {section !== 'vouchers' && !(admin && ['orders', 'admission', 'payment'].includes(section)) && <Button
             variant="secondary"
             aria-label="刷新当前页面"
             disabled={loading}

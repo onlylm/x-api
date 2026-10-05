@@ -522,6 +522,17 @@ async function route(request: Request, env: Env): Promise<Response> {
     return fail('not_found', '接口不存在。', 404)
   }
   if (!userId) return fail('forbidden', '请登录用户账户。', 403)
+  if (path === '/api/vouchers' && method === 'GET')
+    return json(await listVouchers(env, pagination(url).offset, {
+      status: url.searchParams.get('status') ?? '', q: url.searchParams.get('q') ?? '',
+    }, { userId }))
+  if (path === '/api/vouchers' && method === 'POST') {
+    await limit(env, 'voucher-issue:' + userId, 5)
+    return json(await issueVouchers(env, data, { userId }), 201)
+  }
+  const merchantVoucherRevoke = path.match(/^\/api\/vouchers\/(vch_[a-f0-9]{32})\/revoke$/)
+  if (merchantVoucherRevoke && method === 'POST')
+    return json(await revokeVoucher(env, merchantVoucherRevoke[1], data, { userId }))
   if (path === '/api/eligibility' && method === 'POST') {
     await limit(env, 'eligibility:' + userId, 20)
     return json(await eligibility(env, data.username))

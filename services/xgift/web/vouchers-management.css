@@ -31,6 +31,19 @@
 .voucher-record-detail dd { margin: 0; overflow-wrap: anywhere; }
 .voucher-record-detail code { font-size: 11px; }
 .voucher-management .pager { flex-wrap: wrap; }
+.voucher-management-own .voucher-generation-form { grid-template-columns: minmax(0, 1fr); max-width: 760px; }
+.voucher-management-own .voucher-issue-fields > :nth-child(1), .voucher-management-own .voucher-issue-fields > :nth-child(2) { grid-column: auto; }
+.voucher-own-account { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 0; margin-bottom: 20px; border-bottom: 1px solid var(--recharge-line); }
+.voucher-own-account > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.voucher-own-account span { color: #596574; font-variant-numeric: tabular-nums; }
+.voucher-price-note { grid-column: 1 / -1; margin: 0; }
+.voucher-linked-order { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--recharge-line); }
+.voucher-linked-order:focus-visible { outline: 2px solid #527461; outline-offset: 5px; }
+.voucher-order-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 28px; margin: 20px 0; }
+.voucher-order-facts > div { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
+.voucher-order-facts dt { font-size: 12px; color: #65717f; }
+.voucher-order-facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.voucher-order-button { align-self: flex-start; }
 .voucher-batch-dialog .secret-output { width: 100%; margin: 12px 0; }
 .voucher-saved-confirm { display: flex; align-items: start; gap: 10px; line-height: 1.6; padding: 12px 0; }
 .voucher-saved-confirm input { width: 18px; height: 18px; margin: 3px 0 0; flex-shrink: 0; accent-color: var(--recharge-accent); }
@@ -52,4 +65,8 @@
   .voucher-records > .toolbar { gap: 16px; flex-wrap: wrap; }
   .voucher-management .pager > span { flex-basis: 100%; }
   .voucher-owner-pager { flex-wrap: wrap; }
+  .voucher-own-account { align-items: flex-start; flex-direction: column; }
+  .voucher-own-account > button { width: 100%; }
+  .voucher-order-facts { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .voucher-linked-order .toolbar, .voucher-linked-order .actions { flex-wrap: wrap; }
 }
