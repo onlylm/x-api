@@ -11,6 +11,7 @@ import socket
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -134,11 +135,11 @@ def assert_old(state):
     require(old_baseline() == state["old_baseline"], "original_service_or_configuration_changed")
 
 
-def request(url, method="GET", headers=None):
+def request(url, method="GET", headers=None, timeout=8):
     req = urllib.request.Request(url, method=method, headers=headers or {},
                                  data=b"" if method == "POST" else None)
     try:
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.status, dict(response.headers.items()), response.read(2 * 1024 * 1024)
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers.items()), error.read(65536)
@@ -399,9 +400,51 @@ def prepare(args):
 
 def assert_release(state):
     require(sha(SCRIPT.read_bytes()) == state["script_sha256"], "deploy_script_changed")
+    assert_release_contents(state)
+
+
+def assert_release_contents(state):
     require(manifest(ROOT / "releases" / state["release_id"]) == state["release_manifest"], "release_changed")
     require(fingerprint(CONFIG / "service.env") == state["env_sha256"], "reader_configuration_changed")
     assert_old(state)
+
+
+def assert_current(state):
+    require((ROOT / "current").is_symlink()
+            and (ROOT / "current").resolve() == ROOT / "releases" / state["release_id"],
+            "reader_current_changed")
+
+
+def checked_candidate(state):
+    backup = Path(state["backup"])
+    require(backup == ROOT / "backups" / state["release_id"], "backup_directory_changed")
+    candidate = exact(backup / "nginx.candidate")
+    require(fingerprint(backup / "nginx.original") == state["original_site_sha256"]
+            and fingerprint(backup / "nginx.candidate") == state["candidate_site_sha256"]
+            and fingerprint(backup / "new-snippet.conf") == state["snippet_sha256"]
+            and fingerprint(backup / "new-unit.service") == state["unit_sha256"], "release_backup_changed")
+    return candidate
+
+
+def stopped_reader_identity():
+    fields = run(["systemctl", "show", SERVICE, "-p", "LoadState", "-p", "MainPID",
+                  "-p", "ActiveState", "-p", "SubState", "-p", "FragmentPath",
+                  "-p", "UnitFileState", "-p", "NeedDaemonReload", "-p", "ExecMainStartTimestamp",
+                  "-p", "DropInPaths"])
+    identity = dict(line.split("=", 1) for line in fields.splitlines() if "=" in line)
+    expected = dict(LoadState="loaded", MainPID="0", ActiveState="inactive", SubState="dead",
+                    FragmentPath=str(UNIT), UnitFileState="disabled", NeedDaemonReload="no", DropInPaths="")
+    require(all(identity.get(key) == value for key, value in expected.items()), "reader_not_original_stopped_unit")
+    return identity
+
+
+def assert_resume_targets(state):
+    require(fingerprint(SITE) == state["original_site_sha256"], "nginx_changed_before_resume")
+    require(fingerprint(SNIPPET) == state["snippet_sha256"]
+            and fingerprint(UNIT) == state["unit_sha256"], "resume_routes_or_unit_changed")
+    assert_current(state)
+    checked_candidate(state)
+    return stopped_reader_identity()
 
 
 def reader_checks():
@@ -414,21 +457,24 @@ def reader_checks():
         require(code == 401, "reader_admin_session_not_required")
 
 
-def verify():
-    state = load()
-    require(state["status"] in {"installing", "installed"}, "reader_not_installed")
+def assert_verify_targets(state):
     assert_release(state)
     require(fingerprint(SITE) == state["candidate_site_sha256"], "nginx_site_changed")
     require(fingerprint(SNIPPET) == state["snippet_sha256"] and fingerprint(UNIT) == state["unit_sha256"],
             "new_routes_or_unit_changed")
     identity = service_identity(SERVICE)
     require(identity.get("FragmentPath") == str(UNIT), "reader_loaded_wrong_unit")
-    require((ROOT / "current").is_symlink()
-            and (ROOT / "current").resolve() == ROOT / "releases" / state["release_id"],
-            "reader_current_changed")
-    reader_checks()
+    assert_current(state)
+
+
+def verify_public_routes(state, deadline):
+    def probe(path, method="GET", headers=None):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "public_routes_readiness_timeout")
+        return request(PUBLIC + path, method=method, headers=headers, timeout=min(2, remaining))
+
     for path in ("/", "/index.html"):
-        code, headers, body = request(PUBLIC + path)
+        code, headers, body = probe(path, headers={"Accept": "text/html", "Cache-Control": "no-cache"})
         headers = {key.lower(): value for key, value in headers.items()}
         require(code == 200 and sha(body) == state["release_manifest"]["ui/index.html"], "ui_index_mismatch")
         require("no-store" in headers.get("cache-control", "")
@@ -439,13 +485,47 @@ def verify():
                 and headers.get("strict-transport-security", "").startswith("max-age="), "ui_security_headers_missing")
     prefix = "/platform-admin-ui/" + state["release_id"] + "/"
     for path in state["asset_urls"]:
-        code, _, body = request(PUBLIC + path)
+        code, _, body = probe(path)
         require(code == 200 and sha(body) == state["release_manifest"]["ui/" + path.removeprefix(prefix)],
                 "ui_asset_mismatch")
-    code, _, _ = request(PUBLIC + API)
+    code, _, _ = probe(API)
+    require(code not in {404, 502, 503}, "public_route_not_ready")
     require(code == 401, "public_admin_session_not_required")
-    code, _, _ = request(PUBLIC + API, method="POST")
+    code, _, _ = probe(API, method="POST")
+    require(code not in {401, 403, 404, 502, 503}, "public_route_not_ready")
     require(code == 405, "readonly_method_not_enforced")
+
+
+def wait_for_public_routes(state):
+    # A successful reload signal precedes the new workers accepting requests.
+    # Only readiness failures are retried; changed files/old identities or a
+    # security/authentication failure stop immediately. Every attempt rehashes.
+    deadline = time.monotonic() + 20
+    for attempt in range(8):
+        assert_verify_targets(state)
+        try:
+            verify_public_routes(state, deadline)
+            return
+        except DeployError as error:
+            if str(error) not in {"ui_index_mismatch", "ui_asset_mismatch", "public_route_not_ready"}:
+                raise
+            failure = error
+        except OSError as error:
+            failure = error
+        remaining = deadline - time.monotonic()
+        if attempt == 7 or remaining <= 0:
+            raise failure
+        emit("waiting_for_new_routes", attempt=attempt + 1, maximum_attempts=8)
+        time.sleep(min(0.5, remaining))
+
+
+def verify():
+    state = load()
+    require(state["status"] in {"installing", "installed"}, "reader_not_installed")
+    assert_verify_targets(state)
+    reader_checks()
+    old_health()
+    wait_for_public_routes(state)
     code, _, body = request(PUBLIC + "/api/session")
     require(code == 200 and json.loads(body).get("data", {}).get("authenticated") is False,
             "original_anonymous_session_changed")
@@ -488,21 +568,50 @@ def install():
         require(not path.exists() and not path.is_symlink(), "new_install_target_changed")
     port_free()
     old_health()
+    activate(state, reuse=False)
+
+
+def resume(args):
+    state = load()
+    require(state["status"] == "rolled_back", "resume_requires_rolled_back")
+    require(re.fullmatch(r"[a-f0-9]{64}", args.previous_script_sha256)
+            and state["script_sha256"] == args.previous_script_sha256, "previous_deploy_script_mismatch")
+    # The explicit reviewed previous hash permits a script-only migration.
+    # All retained files and stopped unit identity must still match first.
+    assert_release_contents(state)
+    identity = assert_resume_targets(state)
+    port_free()
+    old_health()
+    assert_release_contents(state)
+    require(assert_resume_targets(state) == identity, "stopped_reader_identity_changed")
+    state["resume_previous_script_sha256"] = state["script_sha256"]
+    state["resume_stopped_reader_identity"] = identity
+    state["script_sha256"] = sha(SCRIPT.read_bytes())
+    save(state)
+    activate(state, reuse=True)
+
+
+def activate(state, *, reuse):
+    assert_release(state)
+    if reuse:
+        require(assert_resume_targets(state) == state["resume_stopped_reader_identity"],
+                "stopped_reader_identity_changed")
     backup = Path(state["backup"])
-    candidate = exact(backup / "nginx.candidate")
-    require(sha(candidate.encode()) == state["candidate_site_sha256"]
-            and fingerprint(backup / "new-snippet.conf") == state["snippet_sha256"]
-            and fingerprint(backup / "new-unit.service") == state["unit_sha256"], "release_backup_changed")
+    candidate = checked_candidate(state)
     state["status"] = "installing"
     save(state)
     try:
-        os.symlink(ROOT / "releases" / state["release_id"], ROOT / "current")
-        write_new(UNIT, exact(backup / "new-unit.service"), 0o644)
+        if not reuse:
+            os.symlink(ROOT / "releases" / state["release_id"], ROOT / "current")
+            write_new(UNIT, exact(backup / "new-unit.service"), 0o644)
         run(["systemd-analyze", "verify", str(UNIT)])
-        run(["systemctl", "daemon-reload"])
+        if not reuse:
+            run(["systemctl", "daemon-reload"])
+        else:
+            require(assert_resume_targets(state) == state["resume_stopped_reader_identity"],
+                    "stopped_reader_identity_changed")
         run(["systemctl", "enable", "--now", SERVICE])
         # Retry bounded startup without touching either existing service.
-        import time
         for attempt in range(8):
             try:
                 reader_checks()
@@ -513,7 +622,10 @@ def install():
                 time.sleep(0.5)
         assert_old(state)
         require(fingerprint(SITE) == state["original_site_sha256"], "nginx_changed_before_route")
-        write_new(SNIPPET, exact(backup / "new-snippet.conf"), 0o644)
+        if not reuse:
+            write_new(SNIPPET, exact(backup / "new-snippet.conf"), 0o644)
+        else:
+            require(fingerprint(SNIPPET) == state["snippet_sha256"], "resume_snippet_changed_before_route")
         atomic(SITE, candidate, state["site_mode"])
         run(["nginx", "-t"])
         run(["systemctl", "reload", "nginx"])
@@ -539,6 +651,8 @@ def main():
         prepare_parser.add_argument("--" + name, required=True)
     for name in ("install", "verify", "rollback"):
         commands.add_parser(name)
+    resume_parser = commands.add_parser("resume")
+    resume_parser.add_argument("--previous-script-sha256", required=True)
     args = parser.parse_args()
     require(os.geteuid() == 0, "root_required")
     import fcntl
@@ -548,6 +662,8 @@ def main():
         try:
             if args.action == "prepare":
                 prepare(args)
+            elif args.action == "resume":
+                resume(args)
             else:
                 {"install": install, "verify": verify, "rollback": rollback}[args.action]()
         except Exception as error:

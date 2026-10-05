@@ -41,7 +41,7 @@ ui/assets/<本轮构建产物>
 ui/<可选图标/字体文件>
 ```
 
-不得包含顶层 `.`、环境、私钥、数据库、node_modules、符号链接、源码或隐藏文件。允许文件类型限制在可执行JS/包JSON与静态HTML/JS/CSS/SVG/PNG/ICO/WOFF2/WebP。部署过程不执行npm安装。
+不得包含顶层 `.`、环境、私钥、数据库、node_modules、符号链接、源码或隐藏文件。打包时明确排除 Vite 复制的 `ui/_headers`（由 Nginx 专用 snippet 提供安全头，不读取此文件）。允许文件类型限制在可执行JS/包JSON与静态HTML/JS/CSS/SVG/PNG/ICO/WOFF2/WebP。部署过程不执行npm安装。
 
 旧 `/assets` 保留由8791提供，已打开旧页面继续加载旧hash资源；新静态资源使用独立带commit路径。只替换精确 `/` 与 `/index.html` 入口，不修改 `/redeem`、`/api`、`/v1`、`/partner` 原路由。HTML使用原CSP、X-Frame-Options、nosniff、Referrer-Policy和HSTS，Cache-Control:no-store；版本化资源immutable。
 
@@ -68,6 +68,8 @@ python3 /approved-release/platform-orders-deploy.py verify
 
 prepare仅检查、备份配置、解包隔离产物和生成无秘密的新环境，不启动、不reload。install再次核验基线，仅启动新服务；健康及匿名拒绝通过后才写入专用snippet和一个include，nginx -t成功再reload。verify核对旧服务状态、HTML/资源hash、安全头、GET401、POST405、原会话接口及健康；没有真实付款/赠送调用。
 
+Nginx 平滑 reload 返回不代表新 worker 已立即接管。新路由验收最多尝试 8 次、总就绪窗口 20 秒，每次 HTTP 请求最多 2 秒，HTML 明确发送 `Accept: text/html` 和 `Cache-Control: no-cache`。每轮重新验证代码、环境、Nginx 文件指纹及原服务身份；配置或安全校验异常不重试。超时仍不一致则按原流程回滚，不改变 alias 路径或旧代理路由。
+
 ## 回滚
 
 ```sh
@@ -76,7 +78,20 @@ python3 /approved-release/platform-orders-deploy.py rollback
 
 只在原文件与本次候选之间、旧实例与配置全部仍相同的情况下恢复原Nginx文件（移除本次include），检测成功后reload，再停止/禁用新3111服务。保留新增代码、静态产物、环境和备份；不恢复任何数据库。发现并发修改则拒绝覆盖，保留现场报告。旧 /partner snippet原样保留。
 
-首次prepare中断不支持覆盖重跑，先核对现场；本脚本不是通用升级工具。开页用户回滚后可刷新恢复旧UI；旧hash assets始终不动。新API返回的履约状态是网关已保存快照，显示更新时间，不承诺实时向X查单。
+## 成功回滚后的安全重试
+
+仅 `deploy-state.json` 的状态为 `rolled_back` 时允许恢复；`prepared`、`installing`、`installed`、`rollback_required` 都拒绝。不能重新 prepare、删除目录、重新解包或覆盖环境。
+
+```sh
+python3 /approved-release/platform-orders-deploy.py resume \
+  --previous-script-sha256 <上一次已审部署脚本SHA256>
+```
+
+参数必须为 64 位 SHA256，并且严格等于旧 state 记录的 `script_sha256`。脚本先核对 release 全文件清单、环境、全部备份、current 链接、已保留 unit/snippet、原始站点和旧服务基线；确认新 reader 实际加载的 unit 路径正确、没有 drop-in 覆盖，且为 inactive/dead、MainPID=0、disabled、无需 daemon-reload。检查新端口空闲及原健康，再次核对现场未变化，才更新 state 的脚本指纹并保留前次指纹和停止身份。
+
+恢复只复用已保留文件，不覆盖 unit/snippet/current/环境，不运行 daemon-reload；只启动已核实的新 reader、恢复本次候选 Nginx include，配置检测成功后 reload 并有限等待。仍然失败则回滚原站点、停止新服务；不恢复数据库，也不重启旧服务。任一保留文件缺失或被修改都拒绝自动补齐。若恢复在写入新脚本指纹后、启动前中断，需先核对现场，再以 state 当前记录且重新审核过的脚本指纹调用 resume。
+
+首次 prepare 中断不支持覆盖重跑，先核对现场；本脚本不是通用升级工具。开页用户回滚后可刷新恢复旧 UI；旧 hash assets 始终不动。新 API 返回的履约状态是网关已保存快照，显示更新时间，不承诺实时向 X 查单。
 
 ## 本地验收
 
