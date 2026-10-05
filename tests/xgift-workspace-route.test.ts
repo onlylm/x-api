@@ -17,7 +17,7 @@ test('merchant workspace includes owned vouchers without granting administrative
   assert.ok(merchantSections.includes('vouchers'))
   assert.ok(adminSections.includes('vouchers'))
   assert.deepEqual(workspaceRoute('#vouchers?status=redeemed&q=delivery&page=2'), { section: 'vouchers', page: 2 })
-  for (const section of ['users', 'admission', 'payment', 'cards', 'secrets', 'products', 'audit', 'webhooks'])
+  for (const section of ['platform-orders', 'users', 'admission', 'payment', 'cards', 'secrets', 'products', 'audit', 'webhooks'])
     assert.ok(!(merchantSections as readonly string[]).includes(section))
 })
 
@@ -26,5 +26,15 @@ test('voucher pagination stays inside the component for both roles to retain gen
   assert.equal(hasOwnPagination('vouchers', true), true)
   assert.equal(hasOwnPagination('orders', false), false)
   assert.equal(hasOwnPagination('orders', true), true)
+  assert.equal(hasOwnPagination('platform-orders', false), false)
+  assert.equal(hasOwnPagination('platform-orders', true), true)
   assert.equal(hasOwnPagination('ledger', false), false)
+})
+
+test('platform orders is an administrative route with independent filtering and pagination', () => {
+  assert.ok(adminSections.includes('platform-orders'))
+  assert.deepEqual(workspaceRoute('#platform-orders?payment=paid&fulfillment=review&q=platform-order&page=2'), { section: 'platform-orders', page: 2 })
+  assert.equal(workspaceHref('platform-orders'), '#platform-orders')
+  assert.equal(workspaceHref('platform-orders', 100000), '#platform-orders?page=100000')
+  assert.deepEqual(merchantSections, ['overview', 'orders', 'vouchers', 'keys', 'ledger', 'docs'])
 })

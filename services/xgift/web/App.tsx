@@ -15,6 +15,7 @@ import { Vouchers } from './Vouchers'
 import { PaymentSettings } from './PaymentSettings'
 import { AdmissionSettings } from './AdmissionSettings'
 import { AdminOrders } from './AdminOrders'
+import { PlatformOrders } from './PlatformOrders'
 import { Checkout } from './Checkout'
 import { orderFailureDescription } from './order-failures'
 import { hasUnsavedChanges } from './unsaved-changes'
@@ -90,6 +91,7 @@ const sections = {
   overview: ['工作台', '先处理异常，再查看今日进度', ChartBar],
   users: ['用户管理', '开通账户、入账点数及设置用户价格', Users],
   orders: ['订单与队列', '多单排队、逐笔付款，集中处理需要核对的原订单', ListChecks],
+  'platform-orders': ['平台订单', '关联平台收款与 X 赠送进度，只读查询原订单', Receipt],
   vouchers: ['卡密管理', '生成套餐卡密、查看兑换记录及撤销未用卡密', Key],
   ledger: ['点数流水', '充值、冻结、消费与退回记录', Receipt],
   products: ['商品配置', '点数售价与预期支付金额', SlidersHorizontal],
@@ -474,7 +476,7 @@ function Workspace() {
             }
           })
         }
-      } else if (['docs', 'admission', 'payment', 'vouchers'].includes(section) || (admin && section === 'orders')) result = {}
+      } else if (['docs', 'admission', 'payment', 'vouchers'].includes(section) || (admin && ['orders', 'platform-orders'].includes(section))) result = {}
       else
         result = {
           rows: await api<Row[]>(
@@ -630,6 +632,7 @@ function Workspace() {
     if (admin && section === 'admission') return <AdmissionSettings request={api} onError={onError} />
     if (admin && section === 'payment') return <PaymentSettings request={api} onError={onError} />
     if (admin && section === 'orders') return <AdminOrders request={api} onError={onError} refreshVersion={refresh} />
+    if (admin && section === 'platform-orders') return <PlatformOrders request={api} onError={onError} />
     if (section === 'overview') {
       if (admin)
         return <OperationsHome summary={data} />
@@ -1210,7 +1213,7 @@ function Workspace() {
         </a>
         <nav aria-label="主导航" className="grouped-navigation">
           {admin ? <>
-            <div className="nav-primary">{(['overview', 'orders', 'vouchers'] as Section[]).map(navItem)}</div>
+            <div className="nav-primary">{(['overview', 'orders', 'platform-orders', 'vouchers'] as Section[]).map(navItem)}</div>
             <details className="nav-folder" open={['admission', 'payment', 'cards', 'secrets', 'products'].includes(section)}>
               <summary>运行设置</summary>
               {(['admission', 'payment', 'cards', 'secrets', 'products'] as Section[]).map(navItem)}
@@ -1253,7 +1256,7 @@ function Workspace() {
             <h1>{sections[section][0]}</h1>
             <p>{!admin && section === 'vouchers' ? '生成并交付自己的套餐卡密，查看兑换进度' : sections[section][1]}</p>
           </div>
-          {section !== 'vouchers' && !(admin && ['orders', 'admission', 'payment'].includes(section)) && <Button
+          {section !== 'vouchers' && !(admin && ['orders', 'platform-orders', 'admission', 'payment'].includes(section)) && <Button
             variant="secondary"
             aria-label="刷新当前页面"
             disabled={loading}

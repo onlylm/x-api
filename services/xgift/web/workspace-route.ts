@@ -1,4 +1,4 @@
-export const adminSections = ['overview', 'orders', 'vouchers', 'admission', 'payment', 'cards', 'users', 'ledger', 'products', 'secrets', 'webhooks', 'audit'] as const
+export const adminSections = ['overview', 'orders', 'platform-orders', 'vouchers', 'admission', 'payment', 'cards', 'users', 'ledger', 'products', 'secrets', 'webhooks', 'audit'] as const
 export const merchantSections = ['overview', 'orders', 'vouchers', 'keys', 'ledger', 'docs'] as const
 export type WorkspaceSection = typeof adminSections[number] | typeof merchantSections[number]
 
@@ -16,5 +16,5 @@ export function workspaceHref(section: WorkspaceSection, page = 1) {
 
 /** These views own their filters and must stay mounted when their page changes. */
 export function hasOwnPagination(section: WorkspaceSection, isAdmin: boolean) {
-  return section === 'vouchers' || (isAdmin && section === 'orders')
+  return section === 'vouchers' || (isAdmin && ['orders', 'platform-orders'].includes(section))
 }
