@@ -255,14 +255,14 @@ export function PaymentSettings({ request, onError }: { request: Request; onErro
       setStatusError(''); setCheckedAt(Date.now()); setConfirmOpen(false); setConfirmation('')
       if (kind === 'save') {
         if (next.enabled)
-          setActionError('配置已保存，但最新设置显示 X 付款当前已启用。请核对其他管理操作，必要时停用付款。')
+          setActionError('配置已保存，但最新设置显示 X 付款当前已启用。请核对其他页面或登录会话中的操作，必要时停用付款。')
         else setMessage('配置已保存，X 付款仍关闭。检查通过后可单独启用。')
       } else if (kind === 'disable') {
         if (next.enabled)
-          setActionError('停用请求已执行，但最新设置显示 X 付款已重新启用。请核对其他管理操作，必要时再次停用。')
+          setActionError('停用请求已执行，但最新设置显示 X 付款已重新启用。请核对其他页面或登录会话中的操作，必要时再次停用。')
         else setMessage('X 付款已停用。请继续核对未结订单的处理结果。')
       } else if (!next.enabled) {
-        setActionError('启用请求已执行，但最新设置显示 X 付款当前已停用。请核对其他管理操作，未确认前不要重新启用。')
+        setActionError('启用请求已执行，但最新设置显示 X 付款当前已停用。请核对其他页面或登录会话中的操作，未确认前不要重新启用。')
       } else {
         setMessage(next.accepts_orders ? 'X 付款已启用，当前允许在每日接单额度内接单。'
           : 'X 付款已启用；新单还须通过上方每日接单设置与未结订单检查。')

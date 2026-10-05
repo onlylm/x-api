@@ -37,7 +37,7 @@ def card_target(data):
     path = url.path.removeprefix("/openapi/v1")
     if url.path != "/openapi/v1" + path:
         raise ValueError()
-    query = urllib.parse.parse_qs(url.query, keep_blank_values=True, strict_parsing=True)
+    query = urllib.parse.parse_qs(url.query, keep_blank_values=True, strict_parsing=True) if url.query else {}
     if any(k not in ("page", "page_size", "sync") or len(v) != 1 or not v[0].isdigit()
            for k, v in query.items()):
         raise ValueError()
