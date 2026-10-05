@@ -1,0 +1,85 @@
+[
+  {
+    "product": "chatgpt_plus_1m",
+    "name_zh": "ChatGPT Plus 月卡",
+    "name": "ChatGPT Plus 1 Month",
+    "plan": "plus",
+    "cost_price": "0.01",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  },
+  {
+    "product": "chatgpt_pro_5x_1m",
+    "name_zh": "ChatGPT Pro 5x 月卡",
+    "name": "ChatGPT Pro 5x 1 Month",
+    "plan": "pro_5x",
+    "cost_price": "0.01",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  },
+  {
+    "product": "chatgpt_pro_20x_1m",
+    "name_zh": "ChatGPT Pro 20x 月卡",
+    "name": "ChatGPT Pro 20x 1 Month",
+    "plan": "pro_20x",
+    "cost_price": "0.01",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  },
+  {
+    "product": "chatgpt_pro_50x_1m",
+    "name_zh": "ChatGPT Pro 50x 月卡",
+    "name": "ChatGPT Pro 50x 1 Month",
+    "plan": "pro_50x",
+    "internal_cost_cny": "3250.00",
+    "cost_price": "3250.00",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": true
+  },
+  {
+    "product": "chatgpt_pro_50x_cl_1m",
+    "name_zh": "ChatGPT Pro 50x 智利区月卡",
+    "name": "ChatGPT Pro 50x Chile 1 Month",
+    "plan": "pro_50x",
+    "payment_country": "CL",
+    "payment_currency": "CLP",
+    "internal_cost_cny": "0.00",
+    "cost_price": "0.01",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  },
+  {
+    "product": "x_premium_3m",
+    "name_zh": "X Premium 蓝V 3个月",
+    "name": "X Premium 3 Months",
+    "plan": "x_premium_3m",
+    "internal_cost_cny": "0.00",
+    "cost_price": "22.00",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  },
+  {
+    "product": "x_premium_6m",
+    "name_zh": "X Premium 蓝V 6个月",
+    "name": "X Premium 6 Months",
+    "plan": "x_premium_6m",
+    "internal_cost_cny": "0.00",
+    "cost_price": "44.00",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  }
+]

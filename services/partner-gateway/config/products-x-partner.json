@@ -1,0 +1,26 @@
+[
+  {
+    "product": "x_premium_3m",
+    "name_zh": "X Premium 蓝V 3个月",
+    "name": "X Premium 3 Months",
+    "plan": "x_premium_3m",
+    "internal_cost_cny": "0.00",
+    "cost_price": "22.00",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  },
+  {
+    "product": "x_premium_6m",
+    "name_zh": "X Premium 蓝V 6个月",
+    "name": "X Premium 6 Months",
+    "plan": "x_premium_6m",
+    "internal_cost_cny": "0.00",
+    "cost_price": "44.00",
+    "max_sell_price": "9999.00",
+    "currency": "CNY",
+    "max_qty": 1,
+    "enabled": false
+  }
+]

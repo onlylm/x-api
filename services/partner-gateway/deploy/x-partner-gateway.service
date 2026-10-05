@@ -1,0 +1,26 @@
+[Unit]
+Description=Isolated X partner payment and fulfillment gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xpartner
+Group=xpartner
+WorkingDirectory=/opt/x-partner-gateway/current
+Environment=PATH=/opt/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/etc/x-partner-gateway/service.env
+ExecStart=/opt/node/bin/node dist/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/x-partner-gateway
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
