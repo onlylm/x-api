@@ -108,26 +108,27 @@ class IndependentReleaseTests(unittest.TestCase):
                 activate.assert_not_called()
 
     def test_resume_changes_script_hash_only_after_unchanged_retained_files(self):
-        state = {"status": "rolled_back", "script_sha256": "a" * 64}
+        state = {"status": "rolled_back", "script_sha256": "a" * 64, "snippet_sha256": "b" * 64}
         identity = {"MainPID": "0", "FragmentPath": str(deploy.UNIT)}
-        with patch.object(deploy, "load", return_value=state), patch.object(deploy, "assert_release_contents") as contents, patch.object(deploy, "assert_resume_targets", return_value=identity) as targets, patch.object(deploy, "port_free"), patch.object(deploy, "old_health"), patch.object(deploy, "save") as save, patch.object(deploy, "activate") as activate, patch.object(deploy, "write_new") as write, patch.object(deploy, "extract") as extract:
-            deploy.resume(SimpleNamespace(previous_script_sha256="a" * 64))
+        with patch.object(deploy, "load", return_value=state), patch.object(deploy, "assert_release_contents") as contents, patch.object(deploy, "assert_resume_targets", return_value=identity) as targets, patch.object(deploy, "migrate_resume_snippet") as migrate, patch.object(deploy, "port_free"), patch.object(deploy, "old_health"), patch.object(deploy, "save") as save, patch.object(deploy, "activate") as activate, patch.object(deploy, "write_new") as write, patch.object(deploy, "extract") as extract:
+            deploy.resume(SimpleNamespace(previous_script_sha256="a" * 64, previous_snippet_sha256="b" * 64))
             self.assertEqual(contents.call_count, 2)
             self.assertEqual(targets.call_count, 2)
             self.assertEqual(state["script_sha256"], deploy.sha(deploy.SCRIPT.read_bytes()))
             self.assertEqual(state["resume_previous_script_sha256"], "a" * 64)
             save.assert_called_once_with(state)
             activate.assert_called_once_with(state, reuse=True)
+            migrate.assert_called_once_with(state, identity)
             write.assert_not_called()
             extract.assert_not_called()
 
     def test_resume_rejects_changes_before_script_hash_update_or_writes(self):
         for target_side_effect in ([deploy.DeployError("nginx_changed_before_resume")],
                                    [{"MainPID": "0"}, {"MainPID": "1"}]):
-            state = {"status": "rolled_back", "script_sha256": "a" * 64}
+            state = {"status": "rolled_back", "script_sha256": "a" * 64, "snippet_sha256": "b" * 64}
             with self.subTest(target_side_effect=target_side_effect), patch.object(deploy, "load", return_value=state), patch.object(deploy, "assert_release_contents"), patch.object(deploy, "assert_resume_targets", side_effect=target_side_effect), patch.object(deploy, "port_free"), patch.object(deploy, "old_health"), patch.object(deploy, "save") as save, patch.object(deploy, "activate") as activate:
                 with self.assertRaises(deploy.DeployError):
-                    deploy.resume(SimpleNamespace(previous_script_sha256="a" * 64))
+                    deploy.resume(SimpleNamespace(previous_script_sha256="a" * 64, previous_snippet_sha256="b" * 64))
                 self.assertEqual(state["script_sha256"], "a" * 64)
                 save.assert_not_called()
                 activate.assert_not_called()
@@ -175,6 +176,113 @@ class IndependentReleaseTests(unittest.TestCase):
         with patch.object(deploy.subprocess, "run", return_value=SimpleNamespace(stdout="LoadState=loaded\n", returncode=0)):
             with self.assertRaisesRegex(deploy.DeployError, "already_in_use"):
                 deploy.require_unused_service_name()
+
+    def test_exact_html_entries_use_root_and_try_files_without_file_alias(self):
+        fixed = deploy.snippet(REVISION)
+        legacy = deploy.legacy_alias_snippet(REVISION)
+        index = deploy.ROOT / "releases" / REVISION / "ui/index.html"
+        replacement = "    root " + index.parent.as_posix() + ";\n    try_files /index.html =404;\n"
+        self.assertEqual(fixed.count(replacement), 2)
+        self.assertNotIn("alias " + index.as_posix(), fixed)
+        self.assertEqual(fixed.replace(replacement, "    alias " + index.as_posix() + ";\n"), legacy)
+        self.assertEqual(fixed.count("    alias "), 1)  # Versioned assets unchanged.
+        self.assertIn("    alias " + index.parent.as_posix() + "/;", fixed)
+
+    def test_resume_rejects_unapproved_previous_snippet_before_reading_targets(self):
+        for value in ("c" * 64, "invalid"):
+            state = {"status": "rolled_back", "script_sha256": "a" * 64, "snippet_sha256": "b" * 64}
+            with self.subTest(value=value), patch.object(deploy, "load", return_value=state), patch.object(deploy, "assert_release_contents") as contents, patch.object(deploy, "save") as save:
+                with self.assertRaisesRegex(deploy.DeployError, "previous_snippet_mismatch"):
+                    deploy.resume(SimpleNamespace(previous_script_sha256="a" * 64, previous_snippet_sha256=value))
+                contents.assert_not_called()
+                save.assert_not_called()
+
+    def test_known_snippet_migration_preserves_legacy_backup_site_and_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backup = root / "backups"
+            backup.mkdir()
+            site = root / "site"
+            site.write_text("original-site", encoding="utf-8")
+            snippet = root / "snippet"
+            with patch.object(deploy, "ROOT", root):
+                legacy = deploy.legacy_alias_snippet(REVISION)
+                fixed = deploy.snippet(REVISION)
+            deploy.write_new(snippet, legacy)
+            deploy.write_new(backup / "new-snippet.conf", legacy)
+            deploy.write_new(backup / "nginx.original", "original-site")
+            deploy.write_new(backup / "nginx.candidate", "original-site-plus-include")
+            state = {"status": "rolled_back", "release_id": REVISION, "backup": str(backup),
+                     "script_sha256": "a" * 64, "snippet_sha256": deploy.sha(legacy.encode()),
+                     "release_manifest": {"untouched": "hash"}, "artifact_sha256": "original-artifact"}
+            identity = {"MainPID": "0"}
+            snapshots = []
+            with patch.object(deploy, "ROOT", root), patch.object(deploy, "SITE", site), patch.object(deploy, "SNIPPET", snippet), patch.object(deploy, "assert_release_contents"), patch.object(deploy, "assert_resume_targets", return_value=identity), patch.object(deploy, "save", side_effect=lambda value: snapshots.append(json.loads(json.dumps(value)))), patch.object(deploy, "run") as run:
+                deploy.migrate_resume_snippet(state, identity)
+                self.assertEqual(deploy.exact(snippet), fixed)
+                self.assertEqual(deploy.exact(deploy.snippet_backup_path(state)), fixed)
+                self.assertEqual(deploy.exact(backup / "new-snippet.conf"), legacy)
+                self.assertEqual(deploy.exact(backup / "nginx.original"), "original-site")
+                self.assertEqual(deploy.exact(backup / "nginx.candidate"), "original-site-plus-include")
+                self.assertEqual(deploy.exact(site), "original-site")
+                self.assertEqual(state["script_sha256"], "a" * 64)
+                self.assertEqual(state["release_manifest"], {"untouched": "hash"})
+                self.assertEqual(state["artifact_sha256"], "original-artifact")
+                self.assertEqual(state["status"], "rolled_back")
+                self.assertEqual(snapshots[0]["status"], "snippet_migrating")
+                self.assertEqual(snapshots[0]["snippet_sha256"], deploy.sha(legacy.encode()))
+                run.assert_not_called()
+
+    def test_snippet_migration_rejects_any_unrelated_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "snippet"
+            before = deploy.legacy_alias_snippet(REVISION).replace("nosniff", "unsafe")
+            deploy.write_new(path, before)
+            state = {"release_id": REVISION, "snippet_sha256": deploy.sha(before.encode())}
+            with patch.object(deploy, "SNIPPET", path), patch.object(deploy, "save") as save, patch.object(deploy, "atomic") as atomic:
+                with self.assertRaisesRegex(deploy.DeployError, "not_known_alias_repair"):
+                    deploy.migrate_resume_snippet(state, {})
+                save.assert_not_called()
+                atomic.assert_not_called()
+                self.assertEqual(deploy.exact(path), before)
+
+    def test_snippet_backup_conflict_never_overwrites_existing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "snippet"
+            legacy = deploy.legacy_alias_snippet(REVISION)
+            fixed = deploy.snippet(REVISION)
+            deploy.write_new(path, legacy)
+            target = root / ("new-snippet-" + deploy.sha(fixed.encode()) + ".conf")
+            deploy.write_new(target, "unrelated")
+            state = {"release_id": REVISION, "snippet_sha256": deploy.sha(legacy.encode()), "backup": str(root)}
+            with patch.object(deploy, "SNIPPET", path), patch.object(deploy, "save") as save, patch.object(deploy, "atomic") as atomic:
+                with self.assertRaisesRegex(deploy.DeployError, "backup_conflict"):
+                    deploy.migrate_resume_snippet(state, {})
+                save.assert_not_called()
+                atomic.assert_not_called()
+                self.assertEqual(deploy.exact(target), "unrelated")
+
+    def test_snippet_migration_rechecks_old_identity_before_writing_snippet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "snippet"
+            legacy = deploy.legacy_alias_snippet(REVISION)
+            deploy.write_new(path, legacy)
+            state = {"status": "rolled_back", "release_id": REVISION, "snippet_sha256": deploy.sha(legacy.encode()), "backup": str(root)}
+            with patch.object(deploy, "SNIPPET", path), patch.object(deploy, "assert_release_contents"), patch.object(deploy, "assert_resume_targets", side_effect=[{}, deploy.DeployError("concurrent-change")]), patch.object(deploy, "save") as save, patch.object(deploy, "atomic") as atomic:
+                with self.assertRaisesRegex(deploy.DeployError, "concurrent-change"):
+                    deploy.migrate_resume_snippet(state, {})
+                atomic.assert_not_called()
+                self.assertEqual(deploy.exact(path), legacy)
+                self.assertEqual(state["status"], "snippet_migrating")
+                save.assert_called_once()
+
+    def test_snippet_backup_pointer_rejects_paths_outside_known_version_names(self):
+        for name in ("../nginx.original", "/tmp/other", "new-snippet-" + "a" * 64 + ".conf"):
+            with self.subTest(name=name), self.assertRaisesRegex(deploy.DeployError, "backup_name_invalid"):
+                deploy.snippet_backup_path({"snippet_backup_name": name, "snippet_sha256": "b" * 64, "backup": "/backups"})
 
     def test_includes_only_new_snippet_preserving_old_nginx_routes(self):
         candidate = deploy.candidate_site(ORIGINAL)

@@ -195,7 +195,8 @@ def snippet(release_id):
         result += (
             "location = " + path + " {\n"
             "    if ($request_method !~ ^(GET|HEAD)$) { return 405; }\n"
-            "    alias " + index.as_posix() + ";\n"
+            "    root " + index.parent.as_posix() + ";\n"
+            "    try_files /index.html =404;\n"
             "    default_type text/html;\n    charset utf-8;\n"
             "    disable_symlinks on;\n" + SECURITY +
             '    add_header Cache-Control "no-store" always;\n}\n\n'
@@ -218,6 +219,15 @@ def snippet(release_id):
         '    add_header Cache-Control "no-store" always;\n}\n'
     )
     return result
+
+
+def legacy_alias_snippet(release_id):
+    # Only this previously reviewed two-line-per-entry repair may be migrated.
+    index = ROOT / "releases" / release_id / "ui/index.html"
+    fixed = "    root " + index.parent.as_posix() + ";\n    try_files /index.html =404;\n"
+    current = snippet(release_id)
+    require(current.count(fixed) == 2, "unexpected_index_snippet_shape")
+    return current.replace(fixed, "    alias " + index.as_posix() + ";\n")
 
 
 def unit_text():
@@ -421,9 +431,16 @@ def checked_candidate(state):
     candidate = exact(backup / "nginx.candidate")
     require(fingerprint(backup / "nginx.original") == state["original_site_sha256"]
             and fingerprint(backup / "nginx.candidate") == state["candidate_site_sha256"]
-            and fingerprint(backup / "new-snippet.conf") == state["snippet_sha256"]
+            and fingerprint(snippet_backup_path(state)) == state["snippet_sha256"]
             and fingerprint(backup / "new-unit.service") == state["unit_sha256"], "release_backup_changed")
     return candidate
+
+
+def snippet_backup_path(state):
+    name = state.get("snippet_backup_name", "new-snippet.conf")
+    require(name == "new-snippet.conf" or name == "new-snippet-" + state["snippet_sha256"] + ".conf",
+            "snippet_backup_name_invalid")
+    return Path(state["backup"]) / name
 
 
 def stopped_reader_identity():
@@ -576,7 +593,9 @@ def resume(args):
     require(state["status"] == "rolled_back", "resume_requires_rolled_back")
     require(re.fullmatch(r"[a-f0-9]{64}", args.previous_script_sha256)
             and state["script_sha256"] == args.previous_script_sha256, "previous_deploy_script_mismatch")
-    # The explicit reviewed previous hash permits a script-only migration.
+    require(re.fullmatch(r"[a-f0-9]{64}", args.previous_snippet_sha256)
+            and state["snippet_sha256"] == args.previous_snippet_sha256, "previous_snippet_mismatch")
+    # Explicit reviewed hashes permit only the known root-index snippet repair.
     # All retained files and stopped unit identity must still match first.
     assert_release_contents(state)
     identity = assert_resume_targets(state)
@@ -584,11 +603,45 @@ def resume(args):
     old_health()
     assert_release_contents(state)
     require(assert_resume_targets(state) == identity, "stopped_reader_identity_changed")
+    migrate_resume_snippet(state, identity)
     state["resume_previous_script_sha256"] = state["script_sha256"]
     state["resume_stopped_reader_identity"] = identity
     state["script_sha256"] = sha(SCRIPT.read_bytes())
     save(state)
     activate(state, reuse=True)
+
+
+def migrate_resume_snippet(state, identity):
+    before = exact(SNIPPET)
+    require(sha(before.encode()) == state["snippet_sha256"], "snippet_changed_before_migration")
+    repaired = snippet(state["release_id"])
+    if before == repaired:
+        return
+    require(before == legacy_alias_snippet(state["release_id"]), "snippet_migration_not_known_alias_repair")
+    repaired_sha = sha(repaired.encode())
+    name = "new-snippet-" + repaired_sha + ".conf"
+    target = Path(state["backup"]) / name
+    if target.exists() or target.is_symlink():
+        require(fingerprint(target) == repaired_sha, "snippet_version_backup_conflict")
+    else:
+        write_new(target, repaired)
+    # Preserve nginx.original, nginx.candidate and the legacy new-snippet.conf.
+    # On interruption this explicit intermediate state fails closed. The old
+    # site is still active, and no service is started while editing this file.
+    assert_release_contents(state)
+    require(assert_resume_targets(state) == identity, "stopped_reader_identity_changed")
+    state["status"] = "snippet_migrating"
+    state["pending_snippet_sha256"] = repaired_sha
+    state["pending_snippet_backup_name"] = name
+    save(state)
+    assert_release_contents(state)
+    require(assert_resume_targets(state) == identity, "stopped_reader_identity_changed")
+    atomic(SNIPPET, repaired, SNIPPET.stat().st_mode & 0o777)
+    require(fingerprint(SNIPPET) == repaired_sha, "snippet_repair_write_mismatch")
+    state["resume_previous_snippet_sha256"] = state["snippet_sha256"]
+    state["snippet_sha256"] = state.pop("pending_snippet_sha256")
+    state["snippet_backup_name"] = state.pop("pending_snippet_backup_name")
+    state["status"] = "rolled_back"
 
 
 def activate(state, *, reuse):
@@ -623,7 +676,7 @@ def activate(state, *, reuse):
         assert_old(state)
         require(fingerprint(SITE) == state["original_site_sha256"], "nginx_changed_before_route")
         if not reuse:
-            write_new(SNIPPET, exact(backup / "new-snippet.conf"), 0o644)
+            write_new(SNIPPET, exact(snippet_backup_path(state)), 0o644)
         else:
             require(fingerprint(SNIPPET) == state["snippet_sha256"], "resume_snippet_changed_before_route")
         atomic(SITE, candidate, state["site_mode"])
@@ -653,6 +706,7 @@ def main():
         commands.add_parser(name)
     resume_parser = commands.add_parser("resume")
     resume_parser.add_argument("--previous-script-sha256", required=True)
+    resume_parser.add_argument("--previous-snippet-sha256", required=True)
     args = parser.parse_args()
     require(os.geteuid() == 0, "root_required")
     import fcntl
