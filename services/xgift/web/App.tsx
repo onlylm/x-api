@@ -16,6 +16,7 @@ import { PaymentSettings } from './PaymentSettings'
 import { AdmissionSettings } from './AdmissionSettings'
 import { AlipaySettings } from './AlipaySettings'
 import { Checkout } from './Checkout'
+import { orderFailureDescription } from './order-failures'
 import {
   ArrowClockwise,
   ArrowSquareOut,
@@ -798,6 +799,8 @@ function Workspace() {
               <Status value={r.status} />,
               <>
                 <Stack top={r.receipt ?? r.failure_code} bottom={r.id} />
+                {orderFailureDescription(r.failure_code) && <p className="note">{orderFailureDescription(r.failure_code)}</p>}
+                {r.receipt && r.failure_code && <p className="note">原因代码：{s(r.failure_code)}</p>}
                 {admin &&
                   r.status === 'queued' &&
                   actionButton('取消并退点', () =>
@@ -1539,7 +1542,7 @@ function Cards({ data, pager, form, actionButton, toolbar }: CardsProps) {
       {toolbar('持卡人账单资料', actionButton(giftProfile.configured ? '修改账单资料' : '填写账单资料', configureGift))}
       <p className="note">
         {giftProfile.configured ? '账单资料已保存，接收用户名由每笔商城订单提供。' : '请补齐持卡人姓名、账单邮箱与国家；接收用户名在商城下单时填写。'}
-        {' '}X 付款使用上方选定的已有卡，不会自动开卡、充值或换卡。新增接单受后台每日额度控制；保存账单资料不会启用付款。
+        {' '}X 付款使用上方选定的已有卡，不会自动开卡或充值；仅在付款准备阶段确认卡不可用时，按已配置顺序尝试备用卡。新增接单受后台每日额度控制；保存账单资料不会启用付款。
       </p>
       {!config.configured ? (
         <div className="setup-empty">

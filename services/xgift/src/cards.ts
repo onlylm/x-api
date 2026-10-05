@@ -3,6 +3,7 @@ import {
   booleanInt,
   constantEqual,
   fail,
+  Failure,
   hmac,
   id,
   integer,
@@ -282,8 +283,11 @@ export async function cardRead(
   resource: string,
   page = 1,
   cardId?: number,
+  options: { providerRevision?: string } = {},
 ) {
   const provider = await configuration(env)
+  if (options.providerRevision !== undefined && options.providerRevision !== provider.revision)
+    return fail('card_provider_changed', '卡台配置已变化，请刷新配置后重新获取列表。', 409)
   try {
     if (resource === 'card' && cardId)
       return safeCard(object(await call(env, provider, `/cards/${integer(cardId, '卡 ID')}?sync=1`)))
@@ -315,10 +319,19 @@ export async function cardRead(
           : [],
       }))
     if (resource === 'cards') {
+      integer(page, '页码', 1, 10000)
+      const requestedAt = Date.now()
       const result = object(
         await call(env, provider, `/cards?page=${page}&page_size=30&sync=0`),
       )
-      return { total: result.total, list: rows(result.list).map(safeCard) }
+      const list = rows(result.list).map(safeCard)
+      const total = typeof result.total === 'string' && /^\d+$/.test(result.total) ? Number(result.total) : result.total
+      if (!Number.isSafeInteger(total) || Number(total) < 0)
+        throw new Error('Malformed card count')
+      if ((await cardConfiguration(env)).revision !== provider.revision)
+        return fail('card_provider_changed', '卡台配置已变化，已丢弃旧卡台的列表，请刷新后重试。', 409)
+      return { total: Number(total), list, provider_revision: provider.revision,
+        refresh: { mode: 'cached' as const, requested_at: requestedAt, completed_at: Date.now() } }
     }
     if (cardId && resource === 'transactions') {
       return rows(
@@ -357,6 +370,7 @@ export async function cardRead(
       )
     return fail('not_found', '卡台接口不存在。', 404)
   } catch (error) {
+    if (error instanceof Failure) throw error
     if (error instanceof CardResponseError)
       return fail(error.code, '卡台请求未成功，请核对配置或稍后重查。', 502)
     return fail(
@@ -365,6 +379,12 @@ export async function cardRead(
       502,
     )
   }
+}
+/** Explicitly refetch the provider inventory. This is not an issuer-level sync;
+ * the documented integration currently reads the provider's cached card data. */
+export async function syncCardList(env: Env, body: Row, page = 1) {
+  const providerRevision = text(body.provider_revision, '卡台配置版本', 64)
+  return cardRead(env, 'cards', page, undefined, { providerRevision })
 }
 export async function cardWrite(
   env: Env,

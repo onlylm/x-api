@@ -786,6 +786,10 @@ code {
 .payment-card-pager { margin: 8px 0 0; flex-wrap: wrap; }
 .payment-policy, .payment-save-row { grid-column: 1 / -1; }
 .payment-form .payment-policy { margin: 0; }
+.payment-backups { border: 0; padding: 0; min-width: 0; }
+.payment-backups legend { font-size: 13px; font-weight: 600; }
+.payment-backup-fields { display: grid; gap: 16px; min-width: 0; }
+.payment-backup-fields select { text-overflow: ellipsis; }
 .payment-enable-row {
   justify-content: space-between;
   margin-top: 24px;

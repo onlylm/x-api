@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Button } from '@cloudflare/kumo/components/button'
 import { Input } from '@cloudflare/kumo/components/input'
+import { orderFailureDescription } from './order-failures'
 
 export type Request = <T>(
   path: string,
@@ -173,7 +174,7 @@ export function OrderResult({ order }: { order: Order }) {
             : order.status === 'failed'
               ? '订单未完成，请联系商户核对处理结果。'
               : '正在处理，请通过原订单查看进度，无需再次提交。'}
-        {order.failure_code && <> 原因：{order.failure_code}</>}
+        {order.failure_code && <> {orderFailureDescription(order.failure_code)} 原因代码：<code>{order.failure_code}</code></>}
       </p>
     </section>
   )

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { database } from '../services/xgift/server/database.ts'
 import { createUser } from '../services/xgift/src/auth.ts'
 import { cardConfiguration, configureCards } from '../services/xgift/src/cards.ts'
-import { type Env, type Failure } from '../services/xgift/src/core.ts'
+import { seal, type Env, type Failure } from '../services/xgift/src/core.ts'
 import { configureGiftProfile } from '../services/xgift/src/gift-profile.ts'
 import { saveSecret } from '../services/xgift/src/network.ts'
 import {
@@ -21,7 +21,8 @@ async function fixture(t: Context) {
   t.after(() => db.close())
   const state = {
     calls: [] as string[], executions: 0, balance: 20, status: 'ACTIVE', pan: '4242424242424242',
-    returnedId: null as number | null, unavailable: false, onCardRead: undefined as (() => Promise<void>) | undefined,
+    returnedId: null as number | null, unavailable: false, onCardRead: undefined as ((cardId: number) => Promise<void>) | undefined,
+    cardOverrides: new Map<number, Partial<{ balance: number; status: string; pan: string; returnedId: number; unavailable: boolean }>>(),
   }
   const env: Env = {
     DB, MASTER_KEY: 'a'.repeat(64), ADMIN_PASSWORD: 'test-admin-password-only',
@@ -38,12 +39,14 @@ async function fixture(t: Context) {
     assert.equal(init?.method ?? 'GET', 'GET', 'Payment configuration must never make a provider write')
     assert.match(url.pathname, /^\/openapi\/v1\/cards\/\d+$/)
     assert.equal(url.searchParams.get('sync'), '1')
-    if (state.unavailable) throw new Error('fixture provider unavailable')
-    await state.onCardRead?.()
+    const cardId = Number(url.pathname.split('/').at(-1))
+    const card = { ...state, ...state.cardOverrides.get(cardId) }
+    if (card.unavailable) throw new Error('fixture provider unavailable')
+    await state.onCardRead?.(cardId)
     return Response.json({ code: 0, data: {
-      id: state.returnedId ?? Number(url.pathname.split('/').at(-1)), product_code: 'EXISTING-CARD',
-      network: 'VISA', status: state.status, available_amount: state.balance,
-      card_number: state.pan, cvv: '321', expire: '12/30', first_name: 'Private',
+      id: card.returnedId ?? cardId, product_code: 'EXISTING-CARD',
+      network: 'VISA', status: card.status, available_amount: card.balance,
+      card_number: card.pan, cvv: '321', expire: '12/30', first_name: 'Private',
       last_name: 'Fixture', email: 'private-card@example.test', extra: 'private-provider-payload',
     } })
   })
@@ -276,4 +279,147 @@ test('runtime refresh and emergency lock override stale enabled environments whi
   await assert.rejects(assertPaymentAllowed(locked, binding), (e: Failure) => e.code === 'payments_paused')
   assert.equal((await paymentView(locked)).ready_to_enable, false)
   await assert.rejects(assertPaymentAllowed(effective, { ...binding!, card_id: 456 }), (e: Failure) => e.code === 'payment_configuration_changed')
+})
+
+test('up to three ordered backup cards are verified read-only, encrypted and frozen in the payment binding', async t => {
+  const s = await fixture(t)
+  const saved = await s.save({ backup_card_ids: [456, 789, 999] })
+  assert.deepEqual(saved.backup_card_ids, [456, 789, 999])
+  assert.deepEqual(saved.backup_cards.map(card => card.id), [456, 789, 999])
+  assert.equal(saved.selected_card?.id, 123)
+  assert.equal(saved.enabled, false)
+  assert.equal(saved.checks.find(check => check.code === 'backup_cards')?.ok, true)
+  assert.deepEqual(s.state.calls.slice().sort(), [123, 456, 789, 999].map(id => 'GET /openapi/v1/cards/' + id))
+  assert.doesNotMatch(JSON.stringify(saved), /4242424242424242|cvv|expire|private-provider/)
+  assert.doesNotMatch(JSON.stringify(s.db.prepare('SELECT * FROM payment_settings').get()), /backup_cards|backup_card_ids|pk_live/)
+  await s.enable()
+  assert.equal(s.state.calls.length, 8, 'Enabling must recheck the primary and all backups')
+  const binding = await paymentBinding(await resolvePaymentEnv(s.env))
+  assert.equal(binding?.card_id, 123)
+  assert.deepEqual(binding?.backup_card_ids, [456, 789, 999])
+  assert.equal((await paymentSettings(s.env))?.card_id, 123)
+  await assert.rejects(s.save({ backup_card_ids: [] }), (e: Failure) => e.code === 'payments_must_be_paused')
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM native_funding').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 0)
+  assert.equal(s.state.executions, 0)
+})
+
+test('backup verification is parallel and bounded to the primary plus three candidates', { timeout: 5000 }, async t => {
+  const s = await fixture(t)
+  let inFlight = 0, maximum = 0
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  s.state.onCardRead = async () => {
+    inFlight++; maximum = Math.max(maximum, inFlight)
+    if (inFlight === 4) release()
+    await gate
+    inFlight--
+  }
+  await s.save({ backup_card_ids: [456, 789, 999] })
+  assert.equal(maximum, 4)
+  assert.equal(s.state.calls.length, 4)
+})
+
+test('legacy payloads and bindings have no implicit backup cards', async t => {
+  const s = await fixture(t)
+  await s.save()
+  const { backup_card_ids: _ids, backup_cards: _cards, ...legacy } = (await paymentSettings(s.env))!
+  s.db.prepare('UPDATE payment_settings SET payload=? WHERE id=1').run(await seal(s.env, 'payment-settings', JSON.stringify(legacy)))
+  assert.deepEqual((await paymentSettings(s.env))?.backup_card_ids, [])
+  assert.deepEqual((await paymentView(s.env)).backup_cards, [])
+  await s.enable()
+  const effective = await resolvePaymentEnv(s.env)
+  const { backup_card_ids: _snapshotIds, ...binding } = (await paymentBinding(effective))!
+  await assertPaymentAllowed(effective, binding)
+  assert.equal((await paymentSettings(s.env))?.card_id, 123)
+})
+
+test('omitted backup IDs preserve prior authorization and an explicit empty array clears it', async t => {
+  const s = await fixture(t)
+  await s.save({ backup_card_ids: [456, 789] })
+  const preserved = await s.save({ stripe_publishable_key: 'pk_live_changedfixture' })
+  assert.deepEqual(preserved.backup_card_ids, [456, 789])
+  await assert.rejects(s.save({ card_id: 456 }), (e: Failure) => e.code === 'invalid_input')
+  assert.deepEqual((await paymentSettings(s.env))?.backup_card_ids, [456, 789])
+  const cleared = await s.save({ backup_card_ids: [] })
+  assert.deepEqual(cleared.backup_card_ids, [])
+  assert.deepEqual(cleared.backup_cards, [])
+  assert.equal(cleared.enabled, false)
+})
+
+test('malformed, duplicated or excessive backup IDs fail before any provider request', async t => {
+  const s = await fixture(t)
+  for (const backupIds of [null, '456', ['456'], [123], [456, 456], [456, 789, 999, 1000], [0], [-1], [1.5], [1000000001], [{}], [undefined]]) {
+    const calls = s.state.calls.length
+    await assert.rejects(s.save({ backup_card_ids: backupIds }), (e: Failure) => e.code === 'invalid_input')
+    assert.equal(s.state.calls.length, calls)
+    assert.equal(await paymentSettings(s.env), null)
+  }
+})
+
+test('a changed provider cannot implicitly inherit backup card identities from an older admin client', async t => {
+  const s = await fixture(t)
+  await s.save({ backup_card_ids: [456] })
+  await configureCards(s.env, { environment: 'production', transport: 'direct', api_key: 'sk_changed_provider_fixture', writes_enabled: false })
+  const calls = s.state.calls.length
+  await assert.rejects(s.save(), (e: Failure) => e.code === 'payment_provider_changed')
+  assert.equal(s.state.calls.length, calls)
+  assert.deepEqual((await paymentSettings(s.env))?.backup_card_ids, [456])
+  const cleared = await s.save({ backup_card_ids: [] })
+  assert.deepEqual(cleared.backup_card_ids, [])
+  assert.equal(cleared.enabled, false)
+})
+
+test('an unavailable or unready backup cannot be saved or enabled and never changes the primary binding', async t => {
+  const s = await fixture(t)
+  for (const patch of [{ balance: 9.99 }, { status: 'FROZEN' }, { pan: '' }, { returnedId: 999 }, { unavailable: true }]) {
+    s.state.cardOverrides.set(456, patch)
+    await assert.rejects(s.save({ backup_card_ids: [456] }), (e: Failure) => ['payment_card_not_ready', 'card_provider_unavailable'].includes(e.code))
+    assert.equal(await paymentSettings(s.env), null)
+  }
+  s.state.cardOverrides.clear()
+  const saved = await s.save({ backup_card_ids: [456] })
+  s.state.cardOverrides.set(456, { balance: 9.99 })
+  await assert.rejects(s.enable(), (e: Failure) => e.code === 'payment_card_not_ready')
+  const current = (await paymentSettings(s.env))!
+  assert.equal(current.enabled, false)
+  assert.equal(current.card_id, 123)
+  assert.equal(current.revision, saved.revision)
+  assert.deepEqual(current.backup_card_ids, [456])
+  assert.equal(s.state.executions, 0)
+})
+
+test('provider changes and emergency pauses win races during backup verification', async t => {
+  const s = await fixture(t)
+  s.state.onCardRead = async cardId => {
+    if (cardId !== 456) return
+    s.state.onCardRead = undefined
+    await configureCards(s.env, { environment: 'production', transport: 'direct', api_key: 'sk_new_fixture_provider', writes_enabled: false })
+  }
+  await assert.rejects(s.save({ backup_card_ids: [456] }), (e: Failure) => e.code === 'payment_provider_changed')
+  assert.equal(await paymentSettings(s.env), null)
+  await s.save({ backup_card_ids: [456] })
+  s.state.onCardRead = async cardId => {
+    if (cardId !== 456) return
+    s.state.onCardRead = undefined
+    await setPaymentsEnabled(s.env, { enabled: false })
+  }
+  await assert.rejects(s.enable(), (e: Failure) => e.code === 'payment_config_conflict')
+  assert.equal((await paymentSettings(s.env))?.enabled, false)
+  assert.deepEqual((await paymentSettings(s.env))?.backup_card_ids, [456])
+})
+
+test('frozen backup authorization must exactly match the configured ordered candidate list', async t => {
+  const s = await fixture(t)
+  await s.save({ backup_card_ids: [456, 789] }); await s.enable()
+  const effective = await resolvePaymentEnv(s.env), binding = (await paymentBinding(effective))!
+  await assertPaymentAllowed(effective, binding)
+  for (const backups of [undefined, [], [456], [789, 456], [456, 789, 999]])
+    await assert.rejects(assertPaymentAllowed(effective, { ...binding, backup_card_ids: backups }),
+      (e: Failure) => e.code === 'payment_configuration_changed')
+  await setPaymentsEnabled(s.env, { enabled: false })
+  await s.enable()
+  await assertPaymentAllowed(await resolvePaymentEnv(s.env), binding)
+  assert.equal((await paymentSettings(s.env))?.card_id, 123)
 })

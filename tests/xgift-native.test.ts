@@ -10,7 +10,7 @@ import { cardConfiguration, configureCards } from '../services/xgift/src/cards.t
 import { configureGiftProfile } from '../services/xgift/src/gift-profile.ts'
 import { configurePayments, paymentSettings, resolvePaymentEnv, setPaymentsEnabled } from '../services/xgift/src/payments.ts'
 import { reconcile } from '../services/xgift/src/executor.ts'
-import { unseal, type Env } from '../services/xgift/src/core.ts'
+import { seal, unseal, type Env } from '../services/xgift/src/core.ts'
 import { signature } from '../shared/xgift-signature.ts'
 import worker from '../services/xgift/src/index.ts'
 
@@ -35,7 +35,9 @@ async function fixture(t: Context) {
   await configureCards(env, { environment: 'production', transport: 'direct', api_key: 'sk_fixture', writes_enabled: true })
   await configureGiftProfile(env, { first_name: 'Test', last_name: 'User', billing_email: 'test@example.test', billing_country: 'HK', billing_line1: 'Fixture address' })
   const state = { eligible: true, recipientId: '12345', xError: false, malformed: false, xCreates: 0, cardOpens: 0, methods: 0, confirms: 0, polls: 0, lostConfirm: false, lostCard: false, wrongPage: false, openFee: 0.5, requiresAction: false,
-    cardId: 123, cardProduct: 'PP5583RC', cardBalance: 20, cardStatus: 'ACTIVE', cardExpiry: '12/30', cardReads: [] as number[], methodBilling: [] as string[], paymentKeys: [] as string[], onInit: undefined as (() => Promise<void>) | undefined }
+    cardId: 123, cardProduct: 'PP5583RC', cardBalance: 20, cardStatus: 'ACTIVE', cardExpiry: '12/30', cardReads: [] as number[], methodBilling: [] as string[], paymentKeys: [] as string[], onInit: undefined as (() => Promise<void>) | undefined,
+    cards: {} as Record<number, Record<string, unknown>>, methodCards: [] as string[], confirmMethods: [] as string[], methodLost: false,
+    providerFailure: null as 'network' | 'unauthorized' | null, onCardRead: undefined as ((cardId: number) => Promise<void>) | undefined }
   t.mock.method(globalThis, 'fetch', async (input: string | URL, init?: RequestInit) => {
     const url = new URL(String(input))
     if (url.hostname === 'x.com') {
@@ -53,21 +55,30 @@ async function fixture(t: Context) {
           assert.equal(body.init_amount, 20); assert.equal(body.product_code, 'PP5583RC'); assert.equal(body.max_on_percent, 10); assert.equal(body.transaction_limit, 10); assert.equal(body.transaction_limit_type, 'limited')
           if (state.lostCard) throw new Error('lost open reply')
           return { id: 123, status: 'ACTIVE', product_code: 'PP5583RC' }
-        })() : (() => {
+        })() : await (async () => {
           assert.equal(init?.method ?? 'GET', 'GET', 'Existing-card reads must not mutate provider state')
           const requestedCard = Number(url.pathname.match(/\/cards\/(\d+)$/)?.[1])
           state.cardReads.push(requestedCard)
-          return { id: state.cardId, product_code: state.cardProduct, card_number: '4242424242424242', cvv: '123', expire: state.cardExpiry, status: state.cardStatus, available_amount: state.cardBalance }
+          await state.onCardRead?.(requestedCard)
+          if (state.providerFailure === 'network') throw new Error('fixture card provider unavailable')
+          return { id: state.cardId, product_code: state.cardProduct, card_number: '4242424242424242', cvv: '123', expire: state.cardExpiry, status: state.cardStatus, available_amount: state.cardBalance, ...state.cards[requestedCard] }
         })()
+      if (state.providerFailure === 'unauthorized') return Response.json({ code: 1, error_code: 'forbidden' }, { status: 403 })
       return Response.json({ code: 0, data })
     }
     assert.equal(url.hostname, 'api.stripe.com')
     const fields = new URLSearchParams(init?.method === 'POST' ? String(init.body) : url.search)
     state.paymentKeys.push(fields.get('key') ?? '')
     if (url.pathname.endsWith('/init')) { await state.onInit?.(); return Response.json({ ...page(), ...(state.wrongPage ? { currency: 'sgd' } : {}) }) }
-    if (url.pathname.endsWith('/payment_methods')) { state.methods++; state.methodBilling.push(fields.get('billing_details[email]') ?? ''); return Response.json({ id: 'pm_fixture', type: 'card', livemode: true }) }
+    if (url.pathname.endsWith('/payment_methods')) {
+      state.methods++; state.methodBilling.push(fields.get('billing_details[email]') ?? '')
+      state.methodCards.push(fields.get('card[number]') ?? '')
+      if (state.methodLost) throw new Error('fixture tokenization response lost')
+      return Response.json({ id: 'pm_fixture', type: 'card', livemode: true })
+    }
     if (url.pathname.endsWith('/confirm')) {
       state.confirms++; assert.equal(new URLSearchParams(String(init?.body)).get('expected_amount'), '30000')
+      state.confirmMethods.push(fields.get('payment_method') ?? '')
       if (state.lostConfirm) throw new Error('lost confirm reply')
       return Response.json({ ok: true })
     }
@@ -142,17 +153,19 @@ test('payment proof rejects wrong merchant, recipient, quantity, currency, subsc
   assert.throws(() => guardPage(quantity, order, session, true))
 })
 
-async function selectedFixture(t: Context) {
+async function selectedFixture(t: Context, backupCardIds: number[] = []) {
   const s = await fixture(t)
   s.env.NATIVE_EXECUTOR = executeNative
   s.state.cardProduct = 'EXISTING-CARD-PRODUCT'
+  for (const cardId of backupCardIds) s.state.cards[cardId] = { id: cardId, card_number: cardId === 456 ? '5555555555554444' : '4000000000000002',
+    status: 'ACTIVE', available_amount: 20, expire: '12/30' }
   // Existing-card payments work with all card-provider mutations disabled.
   await configureCards(s.env, { environment: 'production', transport: 'direct', api_key: 'sk_fixture', writes_enabled: false })
   await setPaymentsEnabled(s.env, { enabled: false })
   const provider = await cardConfiguration(s.env)
   const settings = await configurePayments(s.env, {
     revision: (await paymentSettings(s.env))!.revision,
-    stripe_publishable_key: 'pk_live_selectedfixture', card_id: 123, provider_revision: provider.revision,
+    stripe_publishable_key: 'pk_live_selectedfixture', card_id: 123, backup_card_ids: backupCardIds, provider_revision: provider.revision,
   })
   const resume = () => setPaymentsEnabled(s.env, { enabled: true, revision: settings.revision, confirmation: 'ENABLE_PAYMENTS' })
   const pause = () => setPaymentsEnabled(s.env, { enabled: false })
@@ -306,4 +319,239 @@ test('creating a saved payment configuration cannot turn a legacy in-flight job 
   assert.equal(s.state.cardOpens, 0)
   assert.equal(s.state.confirms, 0)
   assert.equal(s.db.prepare('SELECT status FROM orders').get()!.status, 'unknown')
+})
+
+type SelectedFixture = Awaited<ReturnType<typeof selectedFixture>>
+async function nativeRecord(s: SelectedFixture) {
+  const order = s.db.prepare('SELECT * FROM orders').get() as unknown as Order
+  const row = s.db.prepare('SELECT * FROM native_jobs WHERE order_id=?').get(order.id)!
+  return { order, job: JSON.parse(await unseal(s.env, 'native:' + order.id, String(row.payload))) }
+}
+async function enterFunding(s: SelectedFixture) {
+  await s.create(); await s.tick(); await s.tick()
+  assert.equal(s.db.prepare('SELECT stage FROM native_jobs').get()!.stage, 'funding')
+  s.state.cardReads.length = 0
+}
+
+test('authorized backups are checked in order once per tick and persist across restart without changing global selection', async t => {
+  const s = await selectedFixture(t, [456, 789]); await enterFunding(s)
+  const settings = await paymentSettings(s.env)
+  s.state.cards[123] = { status: 'FROZEN' }; s.state.cards[456].available_amount = 9
+  await s.tick()
+  assert.deepEqual(s.state.cardReads, [123])
+  let record = await nativeRecord(s)
+  assert.equal(record.job.card_id, 456); assert.equal(record.job.candidate_index, 1)
+  assert.deepEqual(record.job.rejected_cards, [{ card_id: 123, reason: 'card_frozen' }])
+  await s.tick()
+  assert.deepEqual(s.state.cardReads, [123, 456])
+  record = await nativeRecord(s)
+  assert.equal(record.job.card_id, 789); assert.equal(record.job.candidate_index, 2)
+  s.state.cards[123].status = 'ACTIVE'; s.state.cards[456].available_amount = 20
+  // Recreate the execution environment; all candidate state must come from the encrypted job.
+  s.db.exec('UPDATE orders SET next_check=0')
+  await reconcile(await resolvePaymentEnv({ ...s.env }))
+  assert.deepEqual(s.state.cardReads, [123, 456, 789])
+  for (let i = 0; i < 5; i++) await s.tick()
+  assert.equal((await nativeRecord(s)).order.status, 'succeeded')
+  assert.deepEqual(s.state.methodCards, ['4000000000000002'])
+  assert.deepEqual(s.state.confirmMethods, ['pm_fixture'])
+  assert.deepEqual([s.state.xCreates, s.state.cardOpens, s.state.methods, s.state.confirms], [1, 0, 1, 1])
+  assert.ok(s.state.cardReads.slice(2).every(card => card === 789))
+  assert.deepEqual(await paymentSettings(s.env), settings)
+  const audit = s.db.prepare("SELECT actor,action,target,note FROM audit WHERE action='payment_card_failover' ORDER BY created_at,id").all()
+  assert.equal(audit.length, 2); assert.ok(audit.every(row => row.actor === 'system' && row.target === record.order.id))
+  assert.doesNotMatch(JSON.stringify(audit), /4242424242424242|5555555555554444|4000000000000002|cvv|billing/)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+})
+
+test('exhausted backups remain on the last card, audit once, and can resume after that card recovers', async t => {
+  const s = await selectedFixture(t, [456]); await enterFunding(s)
+  s.state.cards[123] = { status: 'DELETED' }; s.state.cards[456].status = 'CANCELLED'
+  await s.tick(); await s.tick()
+  assert.equal((await nativeRecord(s)).order.failure_code, 'payment_cards_exhausted')
+  for (let i = 0; i < 3; i++) await s.tick()
+  assert.deepEqual(s.state.cardReads, [123, 456, 456, 456, 456])
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='payment_cards_exhausted'").get()!.n, 1)
+  assert.equal(s.state.methods + s.state.confirms, 0)
+  s.state.cards[456].status = 'ACTIVE'
+  for (let i = 0; i < 5; i++) await s.tick()
+  const record = await nativeRecord(s)
+  assert.equal(record.order.status, 'succeeded'); assert.equal(record.job.card_id, 456)
+  assert.equal(record.job.candidates_exhausted, false)
+  assert.equal(record.job.rejected_cards.length, 2)
+  assert.deepEqual(s.state.methodCards, ['5555555555554444'])
+  assert.equal(s.state.confirms, 1)
+  assert.equal(s.state.cardReads.filter(card => card === 123).length, 1)
+})
+
+test('a card expiring between preflight reads may switch before any payment method is prepared', async t => {
+  const s = await selectedFixture(t, [456]); await enterFunding(s)
+  await s.tick(); assert.equal((await nativeRecord(s)).job.stage, 'funded')
+  s.state.cards[123] = { expire: '12/20' }
+  await s.tick()
+  const record = await nativeRecord(s)
+  assert.equal(record.job.stage, 'funding'); assert.equal(record.job.card_id, 456)
+  assert.equal(record.job.rejected_cards[0].reason, 'card_expired')
+  assert.equal(s.state.methods, 0)
+  for (let i = 0; i < 5; i++) await s.tick()
+  assert.deepEqual(s.state.methodCards, ['5555555555554444'])
+  assert.equal(s.state.confirms, 1)
+})
+
+test('unverified identity, malformed card fields, unknown statuses and invalid balances never authorize failover', async t => {
+  const cases: [string, Record<string, unknown>][] = [
+    ['wrong identity', { id: 999 }], ['unknown status', { status: 'UNKNOWN' }], ['missing number', { card_number: '' }],
+    ['invalid cvv', { cvv: 'invalid' }], ['invalid expiry month', { expire: '00/30' }], ['invalid expiry format', { expire: '2030-12' }],
+    ['null balance', { available_amount: null }], ['negative balance', { available_amount: -1 }],
+    ['nonnumeric balance', { available_amount: 'unknown' }], ['empty balance', { available_amount: '' }], ['wrong currency', { currency: 'BDT' }],
+  ]
+  for (const [name, patch] of cases) await t.test(name, async t => {
+    const s = await selectedFixture(t, [456]); await enterFunding(s)
+    s.state.cards[123] = patch
+    await s.tick(); await s.tick()
+    const record = await nativeRecord(s)
+    assert.equal(record.order.failure_code, 'payment_card_unverified')
+    assert.equal(record.job.card_id, 123); assert.equal(record.job.rejected_cards, undefined)
+    assert.deepEqual(s.state.cardReads, [123, 123])
+    assert.equal(s.state.methods + s.state.confirms, 0)
+    assert.equal(s.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='payment_card_failover'").get()!.n, 0)
+  })
+})
+
+test('card-provider timeout and authentication failures keep the original candidate without trying a backup', async t => {
+  for (const failure of ['network', 'unauthorized'] as const) await t.test(failure, async t => {
+    const s = await selectedFixture(t, [456]); await enterFunding(s)
+    s.state.providerFailure = failure
+    await s.tick(); await s.tick()
+    const record = await nativeRecord(s)
+    assert.equal(record.order.status, 'unknown'); assert.equal(record.job.card_id, 123)
+    assert.equal(record.job.rejected_cards, undefined)
+    assert.deepEqual(s.state.cardReads, [123, 123]); assert.equal(s.state.methods + s.state.confirms, 0)
+  })
+})
+
+test('lost tokenization and a tokenized card becoming unavailable never create a second method or switch cards', async t => {
+  for (const lost of [false, true]) await t.test(lost ? 'lost method response' : 'method already bound', async t => {
+    const s = await selectedFixture(t, [456]); await enterFunding(s)
+    s.state.methodLost = lost
+    await s.tick(); await s.tick()
+    assert.equal((await nativeRecord(s)).job.stage, lost ? 'tokenizing' : 'tokenized')
+    s.state.cards[123] = { status: 'FROZEN' }
+    for (let i = 0; i < 3; i++) await s.tick()
+    const record = await nativeRecord(s)
+    assert.equal(record.job.card_id, 123); assert.equal(record.job.tokenization_started, true)
+    assert.equal(record.order.failure_code, lost ? 'original_request_unconfirmed' : 'card_frozen')
+    assert.equal(s.state.methods, 1); assert.equal(s.state.confirms, 0)
+    assert.ok(s.state.cardReads.every(card => card === 123))
+  })
+})
+
+test('an authorized backup with lost confirmation or 3DS only polls its original checkout even if another backup is usable', async t => {
+  const s = await selectedFixture(t, [456, 789]); await enterFunding(s)
+  s.state.cards[123] = { status: 'FROZEN' }; s.state.lostConfirm = true; s.state.requiresAction = true
+  for (let i = 0; i < 7; i++) await s.tick()
+  assert.equal((await nativeRecord(s)).order.failure_code, 'payment_requires_action')
+  assert.equal((await nativeRecord(s)).job.card_id, 456)
+  const reads = [...s.state.cardReads]
+  s.state.cards[456].status = 'FROZEN'
+  await s.tick(); await s.tick()
+  assert.deepEqual(s.state.cardReads, reads)
+  await s.pause(); s.state.requiresAction = false; await s.tick()
+  assert.equal((await nativeRecord(s)).order.status, 'succeeded')
+  assert.deepEqual(s.state.methodCards, ['5555555555554444'])
+  assert.equal(s.state.methods, 1); assert.equal(s.state.confirms, 1)
+  assert.ok(!s.state.cardReads.includes(789))
+})
+
+test('an old snapshot without backups never adopts candidates later added to live settings', async t => {
+  const s = await selectedFixture(t); await enterFunding(s)
+  let { order, job } = await nativeRecord(s)
+  delete job.payment.backup_card_ids
+  const snapshot = JSON.parse(await unseal(s.env, 'execution:' + order.id, order.execution_config!))
+  delete snapshot.payment.backup_card_ids
+  s.db.prepare('UPDATE native_jobs SET payload=? WHERE order_id=?').run(await seal(s.env, 'native:' + order.id, JSON.stringify(job)), order.id)
+  s.db.prepare('UPDATE orders SET execution_config=? WHERE id=?').run(await seal(s.env, 'execution:' + order.id, JSON.stringify(snapshot)), order.id)
+  s.state.cards[123] = { status: 'FROZEN' }
+  await s.tick()
+  assert.equal((await nativeRecord(s)).order.failure_code, 'card_frozen')
+  assert.deepEqual(s.state.cardReads, [123])
+  const row = s.db.prepare('SELECT payload FROM payment_settings').get()!
+  const settings = JSON.parse(await unseal(s.env, 'payment-settings', String(row.payload)))
+  settings.backup_card_ids = [456]
+  s.db.prepare('UPDATE payment_settings SET payload=?').run(await seal(s.env, 'payment-settings', JSON.stringify(settings)))
+  await s.tick()
+  const latest = await nativeRecord(s)
+  assert.equal(latest.order.failure_code, 'payment_configuration_changed')
+  assert.equal(latest.job.card_id, 123); assert.equal(latest.job.payment.backup_card_ids, undefined)
+  assert.deepEqual(s.state.cardReads, [123])
+})
+
+test('pause, changed payment revisions and collection reversal detected during card reads block candidate advancement', async t => {
+  for (const change of ['pause', 'revision', 'collection']) await t.test(change, async t => {
+    const s = await selectedFixture(t, [456]); await enterFunding(s)
+    if (change === 'collection') s.db.exec(`INSERT INTO alipay_checkouts(id,access_hash,request_hash,out_trade_no,product_code,product_name,months,points,currency,amount_minor,stripe_product,
+      amount_cents,recipient,recipient_id,provider_revision,outbound_revision,config_payload,status,paid_at,order_id,created_at,expires_at,updated_at)
+      SELECT 'chk_fixture','fixture','fixture','xgift_fixture',product_code,'Fixture',months,points,currency,amount_minor,stripe_product,
+        8880,recipient,recipient_id,'fixture','fixture','fixture','paid',1,id,1,9999999999999,1 FROM orders`)
+    s.state.cards[123] = { status: 'FROZEN' }
+    s.state.onCardRead = async () => {
+      s.state.onCardRead = undefined
+      if (change === 'pause') await s.pause()
+      if (change === 'revision') s.db.exec("UPDATE payment_settings SET revision='paycfg_changed'")
+      if (change === 'collection') s.db.exec("UPDATE alipay_checkouts SET status='attention',failure_code='payment_closed_unconfirmed'")
+    }
+    await s.tick()
+    const record = await nativeRecord(s)
+    assert.equal(record.order.failure_code, change === 'pause' ? 'payments_paused' : change === 'revision' ? 'payment_configuration_changed' : 'collection_requires_review')
+    assert.equal(record.job.card_id, 123); assert.equal(record.job.rejected_cards, undefined)
+    assert.equal(s.state.methods + s.state.confirms, 0)
+    assert.equal(s.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='payment_card_failover'").get()!.n, 0)
+  })
+})
+
+test('a pause after the atomic failover save prevents backup use until resumed and preserves its cursor', async t => {
+  const s = await selectedFixture(t, [456]); await enterFunding(s)
+  s.state.cards[123] = { status: 'FROZEN' }
+  const batch = s.env.DB.batch.bind(s.env.DB); let paused = false
+  t.mock.method(s.env.DB, 'batch', async statements => {
+    const result = await batch(statements)
+    if (!paused && (await nativeRecord(s)).job.card_id === 456) { paused = true; await s.pause() }
+    return result
+  })
+  await s.tick()
+  assert.equal(paused, true)
+  assert.equal((await nativeRecord(s)).order.failure_code, 'payments_paused')
+  assert.equal((await nativeRecord(s)).job.card_id, 456)
+  assert.deepEqual(s.state.cardReads, [123]); assert.equal(s.state.methods, 0)
+  s.state.cards[123].status = 'ACTIVE'; await s.resume(); s.state.cardReads.length = 0
+  for (let i = 0; i < 5; i++) await s.tick()
+  assert.equal((await nativeRecord(s)).order.status, 'succeeded')
+  assert.ok(s.state.cardReads.every(card => card === 456))
+  assert.equal(s.state.methods, 1); assert.equal(s.state.confirms, 1)
+})
+
+test('a tokenization marker survives a last-moment pause rollback and permanently locks the candidate', async t => {
+  const s = await selectedFixture(t, [456]); await enterFunding(s); await s.tick()
+  const prepare = s.env.DB.prepare.bind(s.env.DB); let paused = false
+  t.mock.method(s.env.DB, 'prepare', (sql: string) => {
+    const statement = prepare(sql)
+    if (!sql.startsWith('INSERT INTO native_jobs')) return statement
+    const bind = statement.bind.bind(statement), run = statement.run.bind(statement); let stage: unknown
+    statement.bind = (...values) => { stage = values[1]; bind(...values); return statement }
+    statement.run = async () => {
+      const result = await run()
+      if (stage === 'tokenizing' && !paused) { paused = true; await s.pause() }
+      return result
+    }
+    return statement
+  })
+  await s.tick()
+  const record = await nativeRecord(s)
+  assert.equal(record.job.stage, 'funded'); assert.equal(record.job.tokenization_started, true)
+  assert.equal(record.order.failure_code, 'payments_paused'); assert.equal(s.state.methods, 0)
+  await s.resume(); s.state.cards[123] = { status: 'FROZEN' }; s.state.cardReads.length = 0
+  await s.tick(); await s.tick()
+  assert.equal((await nativeRecord(s)).job.card_id, 123)
+  assert.equal((await nativeRecord(s)).order.failure_code, 'card_frozen')
+  assert.deepEqual(s.state.cardReads, [123, 123]); assert.equal(s.state.methods + s.state.confirms, 0)
 })

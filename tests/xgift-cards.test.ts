@@ -6,6 +6,7 @@ import {
   cardConfiguration,
   configureCards,
   cardRead,
+  syncCardList,
   cardWrite,
   cardOperations,
   resolveCardOperation,
@@ -13,11 +14,14 @@ import {
 import {
   hmac,
   sha256,
+  seal,
+  type Failure,
   type Env,
   type Statement,
   type Value,
 } from '../services/xgift/src/core.ts'
 import worker from '../services/xgift/src/index.ts'
+import { createUser } from '../services/xgift/src/auth.ts'
 type Context = Parameters<Parameters<typeof test>[1]>[0]
 function setup(t: Context) {
   const db = new DatabaseSync(':memory:')
@@ -139,6 +143,157 @@ test('card lists and transaction metadata redact PAN/CVV; spendable balance stay
   assert.equal(balance.spendable_balance, 80)
   assert.equal(balance.balance, 100)
 })
+test('cached card lists carry a verified provider revision and read timestamps without mutating payment state', async (t) => {
+  const { env, db } = setup(t)
+  const provider = await configureCards(env, config)
+  const before = db.prepare('SELECT * FROM card_provider').get()
+  mock(t, async (target, init) => {
+    const url = new URL(String(target))
+    assert.equal(init?.method, 'GET')
+    assert.equal(url.pathname, '/openapi/v1/cards')
+    assert.equal(url.search, '?page=2&page_size=30&sync=0')
+    return Response.json({ code: 0, data: { total: '31', list: [{ id: 123, status: 'ACTIVE', available_amount: 20,
+      card_number: '4111111111111111', cvv: '123' }] } })
+  })
+  const result = await cardRead(env, 'cards', 2) as {
+    total: number; provider_revision: string; refresh: { mode: string; requested_at: number; completed_at: number }
+  }
+  assert.equal(result.total, 31)
+  assert.equal(result.provider_revision, provider.revision)
+  assert.equal(result.refresh.mode, 'cached')
+  assert.ok(result.refresh.completed_at >= result.refresh.requested_at)
+  assert.doesNotMatch(JSON.stringify(result), /4111111111111111|cvv|sk_dummy/)
+  assert.deepEqual(db.prepare('SELECT * FROM card_provider').get(), before)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM payment_settings').get()!.n, 0)
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM card_operations').get()!.n, 0)
+})
+
+test('card lists reject invalid pages and discard a response from a replaced provider', async (t) => {
+  const { env } = setup(t)
+  await configureCards(env, config)
+  let calls = 0
+  mock(t, async () => {
+    calls++
+    await configureCards(env, { ...config, api_key: 'sk_changed_fixture' })
+    return Response.json({ code: 0, data: { total: 1, list: [{ id: 123, status: 'ACTIVE' }] } })
+  })
+  for (const page of [0, 1.5, 10001])
+    await assert.rejects(cardRead(env, 'cards', page), (error: Failure) => error.code === 'invalid_input')
+  assert.equal(calls, 0)
+  await assert.rejects(cardRead(env, 'cards'), (error: Failure) => error.code === 'card_provider_changed' && error.status === 409)
+  assert.equal(calls, 1)
+})
+
+test('a malformed or unavailable card list never returns successful refresh metadata', async (t) => {
+  const { env } = setup(t)
+  await configureCards(env, config)
+  const replies = [null, { total: -1, list: [] }, { total: 1, list: null }]
+  mock(t, async () => {
+    const data = replies.shift()
+    if (data === null) throw new Error('fixture unavailable')
+    return Response.json({ code: 0, data })
+  })
+  for (let attempt = 0; attempt < 3; attempt++)
+    await assert.rejects(cardRead(env, 'cards'), (error: Failure) => error.code === 'card_provider_unavailable')
+})
+
+test('explicit list refresh obtains newly listed cards with GET only and preserves the selected card and accounting', async (t) => {
+  const { env, db } = setup(t)
+  const provider = await configureCards(env, config)
+  const paymentPayload = await seal(env, 'payment-settings', JSON.stringify({
+    card_id: 777, provider_revision: provider.revision, stripe_publishable_key: 'pk_live_fixture',
+    selected_card: { id: 777, status: 'ACTIVE', last_four: '7777', available_amount: 20 }, card_checked_at: 1,
+  }))
+  db.prepare('INSERT INTO payment_settings VALUES(1,0,?,?,1)').run('paycfg_fixture', paymentPayload)
+  const tables = ['payment_settings', 'card_provider', 'order_admission', 'wallets', 'ledger', 'orders', 'card_operations']
+  const snapshot = () => tables.map(table => db.prepare('SELECT * FROM ' + table).all())
+  const before = snapshot()
+  let calls = 0
+  mock(t, async (target, init) => {
+    calls++
+    assert.equal(init?.method, 'GET')
+    assert.equal(new URL(String(target)).pathname, '/openapi/v1/cards')
+    assert.equal(new URL(String(target)).search, '?page=1&page_size=30&sync=0')
+    const cards = [{ id: 123, status: 'ACTIVE', available_amount: 20, card_number: '4111111111111111', cvv: '123' }]
+    if (calls > 1) cards.push({ id: 456, status: 'ACTIVE', available_amount: 30, card_number: '5555555555554444', cvv: '456' })
+    return Response.json({ code: 0, data: { total: cards.length, list: cards } })
+  })
+  const first = await cardRead(env, 'cards') as { total: number; list: { id: number }[] }
+  const next = await syncCardList(env, { provider_revision: provider.revision }) as {
+    total: number; list: { id: number }[]; provider_revision: string; refresh: { mode: string }
+  }
+  assert.equal(first.total, 1)
+  assert.equal(next.total, 2)
+  assert.deepEqual(next.list.map(card => card.id), [123, 456])
+  assert.equal(next.provider_revision, provider.revision)
+  assert.equal(next.refresh.mode, 'cached', 'An explicit refetch must not claim issuer-level synchronization')
+  assert.doesNotMatch(JSON.stringify(next), /4111111111111111|5555555555554444|cvv|pk_live|sk_dummy/)
+  assert.deepEqual(snapshot(), before, 'A missing selected card on this page must not replace or delete its binding')
+  assert.equal(calls, 2)
+})
+
+test('explicit list refresh rejects stale provider revisions and never substitutes cached success for a failed request', async (t) => {
+  const { env } = setup(t)
+  const provider = await configureCards(env, config)
+  let calls = 0
+  mock(t, async () => { calls++; throw new Error('fixture unavailable') })
+  await assert.rejects(syncCardList(env, { provider_revision: 'cfg_stale' }),
+    (error: Failure) => error.code === 'card_provider_changed' && error.status === 409)
+  assert.equal(calls, 0)
+  await assert.rejects(syncCardList(env, { provider_revision: provider.revision }),
+    (error: Failure) => error.code === 'card_provider_unavailable' && error.status === 502)
+  assert.equal(calls, 1)
+})
+
+test('explicit list refresh discards an in-flight response after the card provider changes', async (t) => {
+  const { env } = setup(t)
+  const provider = await configureCards(env, config)
+  mock(t, async () => {
+    await configureCards(env, { ...config, api_key: 'sk_new_provider_fixture' })
+    return Response.json({ code: 0, data: { total: 1, list: [{ id: 123, status: 'ACTIVE' }] } })
+  })
+  await assert.rejects(syncCardList(env, { provider_revision: provider.revision }),
+    (error: Failure) => error.code === 'card_provider_changed' && error.status === 409)
+})
+
+test('list refresh HTTP route requires an administrator, same-origin JSON, a provider revision and valid pagination', async (t) => {
+  const { env } = setup(t)
+  const provider = await configureCards(env, config)
+  const origin = 'https://x-api.example.test'
+  const route = '/api/admin/card-provider/cards/sync'
+  const request = (path: string, body?: Record<string, unknown>, cookie = '', requestOrigin = origin, contentType = 'application/json') =>
+    worker.fetch(new Request(origin + path, { method: body ? 'POST' : 'GET',
+      headers: { Cookie: cookie, Origin: requestOrigin, 'Content-Type': contentType }, body: body ? JSON.stringify(body) : undefined }), env)
+  const adminLogin = await request('/api/login', { email: 'admin', password: env.ADMIN_PASSWORD })
+  const adminCookie = adminLogin.headers.get('Set-Cookie')!.split(';')[0]
+  await createUser(env, { name: 'Merchant', email: 'fixture-merchant@example.test', password: 'fixture-password-long-enough' })
+  const merchantLogin = await request('/api/login', { email: 'fixture-merchant@example.test', password: 'fixture-password-long-enough' })
+  const merchantCookie = merchantLogin.headers.get('Set-Cookie')!.split(';')[0]
+  let calls = 0
+  mock(t, async (target, init) => {
+    calls++
+    assert.equal(init?.method, 'GET')
+    assert.equal(new URL(String(target)).search, '?page=10000&page_size=30&sync=0')
+    return Response.json({ code: 0, data: { total: 0, list: [] } })
+  })
+  const body = { provider_revision: provider.revision }
+  assert.equal((await request(route, body)).status, 401)
+  assert.equal((await request(route, body, merchantCookie)).status, 403)
+  assert.equal((await request(route, body, adminCookie, 'https://attacker.example.test')).status, 403)
+  assert.equal((await request(route, body, adminCookie, origin, 'text/plain')).status, 415)
+  assert.equal((await request(route, {}, adminCookie)).status, 400)
+  for (const page of ['0', '1.5', '10001', 'not-a-page'])
+    assert.equal((await request(route + '?page=' + page, body, adminCookie)).status, 400)
+  assert.equal(calls, 0)
+  const response = await request(route + '?page=10000', body, adminCookie)
+  assert.equal(response.status, 200)
+  const result = (await response.json()).data
+  assert.equal(result.provider_revision, provider.revision)
+  assert.equal(result.refresh.mode, 'cached')
+  assert.equal(result.total, 0)
+  assert.equal(calls, 1)
+})
+
 test('financial writes need switch, confirmation, integer cents and configured gateway', async (t) => {
   const { env, db } = setup(t)
   await configureCards(env, config)

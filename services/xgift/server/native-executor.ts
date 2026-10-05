@@ -1,4 +1,4 @@
-import { Failure, readResponse, seal, unseal, type Env } from '../src/core.ts'
+import { Failure, id, readResponse, seal, unseal, type Env } from '../src/core.ts'
 import type { Order } from '../src/orders.ts'
 import type { Result, Snapshot } from '../src/executor.ts'
 import { accountEligibility, quote, xQuery } from '../src/network.ts'
@@ -9,7 +9,8 @@ import { assertPaymentAllowed, type PaymentBinding } from '../src/payments.ts'
 // X merchant published by x_gift_bot setup.go. Validate every returned payment page against it.
 export const X_MERCHANT = 'acct_1Ika5JA3KZ32dPo1'
 type Json = Record<string, any>
-interface Job { stage: string; session?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding }
+interface Job { stage: string; session?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding
+  candidate_index?: number; rejected_cards?: { card_id: number; reason: string }[]; candidates_exhausted?: boolean; tokenization_started?: boolean }
 const sessionPattern = /^cs_live_[A-Za-z0-9]+$/
 const successUrl = (o: Order) => `https://x.com/${o.recipient}/gift-premium/success`
 export function guardPage(p: Json, order: Order, session: string, before: boolean) {
@@ -32,13 +33,20 @@ async function stripe(key: string, method: string, path: string, fields: Record<
   if (!response.ok || data.error) throw new Error('stripe_result_unconfirmed')
   return data as Json
 }
-async function save(env: Env, order: Order, job: Job) {
-  await env.DB.prepare('INSERT INTO native_jobs VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET stage=excluded.stage,payload=excluded.payload,updated_at=excluded.updated_at')
-    .bind(order.id, job.stage, await seal(env, 'native:' + order.id, JSON.stringify(job)), Date.now()).run()
+async function save(env: Env, order: Order, job: Job, change?: { from_card_id: number; to_card_id: number | null; reason: string }) {
+  const now = Date.now()
+  const update = env.DB.prepare('INSERT INTO native_jobs VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET stage=excluded.stage,payload=excluded.payload,updated_at=excluded.updated_at')
+    .bind(order.id, job.stage, await seal(env, 'native:' + order.id, JSON.stringify(job)), now)
+  if (change) await env.DB.batch([update, env.DB.prepare('INSERT INTO audit VALUES(?,?,?,?,?,?)')
+    .bind(id('audit'), 'system', change.to_card_id === null ? 'payment_cards_exhausted' : 'payment_card_failover', order.id, JSON.stringify(change), now)])
+  else await update.run()
 }
 async function prepareWrite(env: Env, order: Order, job: Job, stage: string) {
   const previous = job.stage
   job.stage = stage
+  // Once a method submission was prepared, this checkout stays bound to that
+  // card even if a last-moment pause makes the phase roll back before sending.
+  if (stage === 'tokenizing') job.tokenization_started = true
   await save(env, order, job)
   try {
     // Saving is asynchronous: a pause can arrive after the preceding guard.
@@ -77,12 +85,59 @@ async function fundCard(env: Env) {
   if (result.status !== 'succeeded' || !result.card_id) throw new Error('card_funding_unconfirmed')
   return Number(result.card_id)
 }
+class CardCheckError extends Error {
+  readonly reason: string
+  readonly canFailover: boolean
+  constructor(reason: string, canFailover = false) {
+    super(reason); this.reason = reason; this.canFailover = canFailover
+  }
+}
 function validateCard(card: Json, cardId: number, selected: boolean) {
   const expiry = String(card.expire ?? '').match(/^(\d{2})\/(\d{2}|\d{4})$/)
   const month = Number(expiry?.[1]), year = expiry ? Number(expiry[2]) + (expiry[2]!.length === 2 ? 2000 : 0) : 0
   const current = new Date()
-  if (Number(card.id) !== cardId || (!selected && card.product_code !== giftPolicy.preferred_product) || card.status !== 'ACTIVE' || !/^\d{12,19}$/.test(String(card.card_number)) || !/^\d{3,4}$/.test(String(card.cvv)) || !expiry || month < 1 || month > 12 || year < current.getUTCFullYear() || (year === current.getUTCFullYear() && month < current.getUTCMonth() + 1) || !Number.isFinite(Number(card.available_amount)) || Number(card.available_amount) < 10 || (card.currency !== undefined && String(card.currency).toUpperCase() !== 'USD')) throw new Error('card_not_ready')
+  const balanceValid = typeof card.available_amount === 'number' ||
+    (typeof card.available_amount === 'string' && /^\d+(?:\.\d+)?$/.test(card.available_amount))
+  const identityValid = (typeof card.id === 'number' && Number.isSafeInteger(card.id)) ||
+    (typeof card.id === 'string' && /^\d+$/.test(card.id))
+  // Identity and malformed responses are not proof that a card is unavailable.
+  // Never amplify a provider/API failure by trying further cards.
+  if (!identityValid || Number(card.id) !== cardId || (!selected && card.product_code !== giftPolicy.preferred_product) ||
+      !['ACTIVE', 'FROZEN', 'DELETED', 'CANCELLED'].includes(card.status) ||
+      !/^\d{12,19}$/.test(String(card.card_number)) || !/^\d{3,4}$/.test(String(card.cvv)) ||
+      !expiry || month < 1 || month > 12 || !balanceValid || !Number.isFinite(Number(card.available_amount)) ||
+      Number(card.available_amount) < 0 || (card.currency !== undefined && String(card.currency).toUpperCase() !== 'USD'))
+    throw new CardCheckError('payment_card_unverified')
+  if (card.status !== 'ACTIVE') throw new CardCheckError('card_' + String(card.status).toLowerCase(), true)
+  if (year < current.getUTCFullYear() || (year === current.getUTCFullYear() && month < current.getUTCMonth() + 1))
+    throw new CardCheckError('card_expired', true)
+  if (Number(card.available_amount) < 10) throw new CardCheckError('card_balance_insufficient', true)
   return expiry
+}
+async function unavailableCard(env: Env, order: Order, job: Job, error: CardCheckError): Promise<Result> {
+  const unknown = (failure_code: string): Result => ({ order_id: order.id, status: 'unknown', failure_code })
+  const payment = job.payment
+  if (!error.canFailover || !payment?.backup_card_ids?.length || !['funding', 'funded'].includes(job.stage) ||
+      job.method !== undefined || job.submitted_at !== undefined || job.tokenization_started)
+    return unknown(error.reason)
+  const candidates = [payment.card_id, ...payment.backup_card_ids], index = candidates.indexOf(job.card_id!)
+  if (index < 0 || (job.candidate_index !== undefined && job.candidate_index !== index)) return unknown('payment_binding_mismatch')
+  await assertPaymentAllowed(env, payment, order.id)
+  // A single invocation reads one candidate only. Persist the next authorized
+  // ID and its audit event atomically; restart never returns to rejected cards.
+  const next = candidates[index + 1] ?? null, rejected = job.rejected_cards ?? []
+  if (next === null && rejected.some(card => card.card_id === job.card_id))
+    return unknown('payment_cards_exhausted')
+  const previousCard = job.card_id!
+  job.rejected_cards = [...rejected, { card_id: previousCard, reason: error.reason }]
+  job.candidate_index = next === null ? index : index + 1
+  job.candidates_exhausted = next === null
+  if (next !== null) { job.card_id = next; job.stage = 'funding' }
+  await save(env, order, job, { from_card_id: previousCard, to_card_id: next, reason: error.reason })
+  await assertPaymentAllowed(env, payment, order.id)
+  // Exhaustion does not cycle back. The last card alone may be read again so
+  // an operator can restore it without creating another purchase or checkout.
+  return next === null ? unknown('payment_cards_exhausted') : { order_id: order.id, status: 'running' }
 }
 export async function executeNative(env: Env, order: Order, snapshot: Snapshot): Promise<Result> {
   const unknown = (code = 'result_unconfirmed'): Result => ({ order_id: order.id, status: 'unknown', failure_code: code })
@@ -102,7 +157,11 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
   if (order.currency !== 'bdt' || ![3, 6].includes(order.months) || order.amount_minor !== order.months * 10000 || order.stripe_product !== (order.months === 3 ? 'prod_TJXJtpzqCpI36N' : 'prod_TJXKKNJwZJIhCM')) return unknown('product_not_authorized')
   try {
     if (!['submitted', 'paid'].includes(job.stage)) await assertPaymentAllowed(env, payment, order.id)
-    if (payment && (job.card_id !== payment.card_id || job.key !== payment.stripe_publishable_key)) return unknown('payment_binding_mismatch')
+    if (payment) {
+      const candidates = [payment.card_id, ...(payment.backup_card_ids ?? [])], index = candidates.indexOf(job.card_id!)
+      if (index < 0 || (job.candidate_index !== undefined && job.candidate_index !== index) || job.key !== payment.stripe_publishable_key)
+        return unknown('payment_binding_mismatch')
+    }
     if (job.stage === 'preflight') {
       const check = await accountEligibility(env, snapshot.account, snapshot.proxy, order.recipient)
       if (!check.eligible || check.recipient_id !== order.recipient_id) return { order_id: order.id, status: 'failed', financial_state: 'not_charged', failure_code: 'recipient_not_eligible' }
@@ -132,8 +191,10 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
       await assertPaymentAllowed(env, payment, order.id)
       if (payment) {
         // Existing-card mode is read-only at the card provider: never open, top up or change limits.
-        validateCard(await paymentCard(env, payment.card_id), payment.card_id, true)
-        job.card_id = payment.card_id
+        const card = await paymentCard(env, job.card_id!)
+        try { validateCard(card, job.card_id!, true) }
+        catch (error) { if (error instanceof CardCheckError) return await unavailableCard(env, order, job, error); throw error }
+        job.candidates_exhausted = false
       } else job.card_id = await fundCard(env)
       job.stage = 'funded'; await save(env, order, job); return running()
     }
@@ -146,7 +207,9 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
         if (!operation || operation.provider_revision !== config.revision) throw new Error('card_provider_changed')
       }
       const card = await paymentCard(env, job.card_id!)
-      const expiry = validateCard(card, job.card_id!, !!payment)
+      let expiry: RegExpMatchArray
+      try { expiry = validateCard(card, job.card_id!, !!payment) }
+      catch (error) { if (payment && error instanceof CardCheckError) return await unavailableCard(env, order, job, error); throw error }
       await assertPaymentAllowed(env, payment, order.id)
       // The USD balance threshold is conservative; an existing card's limits are not modified.
       await prepareWrite(env, order, job, 'tokenizing')
@@ -162,7 +225,7 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
       if (!check.eligible || check.recipient_id !== order.recipient_id) return { order_id: order.id, status: 'failed', financial_state: 'not_charged', failure_code: 'recipient_changed_before_payment' }
       const page = await stripe(job.key, 'POST', `payment_pages/${job.session}/init`, { browser_locale: 'en', redirect_type: 'url' })
       guardPage(page, order, job.session, true)
-      if (payment) validateCard(await paymentCard(env, payment.card_id), payment.card_id, true)
+      if (payment) validateCard(await paymentCard(env, job.card_id!), job.card_id!, true)
       await assertPaymentAllowed(env, payment, order.id)
       job.proof = page; job.checksum = page.init_checksum; job.submitted_at = Date.now()
       await prepareWrite(env, order, job, 'submitted')
@@ -185,6 +248,6 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
     }
     return unknown('execution_stage_unconfirmed')
   } catch (error) {
-    return unknown(error instanceof Failure ? error.code : 'execution_requires_reconciliation')
+    return unknown(error instanceof Failure ? error.code : error instanceof CardCheckError ? error.reason : 'execution_requires_reconciliation')
   }
 }

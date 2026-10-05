@@ -30,6 +30,7 @@ import {
   cardConfiguration,
   configureCards,
   cardRead,
+  syncCardList,
   cardWrite,
   cardOperations,
   resolveCardOperation,
@@ -232,6 +233,11 @@ async function route(request: Request, env: Env): Promise<Response> {
     )
     if (cardResolve && method === 'POST')
       return json(await resolveCardOperation(env, cardResolve[1], data))
+    if (path === '/api/admin/card-provider/cards/sync' && method === 'POST') {
+      const { page } = pagination(url)
+      await limit(env, 'card-list-refresh:admin', 10)
+      return json(await syncCardList(env, data, page))
+    }
     const cardResource = path.match(
       /^\/api\/admin\/card-provider\/(balance|products|cards)$/,
     )
