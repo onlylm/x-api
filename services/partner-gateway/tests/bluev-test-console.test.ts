@@ -13,7 +13,8 @@ const item = () => ({ test_id: ID, request_id: ID, order_id: "po_test", client_o
   product: "x_premium_3m", recipient: "@tester", amount: "22.00", currency: "CNY", payment_status: "pending",
   fulfillment_status: "not_started", requires_review: false, qr_available: true, terminal: false,
   expires_at: null, paid_at: null, created_at: "2026-10-06T00:00:00Z", updated_at: "2026-10-06T00:00:00Z",
-  upstream_order_id: null, detail_zh: "等待付款" });
+  upstream_order_id: null, detail_zh: "等待付款", qr_error_code: null, qr_error_zh: null,
+  qr_retry_allowed: false, qr_retry_requires_renewal: false, qr_retry_version: 0 });
 let server: Server;
 let base: string;
 let sessionStatus: number;
@@ -152,6 +153,74 @@ describe("isolated bluev admin console", () => {
     expect(new Headers((call[1] as RequestInit).headers).get("cookie")).toBeNull();
     expect(JSON.parse((call[1] as RequestInit).body as string)).toEqual(input);
     expect(await result.text()).not.toContain(KEY);
+  });
+  it("forwards an explicit version-bound QR retry as JSON with its original UUID", async () => {
+    upstreamBody = { success: true, item: { ...item(), qr_retry_version: 1 }, idempotent: false };
+    const input = { expected_version: 0, confirm_retry: true, confirm_renewal: false };
+    const result = await post(API + "/orders/" + ID + "/retry-qr", input);
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ success: true, idempotent: false, item: { qr_retry_version: 1 } });
+    expect(upstreamCalls()).toHaveLength(1);
+    const call = upstreamCalls()[0];
+    expect(call[0]).toBe("https://x.aifu.me/bluev-sandbox/internal/bluev-test/orders/" + ID + "/retry-qr");
+    const sent = call[1] as RequestInit;
+    expect(sent.method).toBe("POST"); expect(new Headers(sent.headers).get("accept")).toBe("application/json");
+    expect(new Headers(sent.headers).get("cookie")).toBeNull();
+    expect(JSON.parse(sent.body as string)).toEqual(input);
+  });
+  it("rejects QR recovery without login, same-origin JSON and the exact three consent fields", async () => {
+    const path = API + "/orders/" + ID + "/retry-qr";
+    const body = { expected_version: 0, confirm_retry: true, confirm_renewal: false };
+    expect((await post(path, body, { Cookie: "" })).status).toBe(401);
+    expect((await post(path, body, { Origin: "https://evil.test" })).status).toBe(403);
+    expect((await post(path, body, { "Content-Type": "text/plain" })).status).toBe(415);
+    for (const input of [{ ...body, expected_version: "0" }, { ...body, expected_version: -1 },
+      { ...body, expected_version: 0.5 }, { ...body, expected_version: Number.MAX_SAFE_INTEGER + 1 },
+      { ...body, confirm_retry: false }, { ...body, confirm_renewal: "true" },
+      { expected_version: 0, confirm_retry: true }, { ...body, amount: "0.01" }, { ...body, recipient: "other" }]) {
+      expect((await post(path, input)).status).toBe(422);
+    }
+    expect(upstreamCalls()).toHaveLength(0);
+  });
+  it("never exposes recovery as a GET side effect or treats its JSON response as a PNG", async () => {
+    expect((await get(API + "/orders/" + ID + "/retry-qr")).status).toBe(405);
+    expect((await post(API + "/orders/" + ID + "/qr", {})).status).toBe(405);
+    expect((await post(API + "/orders/invalid/retry-qr", {})).status).toBe(405);
+    expect(upstreamCalls()).toHaveLength(0);
+  });
+  it("rejects a recovery response for a different original order", async () => {
+    const different = "5dd52d41-d3ac-4d4f-b50e-37e38d626734";
+    upstreamBody = { success: true, item: { ...item(), test_id: different, request_id: different }, idempotent: false };
+    const response = await post(API + "/orders/" + ID + "/retry-qr", { expected_version: 0, confirm_retry: true, confirm_renewal: false });
+    expect(response.status).toBe(503); expect(await response.text()).not.toContain(different);
+  });
+  it("replaces raw QR diagnostic text with local fixed messages and rejects unknown error contracts", async () => {
+    upstreamBody = { success: true, item: { ...item(), qr_error_code: "payment_result_unknown", qr_error_zh: "private raw " + KEY } };
+    const body = await (await get(API + "/orders/" + ID)).json();
+    expect(body.item.qr_error_code).toBe("payment_result_unknown");
+    expect(typeof body.item.qr_error_zh).toBe("string");
+    expect(JSON.stringify(body)).not.toMatch(/private raw|independent-test-key/);
+    for (const change of [{ qr_error_code: "unexpected_private_error" }, { qr_retry_version: "1" },
+      { qr_retry_version: -1 }, { qr_retry_version: 1.2 }, { qr_retry_allowed: "true" }, { qr_retry_requires_renewal: null }]) {
+      upstreamBody = { success: true, item: { ...item(), ...change } };
+      expect((await get(API + "/orders/" + ID)).status).toBe(503);
+    }
+  });
+  it("returns safe recovery conflicts and does not repeat an uncertain upstream POST", async () => {
+    const path = API + "/orders/" + ID + "/retry-qr";
+    const input = { expected_version: 0, confirm_retry: true, confirm_renewal: true };
+    for (const code of ["retry_not_allowed", "retry_busy", "renewal_required", "retry_conflict", "retry_recipient_changed", "retry_fulfillment_unavailable"]) {
+      upstreamStatus = 409; upstreamBody = { error: { code, message: "private raw " + KEY } };
+      const response = await post(path, input);
+      expect(response.status).toBe(409);
+      const body = await response.json();
+      expect(body.error).toBe(code); expect(body.detail_zh).not.toContain("private raw");
+    }
+    const before = upstreamCalls().length;
+    fakeFetch.mockImplementation(async (url: string) => { if (url.includes("/admin/api/session")) return Response.json({ success: true }); throw new Error("timeout " + KEY); });
+    const failed = await post(path, input);
+    expect(failed.status).toBe(503); expect(await failed.text()).not.toContain(KEY);
+    expect(upstreamCalls()).toHaveLength(before + 1);
   });
   it("retains request UUID lookup and whitelists all public order fields", async () => {
     upstreamBody = { success: true, items: [{ ...item(), secret: KEY, recipient_ciphertext: "private", qr: "private-qr", detail_zh: KEY }] };

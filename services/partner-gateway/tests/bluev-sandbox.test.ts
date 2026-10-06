@@ -9,6 +9,7 @@ import { bluevSandboxProducts, buildBluevSandbox, loadBluevSandboxConfig, openBl
 import { MockPaymentClient, type PaymentConfirmation } from "../src/clients/payment.js";
 import { MockXApiClient } from "../src/clients/x-api.js";
 import { ledgerTestConfig } from "./ledger-fixtures.js";
+import { BluevPaymentError, type BluevRecoveryPayment } from "../src/bluev-sandbox-payment.js";
 
 describe("isolated administrator blueV real-payment sandbox", () => {
   let directory: string;
@@ -19,7 +20,7 @@ describe("isolated administrator blueV real-payment sandbox", () => {
   let closed: boolean;
   const prefix = "/internal/bluev-test";
   const headers = () => ({ "x-bluev-test-key": config.bluevTestKey });
-  const input = (id = randomUUID(), product = "x_premium_3m", recipient = "test_user") =>
+  const input = (id: string = randomUUID(), product = "x_premium_3m", recipient = "test_user") =>
     ({ request_id: id, product, recipient, confirm_real_payment: true });
   const confirmation = (amount = "22.00"): PaymentConfirmation => ({ paid: true, tradeNo: "verified-alipay-trade",
     paidAt: new Date().toISOString(), receiptAmount: amount, tradeStatus: "TRADE_SUCCESS" });
@@ -57,6 +58,202 @@ describe("isolated administrator blueV real-payment sandbox", () => {
     vi.mocked(payment.verifyNotification).mockResolvedValue(confirmation());
     return service.app.inject({ method: "POST", url: "/callbacks/alipay", payload: { out_trade_no: orderId, sign: "mock-signed" } });
   }
+  function enableRecovery() {
+    const query = vi.fn<BluevRecoveryPayment["queryForRecovery"]>().mockResolvedValue({ state: "not_found",
+      confirmation: { paid: false, tradeNo: null, paidAt: new Date().toISOString(), receiptAmount: null, tradeStatus: null } });
+    Object.assign(payment, { queryForRecovery: query });
+    return query;
+  }
+  async function missingQr(expired = false) {
+    vi.mocked(payment.createPaymentUrl).mockRejectedValueOnce(new BluevPaymentError("bluev_payment_timeout"));
+    const created: BluevTestOrder = (await create()).json().item;
+    if (expired) {
+      const found = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!;
+      const intent = JSON.parse(String(found.order_json)); intent.expires_at = "2020-01-01T00:00:00.000Z";
+      service.db.db.prepare("UPDATE checkout_intents SET order_json=? WHERE client_order_id=?").run(JSON.stringify(intent), created.client_order_id);
+    }
+    return created;
+  }
+  async function retry(id: string, version = 0, renewal = false) {
+    return service.app.inject({ method: "POST", url: `${prefix}/orders/${id}/retry-qr`, headers: headers(),
+      payload: { expected_version: version, confirm_retry: true, confirm_renewal: renewal } });
+  }
+  it("shows sanitized payment errors without falsely ending unknown payments", async () => {
+    enableRecovery(); const created = await missingQr();
+    expect(await item(created.test_id)).toMatchObject({ qr_error_code: "bluev_payment_timeout", qr_retry_allowed: true,
+      qr_retry_requires_renewal: false, qr_retry_version: 0, terminal: false });
+  });
+  it("manual recovery reuses the same order, amount and recipient; replay cannot resend", async () => {
+    const query = enableRecovery(); const created = await missingQr();
+    const response = await retry(created.test_id);
+    expect(response.statusCode).toBe(200);
+    expect(response.json().item).toMatchObject({ order_id: created.order_id, client_order_id: created.client_order_id,
+      recipient: created.recipient, amount: "22.00", product: "x_premium_3m", qr_available: true, payment_status: "pending", qr_retry_version: 1 });
+    expect(query).toHaveBeenCalledTimes(1); expect(payment.createPaymentUrl).toHaveBeenCalledTimes(2);
+    expect(xApi.createOrder).not.toHaveBeenCalled();
+    expect((await retry(created.test_id)).json().idempotent).toBe(true);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(2);
+  });
+  it("requires renewal confirmation and persists the new absolute 20m deadline", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const query = enableRecovery(); const created = await missingQr(true);
+    expect((await retry(created.test_id)).statusCode).toBe(409);
+    expect(query).not.toHaveBeenCalled(); expect((await item(created.test_id)).qr_retry_version).toBe(0);
+    const response = await retry(created.test_id, 0, true);
+    expect(response.json().item).toMatchObject({ order_id: created.order_id, qr_available: true, qr_retry_version: 1 });
+    expect(Date.parse(response.json().item.expires_at) - Date.now()).toBeGreaterThan(1199000);
+    expect(Date.parse(response.json().item.expires_at) - Date.now()).toBeLessThanOrEqual(1200000);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(2);
+  });
+  it.each(["unknown", "trade_exists"] as const)("never precreates when original query is %s", async state => {
+    const query = enableRecovery(); const created = await missingQr();
+    query.mockResolvedValue({ state, confirmation: { paid: false, tradeNo: "maybe-original-trade", paidAt: new Date().toISOString(), receiptAmount: null,
+      tradeStatus: state === "trade_exists" ? "TRADE_CLOSED" : null } });
+    expect((await retry(created.test_id)).json().item).toMatchObject({ payment_status: "unknown", qr_retry_version: 1, qr_error_code: "retry_not_allowed" });
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(xApi.createOrder).not.toHaveBeenCalled();
+  });
+  it("query failure consumes a version durably, even after restart", async () => {
+    const query = enableRecovery(); const created = await missingQr();
+    query.mockRejectedValue(new BluevPaymentError("bluev_payment_signature_unverified"));
+    await retry(created.test_id);
+    await service.app.close(); service = await buildBluevSandbox(config, { payment, xApi, startWorkers: false });
+    expect((await retry(created.test_id)).json().idempotent).toBe(true);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(query).toHaveBeenCalledTimes(1);
+    expect((await retry(created.test_id, 1)).statusCode).toBe(409);
+  });
+  it("concurrent clicks, future versions, create replays and background queries cannot resend", async () => {
+    const query = enableRecovery(); const created = await missingQr();
+    const answer = { state: "not_found" as const, confirmation: { paid: false, tradeNo: null, paidAt: new Date().toISOString(), receiptAmount: null, tradeStatus: null } };
+    let release!: () => void;
+    query.mockImplementation(() => new Promise(resolve => { release = () => resolve(answer); }));
+    const first = retry(created.test_id); await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    expect((await retry(created.test_id)).json().idempotent).toBe(true);
+    expect((await retry(created.test_id, 2)).statusCode).toBe(409);
+    expect((await create(input(created.test_id))).json().idempotent).toBe(true);
+    await service.tests.recoverIntents(); expect(payment.queryPayment).not.toHaveBeenCalled();
+    release(); await first;
+    expect(query).toHaveBeenCalledTimes(1); expect(payment.createPaymentUrl).toHaveBeenCalledTimes(2);
+  });
+  it("an already paid original is reconciled without creating another payment", async () => {
+    const query = enableRecovery(); const created = await missingQr();
+    query.mockResolvedValue({ state: "trade_exists", confirmation: confirmation() });
+    expect((await retry(created.test_id)).json().item).toMatchObject({ payment_status: "paid", fulfillment_status: "queued" });
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(service.db.listActivations(created.order_id!)).toHaveLength(1);
+  });
+  it("callback during recovery preserves payment and prevents precreate", async () => {
+    const query = enableRecovery(); const created = await missingQr();
+    query.mockImplementation(async () => { await paidCallback(created.order_id!); return { state: "not_found", confirmation: {
+      paid: false, tradeNo: null, paidAt: new Date().toISOString(), receiptAmount: null, tradeStatus: null } }; });
+    expect((await retry(created.test_id)).json().item.payment_status).toBe("paid");
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(service.db.listActivations(created.order_id!)).toHaveLength(1);
+  });
+  it("callback during precreate cannot be overwritten back to pending", async () => {
+    enableRecovery(); const created = await missingQr();
+    vi.mocked(payment.createPaymentUrl).mockImplementationOnce(async () => { await paidCallback(created.order_id!); return "https://qr.alipay.com/test"; });
+    expect((await retry(created.test_id)).json().item.payment_status).toBe("paid");
+    expect(service.db.listActivations(created.order_id!)).toHaveLength(1);
+  });
+  it.each(["sales", "recipient", "product"])("rechecks %s before original recovery", async kind => {
+    enableRecovery(); const created = await missingQr(true);
+    if (kind === "sales") unlinkSync(config.partnerSalesGateFile);
+    if (kind === "recipient") vi.spyOn(xApi, "eligibility").mockResolvedValue({ eligible: true, username: "test_user", recipient_id: "changed-owner" });
+    if (kind === "product") vi.spyOn(xApi, "isPlanAvailable").mockResolvedValue(false);
+    expect((await retry(created.test_id, 0, true)).json().item).toMatchObject({ payment_status: "unknown", qr_available: false, expires_at: "2020-01-01T00:00:00.000Z" });
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(xApi.createOrder).not.toHaveBeenCalled();
+  });
+  it.each(["eligibility", "product", "availability"])("classifies %s exceptions as fulfillment checks, not an Alipay result", async kind => {
+    enableRecovery(); const created = await missingQr(true);
+    const before = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json;
+    const sensitive = new Error("raw-upstream-credentials-must-not-escape");
+    if (kind === "eligibility") vi.spyOn(xApi, "eligibility").mockRejectedValue(sensitive);
+    if (kind === "product") vi.spyOn(xApi, "product").mockRejectedValue(sensitive);
+    if (kind === "availability") vi.spyOn(xApi, "isPlanAvailable").mockRejectedValue(sensitive);
+    const response = await retry(created.test_id, 0, true);
+    expect(response.json().item).toMatchObject({ qr_error_code: "retry_fulfillment_unavailable", qr_retry_version: 1, qr_available: false });
+    expect(response.body).not.toContain("raw-upstream");
+    expect(service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json).toBe(before);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(xApi.createOrder).not.toHaveBeenCalled();
+  });
+  it("classifies unreadable frozen recipient evidence without leaking decryption errors or renewing", async () => {
+    enableRecovery(); const created = await missingQr(true);
+    const saved = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!;
+    const intent = JSON.parse(String(saved.order_json)); intent.fulfillment_recipient_ciphertext = "invalid-ciphertext";
+    const before = JSON.stringify(intent);
+    service.db.db.prepare("UPDATE checkout_intents SET order_json=? WHERE client_order_id=?").run(before, created.client_order_id);
+    const eligibility = vi.spyOn(xApi, "eligibility");
+    expect((await retry(created.test_id, 0, true)).json().item).toMatchObject({ qr_error_code: "retry_recipient_changed", qr_retry_version: 1 });
+    expect(eligibility).not.toHaveBeenCalled(); expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1);
+    expect(service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json).toBe(before);
+  });
+  it.each([{ sell_price: "21.00" }, { status: "paid" }, { paid_at: "2026-10-06T00:00:00.000Z" },
+    { alipay_trade_no: "retained-payment-evidence" }, { qr: "https://qr.alipay.com/retained-code" }])("refuses recovery of changed price or retained payment evidence %j before consuming a version", async patch => {
+    const query = enableRecovery(); const created = await missingQr();
+    const saved = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!;
+    const before = JSON.stringify({ ...JSON.parse(String(saved.order_json)), ...patch });
+    service.db.db.prepare("UPDATE checkout_intents SET order_json=? WHERE client_order_id=?").run(before, created.client_order_id);
+    const response = await retry(created.test_id);
+    expect(response.statusCode).toBe(409); expect(response.json().error.code).toBe("retry_not_allowed");
+    expect((await item(created.test_id)).qr_retry_version).toBe(0);
+    expect(query).not.toHaveBeenCalled(); expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1);
+    expect(service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json).toBe(before);
+  });
+  it.each(["eligibility", "product"])("does not renew or precreate after losing the lease during %s", async stage => {
+    enableRecovery(); const created = await missingQr(true);
+    const before = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json;
+    const loseLease = () => service.db.db.prepare("UPDATE bluev_test_requests SET query_lease=?,query_lease_until=? WHERE request_id=?")
+      .run("another-owner", new Date(Date.now() + 120_000).toISOString(), created.test_id);
+    if (stage === "eligibility") {
+      const original = xApi.eligibility.bind(xApi);
+      vi.spyOn(xApi, "eligibility").mockImplementation(async username => { const result = await original(username); loseLease(); return result; });
+    } else {
+      const original = xApi.product.bind(xApi);
+      vi.spyOn(xApi, "product").mockImplementation(async code => { const result = await original(code); loseLease(); return result; });
+    }
+    expect((await retry(created.test_id, 0, true)).json().item).toMatchObject({ payment_status: "unknown", qr_available: false, qr_retry_version: 1 });
+    expect(service.db.db.prepare("SELECT query_lease FROM bluev_test_requests WHERE request_id=?").get(created.test_id)?.query_lease).toBe("another-owner");
+    expect(service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json).toBe(before);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(xApi.createOrder).not.toHaveBeenCalled();
+  });
+  it.each(["eligibility", "product"])("preserves a callback received during %s without renewing or precreating", async stage => {
+    enableRecovery(); const created = await missingQr(true);
+    const before = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json;
+    if (stage === "eligibility") {
+      const original = xApi.eligibility.bind(xApi);
+      vi.spyOn(xApi, "eligibility").mockImplementation(async username => { await paidCallback(created.order_id!); return original(username); });
+    } else {
+      const original = xApi.product.bind(xApi);
+      vi.spyOn(xApi, "product").mockImplementation(async code => { await paidCallback(created.order_id!); return original(code); });
+    }
+    expect((await retry(created.test_id, 0, true)).json().item).toMatchObject({ order_id: created.order_id, payment_status: "paid", expires_at: "2020-01-01T00:00:00.000Z" });
+    expect(service.db.listActivations(created.order_id!)).toHaveLength(1);
+    expect(service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json).toBe(before);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(xApi.createOrder).not.toHaveBeenCalled();
+  });
+  it("does not implicitly renew when eligibility checks cross the original expiry", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    enableRecovery(); const created = await missingQr();
+    const saved = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!;
+    const intent = JSON.parse(String(saved.order_json)); intent.expires_at = new Date(Date.now() + 1_000).toISOString();
+    const before = JSON.stringify(intent);
+    service.db.db.prepare("UPDATE checkout_intents SET order_json=? WHERE client_order_id=?").run(before, created.client_order_id);
+    const original = xApi.eligibility.bind(xApi);
+    vi.spyOn(xApi, "eligibility").mockImplementation(async username => { const result = await original(username); vi.setSystemTime(Date.now() + 2_000); return result; });
+    const response = await retry(created.test_id, 0, false);
+    expect(response.json().item).toMatchObject({ qr_error_code: "renewal_required", qr_retry_requires_renewal: true, qr_available: false,
+      qr_retry_version: 1, expires_at: intent.expires_at });
+    expect(service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)!.order_json).toBe(before);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1); expect(xApi.createOrder).not.toHaveBeenCalled();
+  });
+  it("recovery requires auth and exact confirmation payload; original fields cannot be replaced", async () => {
+    enableRecovery(); const created = await missingQr(); const url = `${prefix}/orders/${created.test_id}/retry-qr`;
+    expect((await service.app.inject({ method: "POST", url, payload: {} })).statusCode).toBe(401);
+    for (const payload of [{ expected_version: 0, confirm_retry: false, confirm_renewal: false },
+      { expected_version: 0, confirm_retry: true, confirm_renewal: false, recipient: "other" },
+      { expected_version: -1, confirm_retry: true, confirm_renewal: false }]) {
+      expect((await service.app.inject({ method: "POST", url, headers: headers(), payload })).statusCode).toBe(400);
+    }
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1);
+  });
 
   it("does not register public partner, old admin, development or refund routes", async () => {
     for (const url of ["/v1/orders", "/api/v1/orders", "/admin/api/test/orders", "/dev/pay/anything", "/api/refunds"]) {

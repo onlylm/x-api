@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { bluevTestPage, bluevTestScript, bluevTestStyles } from "./bluev-test-page.js";
+import { bluevPaymentErrorMessages } from "./bluev-payment-errors.js";
 
 const ORIGIN = "https://api.quefa.cn";
 const FINANCE = "http://app_finance:3100";
@@ -18,6 +19,12 @@ const SAFE_ERRORS: Record<string, string> = {
   idempotency_conflict: "请求号与原测试内容不一致，请勿修改原账号与套餐后重发。",
   test_in_progress: "已有未结束测试，请先核对原单。",
   qr_unavailable: "当前无可支付二维码，请查询原单。",
+  retry_not_allowed: "当前仅能核对原单，不能重取付款码。",
+  retry_busy: "原单正在处理中，请稍后查询原单。",
+  renewal_required: "原付款窗口已到期，需要明确确认续开 20 分钟后才能重取付款码。",
+  retry_conflict: "原单状态已变化，请查询原单后重新核对。",
+  retry_recipient_changed: "原接收账号资格已变化，请仅核对原单，不要重新付款。",
+  retry_fulfillment_unavailable: "原套餐或赠送服务状态已变化，请仅核对原单。",
   sales_paused: "测试新增接单已暂停，仍可查询原单。",
   test_unavailable: "测试暂时不可用，请查询原请求号，勿重复付款。",
   not_found: "测试接口不存在，请联系管理员检查独立连接配置。",
@@ -115,9 +122,18 @@ function orderInput(body: Record<string, unknown>, create: boolean): Record<stri
   }
   return body;
 }
+function qrRetryInput(body: Record<string, unknown>): Record<string, unknown> {
+  const allowed = ["expected_version", "confirm_retry", "confirm_renewal"];
+  if (Object.keys(body).length !== allowed.length || Object.keys(body).some(key => !allowed.includes(key)) ||
+      !Number.isSafeInteger(body.expected_version) || Number(body.expected_version) < 0 ||
+      body.confirm_retry !== true || typeof body.confirm_renewal !== "boolean") {
+    throw new ConsoleError(422, "invalid_argument", "请查询原单状态，并明确确认是否重取原单付款码及续开付款窗口。");
+  }
+  return { expected_version: body.expected_version, confirm_retry: true, confirm_renewal: body.confirm_renewal };
+}
 const ORDER_FIELDS = ["test_id", "request_id", "order_id", "client_order_id", "product", "recipient", "amount", "currency",
   "payment_status", "fulfillment_status", "requires_review", "qr_available", "terminal", "expires_at", "paid_at",
-  "created_at", "updated_at", "upstream_order_id", "detail_zh"];
+  "created_at", "updated_at", "upstream_order_id", "detail_zh", "qr_retry_allowed", "qr_retry_requires_renewal", "qr_retry_version"];
 const STATUS_FIELDS = ["success", "isolated", "ready", "sales_open", "active_test_id", "checked_at"];
 function pick(source: Record<string, unknown>, fields: string[], secret: string): Record<string, unknown> {
   const output: Record<string, unknown> = {};
@@ -135,8 +151,11 @@ function safeItem(value: unknown, key: string): Record<string, unknown> {
       item.currency !== "CNY" || item.amount !== (item.product === "x_premium_6m" ? "44.00" : "22.00") ||
       !["not_created", "unknown", "pending", "paid", "expired", "closed", "refunded"].includes(String(item.payment_status)) ||
       !["not_started", "queued", "running", "success", "failed", "review"].includes(String(item.fulfillment_status)) ||
-      [item.terminal, item.requires_review, item.qr_available].some(flag => typeof flag !== "boolean")) throw new Error("invalid_upstream_item");
-  return pick(item, ORDER_FIELDS, key);
+      [item.terminal, item.requires_review, item.qr_available, item.qr_retry_allowed, item.qr_retry_requires_renewal].some(flag => typeof flag !== "boolean") ||
+      !Number.isSafeInteger(item.qr_retry_version) || Number(item.qr_retry_version) < 0 ||
+      (item.qr_error_code !== null && (typeof item.qr_error_code !== "string" || !Object.hasOwn(bluevPaymentErrorMessages, item.qr_error_code)))) throw new Error("invalid_upstream_item");
+  const code = item.qr_error_code as keyof typeof bluevPaymentErrorMessages | null;
+  return { ...pick(item, ORDER_FIELDS, key), qr_error_code: code, qr_error_zh: code === null ? null : bluevPaymentErrorMessages[code] };
 }
 function safePayload(route: string, value: unknown, key: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || (value as Record<string, unknown>).success !== true) throw new Error("invalid_upstream_response");
@@ -146,7 +165,10 @@ function safePayload(route: string, value: unknown, key: string): Record<string,
       pick(product as Record<string, unknown>, ["product", "name", "amount", "currency", "available"], key)) : [] };
   if (route === "/eligibility") return { ...pick(object, ["product", "recipient", "eligible", "available", "amount", "currency", "detail_zh", "checked_at"], key), success: true };
   if (Array.isArray(object.items)) return { success: true, items: object.items.slice(0, 30).map(item => safeItem(item, key)) };
-  return { success: true, item: safeItem(object.item, key), ...(typeof object.idempotent === "boolean" ? { idempotent: object.idempotent } : {}) };
+  const item = safeItem(object.item, key);
+  const requested = /^\/orders\/([0-9a-f-]+)(?:\/retry-qr)?$/i.exec(route)?.[1];
+  if (requested && String(item.test_id).toLowerCase() !== requested.toLowerCase()) throw new Error("upstream_order_mismatch");
+  return { success: true, item, ...(typeof object.idempotent === "boolean" ? { idempotent: object.idempotent } : {}) };
 }
 
 export function createBluevConsoleServer(config: BluevConsoleConfig, options: { fetch?: typeof fetch } = {}) {
@@ -213,9 +235,12 @@ export function createBluevConsoleServer(config: BluevConsoleConfig, options: { 
         response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); response.end(bluevTestPage); return;
       }
       const route = path.slice(BASE.length);
-      const orderMatch = /^\/orders\/([0-9a-f-]+)(\/qr)?$/i.exec(route);
-      const validGet = route === "/status" || route === "/orders" || (orderMatch && UUID.test(orderMatch[1]));
-      const validPost = route === "/orders" || route === "/eligibility";
+      const orderMatch = /^\/orders\/([0-9a-f-]+)(\/qr|\/retry-qr)?$/i.exec(route);
+      const knownOrder = !!orderMatch && UUID.test(orderMatch[1]);
+      const isQrImage = knownOrder && orderMatch?.[2] === "/qr";
+      const isQrRetry = knownOrder && orderMatch?.[2] === "/retry-qr";
+      const validGet = route === "/status" || route === "/orders" || (knownOrder && !isQrRetry);
+      const validPost = route === "/orders" || route === "/eligibility" || isQrRetry;
       if ((request.method !== "GET" || !validGet) && (request.method !== "POST" || !validPost)) {
         throw new ConsoleError(405, "method_not_allowed", "此测试入口不支持该操作。");
       }
@@ -225,13 +250,13 @@ export function createBluevConsoleServer(config: BluevConsoleConfig, options: { 
         if (request.method !== "GET" || route !== "/orders" || keys.length !== 1 || keys[0] !== "request_id" || !UUID.test(url.searchParams.get("request_id") || "")) throw new ConsoleError(422, "invalid_query", "查询条件无效。");
         suffix += "?request_id=" + url.searchParams.get("request_id");
       }
-      const body = request.method === "POST" ? orderInput(await readJson(request), route === "/orders") : undefined;
+      const body = request.method === "POST" ? (isQrRetry ? qrRetryInput(await readJson(request)) : orderInput(await readJson(request), route === "/orders")) : undefined;
       const result = await fetcher(config.upstreamOrigin + INTERNAL + suffix, {
         method: request.method, redirect: "manual", signal: AbortSignal.timeout(body ? 25000 : 10000),
-        headers: { "X-Bluev-Test-Key": config.testKey, Accept: orderMatch?.[2] ? "image/png" : "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
+        headers: { "X-Bluev-Test-Key": config.testKey, Accept: isQrImage ? "image/png" : "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
         ...(body ? { body: JSON.stringify(body) } : {}),
       });
-      const bytes = await responseBytes(result, orderMatch?.[2] ? 512 * 1024 : 128 * 1024);
+      const bytes = await responseBytes(result, isQrImage ? 512 * 1024 : 128 * 1024);
       if (!result.ok) {
         const status = [400, 404, 409, 422, 429, 503].includes(result.status) ? result.status : 502;
         let code = "test_request_rejected";
@@ -244,7 +269,7 @@ export function createBluevConsoleServer(config: BluevConsoleConfig, options: { 
         throw new ConsoleError(status, code, detail || (route === "/orders" && body
           ? "未确认生成结果。请保留本次请求号并查询原单，不要重复创建。" : "暂时无法完成操作，请检查测试状态或查询原单。"));
       }
-      if (orderMatch?.[2]) {
+      if (isQrImage) {
         if (result.headers.get("content-type")?.split(";")[0] !== "image/png" || !bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error("invalid_qr_response");
         headers(response); response.writeHead(200, { "Content-Type": "image/png" }); response.end(bytes); return;
       }
