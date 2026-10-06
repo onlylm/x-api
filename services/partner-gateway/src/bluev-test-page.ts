@@ -1,4 +1,7 @@
+import { bluevAlipaySettingErrorMessages } from "./bluev-alipay-contract.js";
+
 export const bluevTestStyles = String.raw`
+.page-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 24px;border-bottom:1px solid var(--line)}.page-tabs a{display:block;padding:12px 16px;text-decoration:none;border-bottom:2px solid transparent;min-height:48px}.page-tabs a[aria-current="page"]{color:var(--ink);font-weight:650;border-bottom-color:var(--primary)}.settings-panel{max-width:900px}.settings-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px}.settings-panel textarea{font:inherit;width:100%;min-height:128px;resize:vertical;border-radius:8px;border:1px solid #ccd5e4;padding:12px;background:#f8faff;color:var(--ink);caret-color:var(--primary);overflow-wrap:anywhere}.settings-panel textarea:focus-visible{outline:3px solid var(--primary);outline-offset:3px}.settings-panel textarea::placeholder{color:var(--muted)}.settings-meta{margin:20px 0;padding:16px 0;border-block:1px solid var(--line)}.settings-meta dd{max-width:100%}.settings-panel .field{margin:16px 0}.settings-panel .actions{margin-top:12px}.settings-panel button{white-space:normal}.settings-unsaved{margin:-8px 0 20px;color:var(--warn)}@media(max-width:760px){.settings-fields{grid-template-columns:1fr}.settings-panel input,.settings-panel textarea{font-size:16px}.settings-panel .actions{align-items:stretch}}
 .qr-recovery{border-top:1px solid var(--line);margin-top:24px;padding-top:24px}.qr-recovery h3{font-size:16px;line-height:1.4;margin:0 0 12px}.qr-recovery .check{padding:8px 0}.qr-recovery .check label{padding-bottom:0}.qr-recovery-status{margin:12px 0 0;overflow-wrap:anywhere}.qr-recovery button{max-width:100%;white-space:normal}
 :root{--bg:#f4f6fa;--panel:#fff;--ink:#172033;--muted:#536078;--line:#e4e8ef;--nav:#0c1526;--primary:#2457d6;--primary-soft:#eef3ff;--good:#087a59;--good-soft:#e9f7f1;--warn:#82500b;--warn-soft:#fff4df;--bad:#b53d43;--bad-soft:#fff0f1;--radius:12px}
 *{box-sizing:border-box}html{min-width:320px}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 Inter,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}button,input,select{font:inherit}a{color:var(--primary);text-underline-offset:4px}a:hover{text-decoration-thickness:2px}button,input,select,a{touch-action:manipulation}button,input,select{min-height:44px;border-radius:8px}button{padding:10px 16px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}button:hover{background:var(--primary-soft)}button:active{transform:translateY(1px)}button:disabled{cursor:not-allowed;opacity:.55;transform:none}button.primary{background:var(--primary);border-color:var(--primary);color:var(--panel)}button.primary:hover{background:#1944af}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--primary);outline-offset:3px}input,select{width:100%;padding:10px 12px;background:#f8faff;border:1px solid #ccd5e4;color:var(--ink);caret-color:var(--primary)}input::placeholder{color:var(--muted)}::selection{background:#dbe7ff;color:var(--nav)}*{scrollbar-color:#a3b3cc var(--bg)}[hidden]{display:none!important}
@@ -12,17 +15,25 @@ const API='/admin/api/bluev-test';
 const $=id=>document.getElementById(id);
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const labels={payment:{not_created:'尚未生成付款码',unknown:'付款结果待核对',pending:'等待扫码付款',paid:'已确认到账',expired:'付款已过期',closed:'付款已关闭',refunded:'已退款'},fulfillment:{not_started:'尚未开始',queued:'等待赠送',running:'正在赠送',success:'赠送成功',failed:'赠送失败',review:'结果待核对'}};
-const state={status:null,eligible:null,item:null,requestId:null,draft:null,retryAllowed:false,generation:0,busy:false,polling:false,qrId:null,qrFailed:false,qrBinding:null,qrAttempt:null,qrCheckRequired:false,qrRetryBusy:false};
+const state={status:null,eligible:null,item:null,requestId:null,draft:null,retryAllowed:false,generation:0,busy:false,polling:false,qrId:null,qrFailed:false,qrBinding:null,qrAttempt:null,qrCheckRequired:false,qrRetryBusy:false,closeBusy:false,closeCheckRequired:false,closeBinding:null};
+const alipay={settings:null,dirty:false,saving:false,loading:false,uncertain:false,generation:0,editGeneration:0};
+const alipayErrors=${JSON.stringify(bluevAlipaySettingErrorMessages)};
 function notice(text,error){$('notice').hidden=!text;$('notice').textContent=text;$('notice').className='notice'+(error?' error':'');}
 function save(){try{sessionStorage.setItem('bluev-test-request',JSON.stringify({request_id:state.requestId,draft:state.draft}));}catch{notice('浏览器未允许保存恢复信息，请保留页面上的请求号。',true);}}
 function validDraft(draft,id){return draft&&draft.request_id===id&&uuid.test(id||'')&&['x_premium_3m','x_premium_6m'].includes(draft.product)&&typeof draft.recipient==='string'&&/^@?[A-Za-z0-9_]{1,15}$/.test(draft.recipient)&&draft.confirm_real_payment===true;}
-function updateRetry(){$('retryRequest').disabled=state.busy||!state.retryAllowed||!validDraft(state.draft,state.requestId)||!$('retryConfirm').checked;}
-function pending(){$('orderEmpty').hidden=true;$('pendingRequest').hidden=false;$('pendingRequestId').textContent=state.requestId||'';$('pendingDraft').textContent=state.draft?'原接收账号：'+state.draft.recipient+' · '+(state.draft.product==='x_premium_6m'?'6个月 · ¥44.00':'3个月 · ¥22.00'):'本页没有原请求的账号与套餐快照。请仅查询原单，不要另建请求。';$('retryControls').hidden=!state.retryAllowed||!validDraft(state.draft,state.requestId);updateRetry();}
-function busy(value){state.busy=value;$('eligibility').disabled=value||!!state.requestId;$('product').disabled=value||!!state.requestId;$('recipient').disabled=value||!!state.requestId;$('refreshOrder').disabled=value;$('recoverRequest').disabled=value;$('refreshAll').disabled=value;updateCreate();updateRetry();updateQrRetry();}
+function updateRetry(){$('retryRequest').disabled=state.busy||alipay.saving||!state.retryAllowed||!validDraft(state.draft,state.requestId)||!$('retryConfirm').checked;}
+function pending(){$('orderEmpty').hidden=true;$('pendingRequest').hidden=false;$('pendingRequestId').textContent=state.requestId||'';$('pendingDraft').textContent=state.draft?'原接收账号：'+state.draft.recipient+' · '+(state.draft.product==='x_premium_6m'?'6个月 · ¥44.00':'3个月 · ¥22.00'):'本页没有原请求的账号与套餐快照。请仅查询原单，不要另建请求。';$('retryControls').hidden=!state.retryAllowed||!validDraft(state.draft,state.requestId);updateRetry();testFormStatus();}
+function testFormStatus(){
+  $('testFormLock').hidden=!state.requestId;
+  $('testFormLock').textContent=!state.requestId?'':state.item&&state.item.terminal?'当前原单已结束。可先填写下一笔账号，再点击原单区域“开始下一笔测试”解除关联，重新检查接收资格。':state.item?'当前仍关联原单 '+state.item.recipient+'。你可以填写下一笔账号草稿，但须先核对或安全关闭原单，才能检查资格和创建新测试。':'正在核对已保存的原请求号。你可以填写下一笔账号草稿；请先在原请求区域查询，当前不会创建新测试。';
+}
+function busy(value){state.busy=value;$('eligibility').disabled=value||alipay.saving||!!state.requestId;$('product').disabled=value||alipay.saving;$('recipient').disabled=value||alipay.saving;$('refreshOrder').disabled=value;$('recoverRequest').disabled=value;$('refreshAll').disabled=value;updateCreate();updateRetry();updateQrRetry();updateClose();testFormStatus();settingsControls();}
+function canClose(){const item=state.item;return !!item&&item.payment_status==='unknown'&&!item.qr_available&&!item.terminal&&item.fulfillment_status==='not_started'&&!!item.order_id;}
+function updateClose(){$('closeTestArea').hidden=!canClose();$('closeTest').disabled=state.busy||alipay.saving||state.closeCheckRequired||!canClose()||!$('closeTestConfirm').checked;$('closeTestConfirm').disabled=state.busy||alipay.saving||state.closeCheckRequired;$('closeTest').textContent=state.closeBusy?'正在核对付款状态并关闭…':'核对并关闭此测试';$('closeTestArea').setAttribute('aria-busy',state.closeBusy?'true':'false');}
 function qrVersion(item){return !!item&&Number.isSafeInteger(item.qr_retry_version)&&item.qr_retry_version>=0;}
 function saveQrAttempt(){try{sessionStorage.setItem('bluev-test-qr-attempt',JSON.stringify(state.qrAttempt));}catch{notice('无法保存本次重取记录。请保留原请求号，先查询原单再操作。',true);}}
 function clearQrConfirmation(){$('qrRetryConfirm').checked=false;$('qrRenewalConfirm').checked=false;}
-function updateQrRetry(){const item=state.item;const allowed=item&&item.qr_retry_allowed===true&&qrVersion(item)&&!item.qr_available&&!item.terminal;const renewal=!!item&&item.qr_retry_requires_renewal===true;$('requestQrRetry').disabled=state.busy||state.qrCheckRequired||!allowed||!$('qrRetryConfirm').checked||(renewal&&!$('qrRenewalConfirm').checked);$('requestQrRetry').textContent=state.qrRetryBusy?'正在核对并重取原单付款码…':renewal?'确认续开 20 分钟并重取原单码':'确认重取原单付款码';$('qrRetryConfirm').disabled=state.busy||state.qrCheckRequired;$('qrRenewalConfirm').disabled=state.busy||state.qrCheckRequired;$('qrRecovery').setAttribute('aria-busy',state.qrRetryBusy?'true':'false');}
+function updateQrRetry(){const item=state.item;const allowed=item&&item.qr_retry_allowed===true&&qrVersion(item)&&!item.qr_available&&!item.terminal;const renewal=!!item&&item.qr_retry_requires_renewal===true;$('requestQrRetry').disabled=state.busy||alipay.saving||state.qrCheckRequired||!allowed||!$('qrRetryConfirm').checked||(renewal&&!$('qrRenewalConfirm').checked);$('requestQrRetry').textContent=state.qrRetryBusy?'正在核对并重取原单付款码…':renewal?'确认续开 20 分钟并重取原单码':'确认重取原单付款码';$('qrRetryConfirm').disabled=state.busy||alipay.saving||state.qrCheckRequired;$('qrRenewalConfirm').disabled=state.busy||alipay.saving||state.qrCheckRequired;$('qrRecovery').setAttribute('aria-busy',state.qrRetryBusy?'true':'false');}
 function qrRecovery(item,confirmedRead){
   const binding=item.test_id+'|'+item.qr_retry_version+'|'+(item.qr_retry_requires_renewal===true);
   if(state.qrBinding!==binding){state.qrBinding=binding;clearQrConfirmation();$('qrRetryStatus').textContent='';}
@@ -38,17 +49,74 @@ function qrRecovery(item,confirmedRead){
   updateQrRetry();
 }
 function ready(){const value=state.status;return value&&value.isolated===true&&value.ready===true&&value.sales_open===true;}
-function updateCreate(){const match=state.eligible&&state.eligible.product===$('product').value&&state.eligible.recipient.replace(/^@/,'').toLowerCase()===$('recipient').value.trim().replace(/^@/,'').toLowerCase();$('create').disabled=state.busy||!!state.requestId||!ready()||!match||!state.eligible.eligible||!state.eligible.available||!$('confirm').checked;}
+function updateCreate(){const match=state.eligible&&state.eligible.product===$('product').value&&state.eligible.recipient.replace(/^@/,'').toLowerCase()===$('recipient').value.trim().replace(/^@/,'').toLowerCase();$('create').disabled=state.busy||alipay.saving||!!state.requestId||!ready()||!match||!state.eligible.eligible||!state.eligible.available||!$('confirm').checked;}
 function invalidate(){state.eligible=null;$('confirm').checked=false;$('eligibilityResult').textContent='先检查接收账号，再确认生成付款码。';$('amount').textContent=$('product').value==='x_premium_6m'?'¥44.00':'¥22.00';updateCreate();}
-async function api(path,method,body){const response=await fetch(API+path,{method:method||'GET',credentials:'same-origin',cache:'no-store',headers:body?{'Content-Type':'application/json'}:undefined,body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(30000)});let data;try{data=await response.json();}catch{throw new Error('返回内容异常，请查询原单，不要重复创建。');}if(response.status===401){$('login').hidden=false;state.status=null;updateCreate();throw new Error('登录已失效，请返回原后台重新登录。');}if(!response.ok||data.success!==true)throw new Error(data.detail_zh||'操作未确认，请查询原单。');return data;}
+async function api(path,method,body){const response=await fetch(API+path,{method:method||'GET',credentials:'same-origin',cache:'no-store',headers:body?{'Content-Type':'application/json'}:undefined,body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(30000)});let data;try{data=await response.json();}catch{throw new Error('返回内容异常，请查询原单，不要重复创建。');}if(response.status===401){$('login').hidden=false;state.status=null;updateCreate();const error=new Error('登录已失效，请返回原后台重新登录。');error.code='login_required';throw error;}if(!response.ok||data.success!==true){const error=new Error(data.detail_zh||'操作未确认，请查询原单。');error.code=data.error;throw error;}return data;}
 function input(){return{product:$('product').value,recipient:$('recipient').value.trim()};}
 async function status(){const data=await api('/status');state.status=data;$('serviceStatus').textContent=ready()?'测试接单已就绪；只有你确认后才会生成付款码。':'测试接单尚未开放或服务未就绪，不会创建订单。';updateCreate();if(!state.requestId&&uuid.test(data.active_test_id||'')){state.generation++;state.requestId=data.active_test_id;save();pending();await recover();}}
 function date(value){if(!value)return'—';const parsed=new Date(value);return Number.isFinite(parsed.getTime())?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',dateStyle:'short',timeStyle:'medium',hour12:false}).format(parsed):'—';}
+function settingsNotice(text,error){$('alipayNotice').hidden=!text;$('alipayNotice').textContent=text;$('alipayNotice').className='notice'+(error?' error':'');}
+function settingsValues(){return{app_id:$('alipayAppId').value.trim(),seller_id:$('alipaySellerId').value.trim(),private_key:$('alipayPrivateKey').value.trim(),public_key:$('alipayPublicKey').value.trim()};}
+function settingsValidation(){
+  if(!alipay.settings)return'请先读取当前配置。';
+  const value=settingsValues();
+  if(!/^\d{16}$/.test(value.app_id)||!/^\d{16}$/.test(value.seller_id))return'应用 App ID 和收款商户 PID 都应为 16 位数字。';
+  const changed=value.app_id!==alipay.settings.app_id||value.seller_id!==alipay.settings.seller_id;
+  if(changed&&(!value.private_key||!value.public_key))return'更换应用或收款商户时，必须同时填写应用私钥和支付宝公钥。';
+  if((!alipay.settings.has_private_key&&!value.private_key)||(!alipay.settings.has_public_key&&!value.public_key))return'首次配置必须填写应用私钥和支付宝公钥。';
+  if(value.private_key.length>8192||value.public_key.length>8192)return'密钥内容过长，请核对是否只粘贴了对应密钥。';
+  return'';
+}
+function settingsControls(){
+  const locked=alipay.saving||alipay.loading,validation=settingsValidation();
+  for(const id of ['alipayAppId','alipaySellerId','alipayPrivateKey','alipayPublicKey','alipayConfirm'])$(id).disabled=locked||!alipay.settings;
+  $('saveAlipay').disabled=locked||state.busy||alipay.uncertain||!!validation||!$('alipayConfirm').checked;
+  $('saveAlipay').textContent=alipay.saving?'正在保存支付宝配置…':'确认并保存配置';
+  $('refreshAlipay').disabled=locked;$('refreshAlipay').textContent=alipay.loading?'正在读取配置…':'读取最新配置';
+  $('discardAlipay').disabled=locked;$('discardAlipay').hidden=!alipay.dirty&&!alipay.uncertain;
+  $('discardAlipay').textContent=alipay.uncertain?'清空输入并核对已保存配置':'放弃未保存修改并重新读取';
+  $('alipayForm').setAttribute('aria-busy',locked?'true':'false');
+  $('alipayFieldHint').textContent=validation||'应用与商户未变时，密钥留空会保留服务器已保存的对应密钥。更换身份时须同时提供两份密钥。';
+  $('alipayUnsaved').hidden=!alipay.dirty&&!alipay.saving&&!alipay.uncertain;
+  $('alipayUnsaved').textContent=alipay.saving?'支付宝配置正在保存，请保留本页。':alipay.uncertain?'支付宝配置保存结果尚未核对；请回到配置页读取已保存状态。':'支付宝配置有未保存修改。切换页签不会提交；刷新或关闭页面会丢失输入。';
+}
+function settingsEdited(){
+  alipay.editGeneration++;const value=settingsValues();
+  alipay.dirty=!!value.private_key||!!value.public_key||!alipay.settings||value.app_id!==alipay.settings.app_id||value.seller_id!==alipay.settings.seller_id;
+  $('alipayConfirm').checked=false;settingsControls();
+}
+function showSettings(settings){
+  alipay.settings=settings;alipay.dirty=false;alipay.uncertain=false;
+  $('alipayAppId').value=settings.app_id;$('alipaySellerId').value=settings.seller_id;
+  $('alipayPrivateKey').value='';$('alipayPublicKey').value='';$('alipayConfirm').checked=false;
+  $('alipayPrivateState').textContent=settings.has_private_key?'已保存；留空保留，不会回显':'尚未保存，请填写';
+  $('alipayPublicState').textContent=settings.has_public_key?'已保存；留空保留，不会回显':'尚未保存，请填写';
+  $('alipayNotify').textContent=settings.notify_url;$('alipayRevision').textContent=String(settings.revision);
+  $('alipayUpdated').textContent=date(settings.updated_at)+'（北京时间）';settingsControls();
+}
+function settingsError(error){return error&&Object.hasOwn(alipayErrors,error.code)?alipayErrors[error.code]:error&&error.code==='login_required'?'登录已失效，请返回 Quefa 后台重新登录。':'配置服务暂时无法确认结果，请读取已保存配置后再操作；不会自动重试保存。';}
+async function loadAlipay(discard){
+  if(alipay.saving||alipay.loading)return;
+  if((alipay.dirty||alipay.uncertain)&&!discard){settingsNotice('当前仍有未保存输入或未确认的保存结果。请使用下方“清空/放弃输入并重新读取”，避免覆盖你的填写内容。',true);return;}
+  if(discard){$('alipayPrivateKey').value='';$('alipayPublicKey').value='';$('alipayConfirm').checked=false;alipay.dirty=false;alipay.editGeneration++;}
+  const generation=++alipay.generation,editGeneration=alipay.editGeneration;alipay.loading=true;settingsControls();settingsNotice('正在读取服务器已保存的配置；不会返回任何密钥内容。');
+  try{
+    const data=await api('/settings/alipay');
+    if(generation!==alipay.generation)return;
+    if(editGeneration!==alipay.editGeneration){settingsNotice('读取配置期间表单已发生修改。已保留输入内容，本次没有覆盖表单；请核对后再操作。',true);return;}
+    showSettings(data.settings);settingsNotice('已读取当前配置。格式校验不等于当面付可用，保存后仍需手动测试生成付款码。');
+  }catch(error){if(generation===alipay.generation)settingsNotice(settingsError(error),true);}
+  finally{if(generation===alipay.generation){alipay.loading=false;settingsControls();}}
+}
+function chooseView(){const settings=window.location.hash==='#alipay';$('testView').hidden=settings;$('alipayView').hidden=!settings;$('testTab').setAttribute('aria-current',settings?'false':'page');$('alipayTab').setAttribute('aria-current',settings?'page':'false');if(settings&&!alipay.settings&&!alipay.loading)loadAlipay(false);}
 function hideQr(){state.qrId=null;state.qrFailed=false;$('qrArea').hidden=true;$('qr').removeAttribute('src');}
 function show(item,confirmedRead){
   if(!uuid.test(item.test_id||'')||item.request_id!==item.test_id)throw new Error('订单标识异常，请联系管理员核对。');
   if(state.requestId!==item.request_id){state.generation++;state.qrAttempt=null;state.qrCheckRequired=false;saveQrAttempt();}
   state.item=item;state.requestId=item.request_id;state.retryAllowed=false;
+  const closeBinding=item.test_id+'|'+item.payment_status+'|'+item.terminal;
+  if(state.closeBinding!==closeBinding){state.closeBinding=closeBinding;$('closeTestConfirm').checked=false;}
+  if(confirmedRead)state.closeCheckRequired=false;
   if(state.draft&&state.draft.request_id!==item.request_id)state.draft=null;
   save();$('orderEmpty').hidden=true;$('orderBody').hidden=false;$('pendingRequest').hidden=true;
   $('requestId').textContent=item.request_id;$('orderId').textContent=item.order_id||(item.payment_status==='not_created'?'未创建支付订单':'等待支付服务确认');
@@ -67,8 +135,8 @@ async function recover(){if(!state.requestId)return true;const requested=state.r
 async function refresh(){if(!state.requestId)return true;if(state.busy||state.polling)return false;const requested=state.requestId,generation=state.generation;state.polling=true;try{if(state.item){const data=await api('/orders/'+encodeURIComponent(state.item.test_id));if(state.requestId!==requested||state.generation!==generation)return false;show(data.item,true);return true;}return await recover();}catch(error){if(state.requestId===requested&&state.generation===generation)notice(error.message,true);return false;}finally{state.polling=false;}}
 function cell(row,text){const td=document.createElement('td');td.textContent=text;row.append(td);return td;}
 async function history(){const data=await api('/orders');const body=$('historyRows');body.replaceChildren();$('historyEmpty').hidden=(data.items||[]).length>0;$('historyEmpty').textContent='暂无测试记录。创建后的测试单会保留在这里。';for(const item of data.items||[]){const row=document.createElement('tr');cell(row,item.recipient+' · '+(item.product==='x_premium_6m'?'6个月':'3个月'));cell(row,'¥'+item.amount);cell(row,labels.payment[item.payment_status]||'待核对');cell(row,labels.fulfillment[item.fulfillment_status]||'待核对');cell(row,date(item.created_at));const button=document.createElement('button');button.type='button';button.textContent='查看原单';button.onclick=async()=>{if(state.busy)return;if(state.requestId&&state.requestId!==item.request_id&&(!state.item||!state.item.terminal)){notice('请先核对当前未结束的测试单，避免遗漏未知付款。',true);return;}const generation=state.generation;try{const data=await api('/orders/'+encodeURIComponent(item.test_id));if(state.generation!==generation)return;show(data.item);$('currentOrder').scrollIntoView({block:'start'});}catch(error){if(state.generation===generation)notice(error.message,true);}};cell(row,'').append(button);body.append(row);}}
-$('form').onsubmit=async event=>{event.preventDefault();if(state.busy||state.requestId)return;busy(true);notice('');try{const data=await api('/eligibility','POST',input());state.eligible=data;$('eligibilityResult').textContent=data.detail_zh||((data.eligible&&data.available)?'账号可接收该套餐，请核对后确认。':'账号或套餐暂不符合条件。');$('confirm').checked=false;}catch(error){state.eligible=null;notice(error.message,true);}finally{busy(false);}};
-async function submitDraft(){if(state.busy||!validDraft(state.draft,state.requestId))return;state.retryAllowed=false;$('retryConfirm').checked=false;pending();busy(true);notice('正在核对原请求并生成付款码。请求号已保留，请勿重复提交。');try{const data=await api('/orders','POST',state.draft);if(data.item.request_id!==state.requestId)throw new Error('返回的原请求号不匹配，请联系管理员核对。');show(data.item);notice(data.item.payment_status==='not_created'&&data.item.terminal?'本次未发起付款，原记录已保留。可点击“开始下一笔测试”，重新检查资格后再确认。':'订单已记录。只有你用支付宝扫码付款后，才会产生真实收款与赠送。');await history().catch(error=>notice('当前测试单已保留；历史列表暂未更新：'+error.message,true));}catch(error){notice(error.message,true);$('orderBody').hidden=true;hideQr();}finally{busy(false);}}
+$('form').onsubmit=async event=>{event.preventDefault();if(state.busy||alipay.saving||state.requestId)return;busy(true);notice('');try{const data=await api('/eligibility','POST',input());state.eligible=data;$('eligibilityResult').textContent=data.detail_zh||((data.eligible&&data.available)?'账号可接收该套餐，请核对后确认。':'账号或套餐暂不符合条件。');$('confirm').checked=false;}catch(error){state.eligible=null;notice(error.message,true);}finally{busy(false);}};
+async function submitDraft(){if(state.busy||alipay.saving||!validDraft(state.draft,state.requestId))return;state.retryAllowed=false;$('retryConfirm').checked=false;pending();busy(true);notice('正在核对原请求并生成付款码。请求号已保留，请勿重复提交。');try{const data=await api('/orders','POST',state.draft);if(data.item.request_id!==state.requestId)throw new Error('返回的原请求号不匹配，请联系管理员核对。');show(data.item);notice(data.item.payment_status==='not_created'&&data.item.terminal?'本次未发起付款，原记录已保留。可点击“开始下一笔测试”，重新检查资格后再确认。':'订单已记录。只有你用支付宝扫码付款后，才会产生真实收款与赠送。');await history().catch(error=>notice('当前测试单已保留；历史列表暂未更新：'+error.message,true));}catch(error){notice(error.message,true);$('orderBody').hidden=true;hideQr();}finally{busy(false);}}
 $('create').onclick=async()=>{updateCreate();if($('create').disabled)return;state.generation++;state.requestId=crypto.randomUUID();state.item=null;state.draft={...input(),request_id:state.requestId,confirm_real_payment:true};save();await submitDraft();};
 $('retryConfirm').onchange=updateRetry;$('retryRequest').onclick=async()=>{updateRetry();if(!$('retryRequest').disabled)await submitDraft();};
 $('qrRetryConfirm').onchange=updateQrRetry;$('qrRenewalConfirm').onchange=updateQrRetry;
@@ -97,20 +165,58 @@ $('newTest').onclick=()=>{if(!state.item||!state.item.terminal||state.busy)retur
 $('qr').onerror=()=>{state.qrFailed=true;$('qrError').hidden=false;$('qr').hidden=true;};
 $('qr').onload=()=>{state.qrFailed=false;$('qrError').hidden=true;$('qr').hidden=false;};
 $('retryQr').onclick=()=>{if(state.item&&state.item.qr_available){state.qrId=null;show(state.item);}};
+$('closeTestConfirm').onchange=updateClose;
+$('closeTest').onclick=async()=>{
+  updateClose();if($('closeTest').disabled)return;
+  const requested=state.item.test_id,generation=++state.generation;state.closeBusy=true;$('closeTestConfirm').checked=false;busy(true);notice('正在核对这笔原单是否确实未付款。只有满足安全条件才会关闭测试。');
+  try{
+    const data=await api('/orders/'+encodeURIComponent(requested)+'/close','POST',{confirm_close:true});
+    if(state.requestId!==requested||state.generation!==generation)return;
+    if(!data.item||data.item.request_id!==requested)throw new Error('返回的原单标识不一致，请继续查询原单。');
+    state.closeCheckRequired=false;show(data.item);notice(data.item.payment_status==='closed'&&data.item.terminal?'此测试已关闭，历史记录保留。点击“开始下一笔测试”后，可重新检查账号并下单。':'原单状态已更新，请继续核对收款与赠送结果。');
+  }catch(error){if(state.requestId===requested&&state.generation===generation){state.closeCheckRequired=true;notice(error.message+' 请先查询原单状态，不要强行重复下单。',true);}}
+  finally{if(state.requestId===requested&&state.generation===generation){state.closeBusy=false;busy(false);}}
+};
+for(const id of ['alipayAppId','alipaySellerId','alipayPrivateKey','alipayPublicKey'])$(id).oninput=settingsEdited;
+$('alipayConfirm').onchange=settingsControls;
+$('refreshAlipay').onclick=()=>loadAlipay(false);
+$('discardAlipay').onclick=()=>loadAlipay(true);
+$('alipayForm').onsubmit=async event=>{
+  event.preventDefault();settingsControls();if($('saveAlipay').disabled)return;
+  const generation=++alipay.generation,editGeneration=alipay.editGeneration;
+  const payload={...settingsValues(),expected_revision:alipay.settings.revision,confirm_apply:true};
+  alipay.saving=true;$('alipayConfirm').checked=false;busy(state.busy);settingsNotice('正在保存到蓝 V 独立配置。此操作不会发起交易，也不会开启接单。');
+  try{
+    const data=await api('/settings/alipay','POST',payload);
+    if(generation!==alipay.generation)return;
+    if(editGeneration!==alipay.editGeneration){alipay.uncertain=true;settingsNotice('保存返回时表单已发生变化。已保留新输入，请先核对服务器已保存配置。',true);return;}
+    showSettings(data.settings);settingsNotice('配置已保存，密钥输入已清空。没有发起交易或开启接单；请返回“赠送测试”手动验证付款码。');
+  }catch(error){
+    if(generation!==alipay.generation)return;
+    alipay.uncertain=!['bluev_alipay_invalid_request','bluev_alipay_keys_required','bluev_alipay_invalid_private_key','bluev_alipay_invalid_public_key','bluev_alipay_invalid_config'].includes(error&&error.code);
+    settingsNotice(settingsError(error)+(alipay.uncertain?' 本页不会自动重试保存，请先核对已保存状态。':' 输入内容已保留，修改后请重新勾选保存确认。'),true);
+  }finally{payload.private_key='';payload.public_key='';if(generation===alipay.generation){alipay.saving=false;busy(state.busy);}}
+};
+window.addEventListener('hashchange',chooseView);
+window.addEventListener('beforeunload',event=>{if(alipay.dirty||alipay.saving||alipay.uncertain){event.preventDefault();event.returnValue='';}});
+window.addEventListener('pagehide',()=>{$('alipayPrivateKey').value='';$('alipayPublicKey').value='';$('alipayConfirm').checked=false;});
 try{const saved=JSON.parse(sessionStorage.getItem('bluev-test-request')||'null');if(saved&&uuid.test(saved.request_id||'')){state.requestId=saved.request_id;if(validDraft(saved.draft,state.requestId)){state.draft={product:saved.draft.product,recipient:saved.draft.recipient,request_id:state.requestId,confirm_real_payment:true};$('recipient').value=state.draft.recipient;$('product').value=state.draft.product;}}}catch{}
 try{const attempt=JSON.parse(sessionStorage.getItem('bluev-test-qr-attempt')||'null');if(attempt&&attempt.request_id===state.requestId&&Number.isSafeInteger(attempt.expected_version)&&attempt.expected_version>=0&&attempt.confirm_retry===true&&typeof attempt.confirm_renewal==='boolean'){state.qrAttempt={request_id:attempt.request_id,expected_version:attempt.expected_version,confirm_retry:true,confirm_renewal:attempt.confirm_renewal};state.qrCheckRequired=true;}}catch{}
-busy(false);invalidate();if(state.requestId)pending();(async()=>{for(const action of [status,history,recover])try{await action();}catch(error){notice(error.message,true);}})();
+busy(false);invalidate();if(state.requestId)pending();chooseView();(async()=>{for(const action of [status,history,recover])try{await action();}catch(error){notice(error.message,true);}})();
 setInterval(()=>{if(!document.hidden&&state.requestId&&(!state.item||!state.item.terminal))refresh();},5000);
 })();
 `;
 
 export const bluevTestPage = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>蓝 V 独立测试 · Quefa</title><style>${bluevTestStyles}</style></head><body>
 <header class="top"><div><strong>Quefa 商户中心</strong><span>蓝 V 独立联调</span></div><a href="/admin#sandbox">返回联调沙箱</a></header>
-<main class="wrap"><div class="lead"><h1>蓝 V 测试</h1><p class="muted">3个月 ¥22.00 · 6个月 ¥44.00。独立测试记录，不列入正式平台订单，不影响 ChatGPT 业务。</p></div>
+<main class="wrap"><div class="lead"><h1>蓝 V 独立联调</h1><p class="muted">仅管理蓝 V 测试与独立收款配置，不修改原有 ChatGPT、京东或 X 业务配置。</p></div>
+<nav class="page-tabs" aria-label="蓝 V 联调功能"><a id="testTab" href="#test" aria-current="page">赠送测试</a><a id="alipayTab" href="#alipay">支付宝配置</a></nav>
+<p class="settings-unsaved" id="alipayUnsaved" role="status" hidden></p><p id="login" hidden><a href="/admin#sandbox">返回后台重新登录</a>，然后再打开本测试页。</p>
+<section id="testView" aria-label="蓝 V 赠送测试"><p class="muted">3个月 ¥22.00 · 6个月 ¥44.00。独立测试记录，不列入正式平台订单。</p>
 <p class="notice warn">这是真实交易测试，不是模拟支付。扫码会产生真实支付宝收款，付款后可能产生真实会员赠送及上游扣款。仅使用你已获授权的账号；本页不会自动付款或修改正式销售开关。</p>
-<p id="serviceStatus" class="muted" role="status">正在核验测试服务…</p><p id="login" hidden><a href="/admin#sandbox">返回后台重新登录</a>，然后再打开本测试页。</p><div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+<p id="serviceStatus" class="muted" role="status">正在核验测试服务…</p><div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
 <ol class="steps"><li><strong>1</strong> 检查接收资格</li><li><strong>2</strong> 确认生成付款码</li><li><strong>3</strong> 核对收款与赠送</li></ol>
-<div class="grid"><section class="panel" aria-labelledby="setupTitle"><h2 id="setupTitle">接收账号与套餐</h2><p class="muted">只需 X 用户名，不需要密码或 Session。</p>
+<div class="grid"><section class="panel" aria-labelledby="setupTitle"><h2 id="setupTitle">新测试：账号与套餐</h2><p class="muted">只需 X 用户名，不需要密码或 Session。</p><p class="notice warn" id="testFormLock" role="status" hidden></p>
 <form id="form"><div class="field"><label for="recipient">X 用户名</label><input id="recipient" name="recipient" placeholder="例如 @username" required maxlength="16" pattern="@?[A-Za-z0-9_]{1,15}" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="recipientHint"><small id="recipientHint">请核对完整用户名，不要填写昵称或主页链接。</small></div>
 <div class="field"><label for="product">测试套餐</label><select id="product" name="product"><option value="x_premium_3m">X Premium · 3个月</option><option value="x_premium_6m">X Premium · 6个月</option></select></div>
 <div class="summary"><span>本次支付宝实收</span><strong class="price" id="amount">¥22.00</strong></div><div class="actions"><button id="eligibility" type="submit">检查接收资格</button></div></form>
@@ -121,6 +227,16 @@ export const bluevTestPage = `<!doctype html><html lang="zh-CN"><head><meta char
 <div id="orderBody" hidden><div class="status-pair" aria-live="polite" aria-atomic="true"><div><span>支付宝收款</span><strong id="paymentStatus">待核对</strong></div><div><span>会员赠送</span><strong id="giftStatus">尚未开始</strong></div></div><dl><div><dt>接收账号</dt><dd id="orderRecipient"></dd></div><div><dt>套餐</dt><dd id="orderProduct"></dd></div><div><dt>实收金额</dt><dd id="orderAmount"></dd></div><div><dt>支付订单</dt><dd id="orderId"></dd></div><div><dt>原请求号</dt><dd id="requestId"></dd></div><div><dt>赠送订单</dt><dd id="upstreamId"></dd></div><div><dt>付款有效期</dt><dd id="expiry"></dd></div></dl><p class="notice" id="orderMessage"></p>
 <div class="qr-area" id="qrArea" hidden><img id="qr" width="216" height="216" alt="本测试订单的支付宝付款二维码"><p>使用支付宝扫码。请再次核对金额与接收账号。</p><div id="qrError" role="status" hidden><p>付款码已生成，但二维码图片加载失败。重新加载只读取原码，不会请求新付款码。</p><button id="retryQr" type="button">重新加载二维码图片</button></div></div>
 <section class="qr-recovery" id="qrRecovery" aria-labelledby="qrRecoveryTitle" aria-busy="false" hidden><h3 id="qrRecoveryTitle">付款码尚未就绪</h3><p id="qrServiceMessage" role="status"></p><div id="qrRetryControls" hidden><p class="muted" id="qrRetrySummary"></p><div class="check"><input id="qrRetryConfirm" type="checkbox" aria-describedby="qrRetrySummary"><label for="qrRetryConfirm">我已核对原订单、接收账号和金额，确认仅重取这笔原单的付款码。</label></div><div class="check" id="qrRenewalControl" hidden><input id="qrRenewalConfirm" type="checkbox"><label for="qrRenewalConfirm">原付款窗口已到期，我同意为这笔原单续开 20 分钟，再手动扫码付款。</label></div><button id="requestQrRetry" type="button" disabled>确认重取原单付款码</button></div><p class="muted qr-recovery-status" id="qrRetryStatus" role="status" aria-live="polite"></p></section>
+<section class="qr-recovery" id="closeTestArea" aria-labelledby="closeTestTitle" aria-busy="false" hidden><h3 id="closeTestTitle">结束这笔未付款测试</h3><p class="muted" id="closeTestHint">未取得付款码且付款窗口已结束时，可核对并关闭测试。服务器会向支付宝验签查询原单，已付款、结果不明或窗口仍有效时不能关闭。关闭只保留历史并释放测试名额，不退款、不重新付款。</p><div class="check"><input id="closeTestConfirm" type="checkbox" aria-describedby="closeTestHint"><label for="closeTestConfirm">确认仅在服务器证实安全的情况下关闭当前原测试，保留历史记录。</label></div><button id="closeTest" type="button" disabled>核对并关闭此测试</button></section>
 <div class="actions"><button id="refreshOrder" type="button">查询原单状态</button><button id="newTest" type="button" disabled>开始下一笔测试</button></div><small id="orderUpdated"></small></div></section></div>
 <section class="panel history" aria-labelledby="historyTitle"><div class="history-head"><div><h2 id="historyTitle">最近测试单</h2><p class="muted">仅独立蓝 V 测试单。刷新页面后仍可从这里继续核对。</p></div><button id="refreshAll" type="button">刷新状态</button></div><div id="historyEmpty" class="empty">正在读取测试记录…</div><div class="table-scroll"><table><thead><tr><th>接收账号 / 套餐</th><th>金额</th><th>收款</th><th>赠送</th><th>创建时间（北京）</th><th>操作</th></tr></thead><tbody id="historyRows"></tbody></table></div></section>
-<footer>本页为独立测试记录，不混入正式平台订单。收款成功不等于赠送成功。遇到结果未知时，保留原请求号并查询原单；不要重复付款或换账号重下。</footer></main><script>${bluevTestScript}</script></body></html>`;
+<footer>本页为独立测试记录，不混入正式平台订单。收款成功不等于赠送成功。遇到结果未知时，保留原请求号并查询原单；不要重复付款或换账号重下。</footer></section>
+<section id="alipayView" class="panel settings-panel" aria-labelledby="alipayTitle" hidden><div class="history-head"><div><h2 id="alipayTitle">支付宝收款配置</h2><p class="muted">用于本系统蓝 V 独立测试的支付宝当面付。</p></div><button id="refreshAlipay" type="button">读取最新配置</button></div>
+<p class="notice warn">仅修改蓝 V 独立收款配置，不改动原有京东、ChatGPT 或 X 服务。保存不会发起支付、重取付款码或开启接单；格式通过不代表真实出码已验收。</p>
+<dl class="settings-meta"><div><dt>异步通知地址</dt><dd id="alipayNotify">正在读取…</dd></div><div><dt>配置版本</dt><dd id="alipayRevision">—</dd></div><div><dt>保存时间</dt><dd id="alipayUpdated">—</dd></div></dl>
+<form id="alipayForm" autocomplete="off" aria-busy="false"><div class="settings-fields"><div class="field"><label for="alipayAppId">应用 App ID（16 位）</label><input id="alipayAppId" type="text" inputmode="numeric" maxlength="16" pattern="[0-9]{16}" required autocomplete="off" spellcheck="false" disabled></div><div class="field"><label for="alipaySellerId">收款商户 PID（16 位）</label><input id="alipaySellerId" type="text" inputmode="numeric" maxlength="16" pattern="[0-9]{16}" required autocomplete="off" spellcheck="false" disabled></div></div>
+<div class="settings-fields"><div class="field"><label for="alipayPrivateKey">应用私钥（RSA2）</label><textarea id="alipayPrivateKey" rows="5" maxlength="8192" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="alipayPrivateState alipayFieldHint" placeholder="粘贴 PEM 或裸 Base64 私钥；不会回填" disabled></textarea><small id="alipayPrivateState">正在读取是否已保存…</small></div><div class="field"><label for="alipayPublicKey">支付宝公钥（RSA2）</label><textarea id="alipayPublicKey" rows="5" maxlength="8192" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="alipayPublicState alipayFieldHint" placeholder="粘贴支付宝公钥，不是应用公钥" disabled></textarea><small id="alipayPublicState">正在读取是否已保存…</small></div></div>
+<p class="muted" id="alipayFieldHint" role="status">请先读取当前配置。</p><p class="muted">密钥仅随本次保存请求提交，不存入浏览器存储。保存成功会清空输入框；已保存密钥不会由服务端返回。</p>
+<div class="check"><input id="alipayConfirm" type="checkbox" disabled><label for="alipayConfirm">我确认将此配置用于蓝 V 独立测试收款，并已核对应用与收款商户；本次只保存配置，不发起交易或开启接单。</label></div>
+<div class="actions"><button id="saveAlipay" type="submit" class="primary" disabled>确认并保存配置</button><button id="discardAlipay" type="button" hidden>放弃未保存修改并重新读取</button><a href="#test">返回赠送测试</a></div></form><div id="alipayNotice" class="notice" role="status" aria-live="polite" hidden></div>
+</section></main><script>${bluevTestScript}</script></body></html>`;

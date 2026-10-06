@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { bluevTestPage, bluevTestScript, bluevTestStyles } from "./bluev-test-page.js";
 import { bluevPaymentErrorMessages } from "./bluev-payment-errors.js";
+import { bluevAlipaySettingErrorMessages } from "./bluev-alipay-contract.js";
 
 const ORIGIN = "https://api.quefa.cn";
 const FINANCE = "http://app_finance:3100";
@@ -11,6 +12,7 @@ const INTERNAL = "/internal/bluev-test";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PRODUCTS = new Set(["x_premium_3m", "x_premium_6m"]);
 const SAFE_ERRORS: Record<string, string> = {
+  ...bluevAlipaySettingErrorMessages,
   unauthorized: "测试服务身份校验失败，请联系管理员检查独立连接配置。",
   rate_limited: "请求过于频繁，请稍后查询原单。",
   json_required: "测试请求格式不正确，请刷新本页面。",
@@ -25,6 +27,10 @@ const SAFE_ERRORS: Record<string, string> = {
   retry_conflict: "原单状态已变化，请查询原单后重新核对。",
   retry_recipient_changed: "原接收账号资格已变化，请仅核对原单，不要重新付款。",
   retry_fulfillment_unavailable: "原套餐或赠送服务状态已变化，请仅核对原单。",
+  close_not_allowed: "此原单不符合关闭条件，可能已付款或已生成付款码，请继续核对原单。",
+  close_busy: "原单正在处理中，请稍后查询状态。",
+  close_payment_unknown: "尚不能证实此原单未付款，不能强行关闭；请继续核对。",
+  close_window_open: "原付款窗口尚未结束，暂不能关闭；请保留原单核对。",
   sales_paused: "测试新增接单已暂停，仍可查询原单。",
   test_unavailable: "测试暂时不可用，请查询原请求号，勿重复付款。",
   not_found: "测试接口不存在，请联系管理员检查独立连接配置。",
@@ -93,7 +99,7 @@ function sendJson(response: ServerResponse, status: number, body: unknown): void
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
 }
-async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(request: IncomingMessage, limit = 4096): Promise<Record<string, unknown>> {
   if (request.headers.origin !== ORIGIN) throw new ConsoleError(403, "origin_rejected", "请从 Quefa 后台发起此操作。");
   if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(request.headers["content-type"] || "")) {
     throw new ConsoleError(415, "json_required", "请求必须使用 JSON 格式。");
@@ -104,7 +110,7 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
   for await (const chunk of request) {
     const bytes = Buffer.from(chunk);
     length += bytes.length;
-    if (length > 4096) throw new ConsoleError(413, "body_too_large", "提交内容过长。");
+    if (length > limit) throw new ConsoleError(413, "body_too_large", "提交内容过长。");
     chunks.push(bytes);
   }
   try {
@@ -130,6 +136,25 @@ function qrRetryInput(body: Record<string, unknown>): Record<string, unknown> {
     throw new ConsoleError(422, "invalid_argument", "请查询原单状态，并明确确认是否重取原单付款码及续开付款窗口。");
   }
   return { expected_version: body.expected_version, confirm_retry: true, confirm_renewal: body.confirm_renewal };
+}
+function alipaySettingsInput(body: Record<string, unknown>): Record<string, unknown> {
+  const allowed = ["app_id", "seller_id", "private_key", "public_key", "expected_revision", "confirm_apply"];
+  if (Object.keys(body).length !== allowed.length || Object.keys(body).some(key => !allowed.includes(key)) ||
+      typeof body.app_id !== "string" || !/^\d{16}$/.test(body.app_id) ||
+      typeof body.seller_id !== "string" || !/^\d{16}$/.test(body.seller_id) ||
+      typeof body.private_key !== "string" || body.private_key.length > 8192 ||
+      typeof body.public_key !== "string" || body.public_key.length > 8192 ||
+      !Number.isSafeInteger(body.expected_revision) || Number(body.expected_revision) < 1 || body.confirm_apply !== true) {
+    throw new ConsoleError(422, "bluev_alipay_invalid_request", bluevAlipaySettingErrorMessages.bluev_alipay_invalid_request);
+  }
+  return { app_id: body.app_id, seller_id: body.seller_id, private_key: body.private_key, public_key: body.public_key,
+    expected_revision: body.expected_revision, confirm_apply: true };
+}
+function closeTestInput(body: Record<string, unknown>): Record<string, unknown> {
+  if (Object.keys(body).length !== 1 || body.confirm_close !== true) {
+    throw new ConsoleError(422, "invalid_argument", "请明确确认仅核对并安全关闭当前测试，不能强行关闭付款结果不明的订单。");
+  }
+  return { confirm_close: true };
 }
 const ORDER_FIELDS = ["test_id", "request_id", "order_id", "client_order_id", "product", "recipient", "amount", "currency",
   "payment_status", "fulfillment_status", "requires_review", "qr_available", "terminal", "expires_at", "paid_at",
@@ -157,16 +182,31 @@ function safeItem(value: unknown, key: string): Record<string, unknown> {
   const code = item.qr_error_code as keyof typeof bluevPaymentErrorMessages | null;
   return { ...pick(item, ORDER_FIELDS, key), qr_error_code: code, qr_error_zh: code === null ? null : bluevPaymentErrorMessages[code] };
 }
+function safeAlipaySettings(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_alipay_settings");
+  const settings = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(settings.revision) || Number(settings.revision) < 1 ||
+      typeof settings.app_id !== "string" || !/^\d{16}$/.test(settings.app_id) ||
+      typeof settings.seller_id !== "string" || !/^\d{16}$/.test(settings.seller_id) ||
+      typeof settings.has_private_key !== "boolean" || typeof settings.has_public_key !== "boolean" ||
+      settings.notify_url !== "https://x.aifu.me/bluev-sandbox/callbacks/alipay" ||
+      typeof settings.updated_at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(settings.updated_at) ||
+      !Number.isFinite(Date.parse(settings.updated_at))) throw new Error("invalid_alipay_settings");
+  return { revision: settings.revision, app_id: settings.app_id, seller_id: settings.seller_id,
+    has_private_key: settings.has_private_key, has_public_key: settings.has_public_key,
+    notify_url: settings.notify_url, updated_at: settings.updated_at };
+}
 function safePayload(route: string, value: unknown, key: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || (value as Record<string, unknown>).success !== true) throw new Error("invalid_upstream_response");
   const object = value as Record<string, unknown>;
+  if (route === "/settings/alipay") return { success: true, settings: safeAlipaySettings(object.settings) };
   if (route === "/status") return { ...pick(object, STATUS_FIELDS, key), success: true,
     products: Array.isArray(object.products) ? object.products.slice(0, 2).map(product =>
       pick(product as Record<string, unknown>, ["product", "name", "amount", "currency", "available"], key)) : [] };
   if (route === "/eligibility") return { ...pick(object, ["product", "recipient", "eligible", "available", "amount", "currency", "detail_zh", "checked_at"], key), success: true };
   if (Array.isArray(object.items)) return { success: true, items: object.items.slice(0, 30).map(item => safeItem(item, key)) };
   const item = safeItem(object.item, key);
-  const requested = /^\/orders\/([0-9a-f-]+)(?:\/retry-qr)?$/i.exec(route)?.[1];
+  const requested = /^\/orders\/([0-9a-f-]+)(?:\/retry-qr|\/close)?$/i.exec(route)?.[1];
   if (requested && String(item.test_id).toLowerCase() !== requested.toLowerCase()) throw new Error("upstream_order_mismatch");
   return { success: true, item, ...(typeof object.idempotent === "boolean" ? { idempotent: object.idempotent } : {}) };
 }
@@ -235,12 +275,14 @@ export function createBluevConsoleServer(config: BluevConsoleConfig, options: { 
         response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); response.end(bluevTestPage); return;
       }
       const route = path.slice(BASE.length);
-      const orderMatch = /^\/orders\/([0-9a-f-]+)(\/qr|\/retry-qr)?$/i.exec(route);
+      const orderMatch = /^\/orders\/([0-9a-f-]+)(\/qr|\/retry-qr|\/close)?$/i.exec(route);
       const knownOrder = !!orderMatch && UUID.test(orderMatch[1]);
       const isQrImage = knownOrder && orderMatch?.[2] === "/qr";
       const isQrRetry = knownOrder && orderMatch?.[2] === "/retry-qr";
-      const validGet = route === "/status" || route === "/orders" || (knownOrder && !isQrRetry);
-      const validPost = route === "/orders" || route === "/eligibility" || isQrRetry;
+      const isCloseTest = knownOrder && orderMatch?.[2] === "/close";
+      const isAlipaySettings = route === "/settings/alipay";
+      const validGet = route === "/status" || route === "/orders" || isAlipaySettings || (knownOrder && !isQrRetry && !isCloseTest);
+      const validPost = route === "/orders" || route === "/eligibility" || isQrRetry || isAlipaySettings || isCloseTest;
       if ((request.method !== "GET" || !validGet) && (request.method !== "POST" || !validPost)) {
         throw new ConsoleError(405, "method_not_allowed", "此测试入口不支持该操作。");
       }
@@ -250,7 +292,8 @@ export function createBluevConsoleServer(config: BluevConsoleConfig, options: { 
         if (request.method !== "GET" || route !== "/orders" || keys.length !== 1 || keys[0] !== "request_id" || !UUID.test(url.searchParams.get("request_id") || "")) throw new ConsoleError(422, "invalid_query", "查询条件无效。");
         suffix += "?request_id=" + url.searchParams.get("request_id");
       }
-      const body = request.method === "POST" ? (isQrRetry ? qrRetryInput(await readJson(request)) : orderInput(await readJson(request), route === "/orders")) : undefined;
+      const body = request.method === "POST" ? (isAlipaySettings ? alipaySettingsInput(await readJson(request, 16384))
+        : isQrRetry ? qrRetryInput(await readJson(request)) : isCloseTest ? closeTestInput(await readJson(request)) : orderInput(await readJson(request), route === "/orders")) : undefined;
       const result = await fetcher(config.upstreamOrigin + INTERNAL + suffix, {
         method: request.method, redirect: "manual", signal: AbortSignal.timeout(body ? 25000 : 10000),
         headers: { "X-Bluev-Test-Key": config.testKey, Accept: isQrImage ? "image/png" : "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
@@ -266,7 +309,8 @@ export function createBluevConsoleServer(config: BluevConsoleConfig, options: { 
           const knownCode = errorBody?.error?.code;
           if (typeof knownCode === "string" && Object.hasOwn(SAFE_ERRORS, knownCode)) { code = knownCode; detail = SAFE_ERRORS[knownCode]; }
         } catch { /* Never relay unstructured upstream errors. */ }
-        throw new ConsoleError(status, code, detail || (route === "/orders" && body
+        throw new ConsoleError(status, code, detail || (isAlipaySettings
+          ? "配置结果暂时无法确认，请读取服务器已保存配置后再操作。" : route === "/orders" && body
           ? "未确认生成结果。请保留本次请求号并查询原单，不要重复创建。" : "暂时无法完成操作，请检查测试状态或查询原单。"));
       }
       if (isQrImage) {
@@ -286,7 +330,9 @@ export function createBluevConsoleServer(config: BluevConsoleConfig, options: { 
       }
       sendJson(response, known ? error.status : 503, { success: false,
         error: known ? error.code : "temporarily_unavailable",
-        detail_zh: known ? error.message : "连接暂时中断。若已提交，请保留请求号并查询原单，不要重新下单。" });
+        detail_zh: known ? error.message : request.url?.split("?")[0] === BASE + "/settings/alipay"
+          ? "连接暂时中断。若已提交配置，请读取服务器已保存状态后再操作，不要重复提交。"
+          : "连接暂时中断。若已提交，请保留请求号并查询原单，不要重新下单。" });
     } finally { if (admitted) inFlight--; }
   });
   server.requestTimeout = 35000; server.headersTimeout = 10000; server.keepAliveTimeout = 5000;

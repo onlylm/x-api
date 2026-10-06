@@ -13,7 +13,8 @@ import { normalizeXUsername, xGiftProductCode } from "./domain.js";
 import type { PaymentClient, PaymentConfirmation } from "./clients/payment.js";
 import { createXApiClient, type XApiClient } from "./clients/x-api.js";
 import { MockZovoClient } from "./clients/zovo.js";
-import { BluevSandboxPaymentClient, describeBluevPaymentError, type BluevRecoveryPayment } from "./bluev-sandbox-payment.js";
+import { describeBluevPaymentError, type BluevRecoveryPayment } from "./bluev-sandbox-payment.js";
+import { BluevAlipaySettings, BluevAlipayPaymentRouter, BluevAlipaySettingsError, type BluevAlipayClientFactory } from "./bluev-alipay-settings.js";
 import { decryptValue, secureEqual } from "./security.js";
 import { renderQrPng } from "./qr-image.js";
 import { OrderService, BusinessError } from "./services/order-service.js";
@@ -34,6 +35,7 @@ const listInput = z.object({ request_id: UUID.optional() }).strict();
 const pathInput = z.object({ id: UUID }).strict();
 const retryInput = z.object({ expected_version: z.number().int().min(0).max(1_000_000),
   confirm_retry: z.literal(true), confirm_renewal: z.boolean() }).strict();
+const closeInput = z.object({ confirm_close: z.literal(true) }).strict();
 
 export interface BluevSandboxConfig extends AppConfig {
   bluevSandbox: true;
@@ -131,7 +133,7 @@ export function openBluevSandboxDatabase(config: BluevSandboxConfig): AppDatabas
 }
 
 type RequestRow = { request_id: string; client_order_id: string; product: string; recipient: string;
-  state: "creating" | "created" | "rejected" | "review"; created_at: string; updated_at: string };
+  state: "creating" | "created" | "rejected" | "review" | "closed"; created_at: string; updated_at: string };
 export interface BluevTestOrder {
   test_id: string; request_id: string; order_id: string | null; client_order_id: string; product: string;
   recipient: string; amount: string; currency: "CNY";
@@ -144,6 +146,7 @@ export interface BluevTestOrder {
 }
 
 type PaymentState = { retry_version: number; error_code: string | null; error_zh: string | null; attempted_at: string | null };
+type TestClosure = { closed_at: string; late_paid_at: string | null; late_trade_no: string | null };
 
 function fulfillment(activation: ActivationRecord | undefined, needsReview: boolean): BluevTestOrder["fulfillment_status"] {
   if (!activation) return "not_started";
@@ -172,6 +175,15 @@ export class BluevSandboxOrders {
       request_id TEXT PRIMARY KEY, retry_version INTEGER NOT NULL DEFAULT 0,
       error_code TEXT, error_zh TEXT, attempted_at TEXT
     )`);
+    db.db.exec(`CREATE TABLE IF NOT EXISTS bluev_test_closures (
+      request_id TEXT PRIMARY KEY, closed_at TEXT NOT NULL, reason TEXT NOT NULL,
+      late_paid_at TEXT, late_trade_no TEXT, late_receipt_amount TEXT
+    )`);
+  }
+
+  private closure(id: string): TestClosure | undefined {
+    return this.db.db.prepare("SELECT closed_at,late_paid_at,late_trade_no FROM bluev_test_closures WHERE request_id=?")
+      .get(id) as TestClosure | undefined;
   }
 
   private paymentState(id: string): PaymentState {
@@ -211,31 +223,33 @@ export class BluevSandboxOrders {
     const row = this.row(id);
     if (!row) throw new BusinessError(404, "test_not_found", "测试记录不存在");
     const order = this.order(row), intent = order ? undefined : this.intent(row);
+    const closure = this.closure(id);
     const activation = order ? this.db.listActivations(order.order_id).at(-1) : undefined;
     const control = activation ? this.db.db.prepare("SELECT needs_review FROM activation_worker_control WHERE activation_id=?").get(activation.id) : undefined;
-    const status = fulfillment(activation, Boolean(control?.needs_review));
-    const paymentStatus: BluevTestOrder["payment_status"] = order
+    const status = closure?.late_paid_at ? "review" : fulfillment(activation, Boolean(control?.needs_review));
+    const paymentStatus: BluevTestOrder["payment_status"] = closure ? (closure.late_paid_at ? "paid" : "closed") : order
       ? (order.status === "pending" && order.expires_at <= new Date().toISOString() ? "expired" : order.status)
       : row.state === "rejected" && !intent ? "not_created" : "unknown";
     const terminal = paymentStatus === "not_created" || ["closed", "refunded"].includes(paymentStatus) || ["success", "failed"].includes(status);
     const review = status === "review" || ["unknown", "expired"].includes(paymentStatus);
     const paymentState = this.paymentState(id);
-    const canRetry = !order && Boolean(intent) && this.supportsRecovery() && this.retryIdle(row) &&
+    const canRetry = !closure && !order && Boolean(intent) && this.supportsRecovery() && this.retryIdle(row) &&
       (!paymentState.attempted_at || Date.now() - Date.parse(paymentState.attempted_at) >= 30_000);
     return {
       test_id: id, request_id: id, order_id: order?.order_id ?? intent?.order_id ?? null, client_order_id: row.client_order_id,
       product: row.product, recipient: `@${row.recipient}`, amount: price(row.product), currency: "CNY",
       payment_status: paymentStatus, fulfillment_status: status, requires_review: review,
       qr_available: paymentStatus === "pending" && Boolean(order?.qr), terminal,
-      expires_at: order?.expires_at ?? intent?.expires_at ?? null, paid_at: order?.paid_at ?? null,
-      created_at: row.created_at, updated_at: [row.updated_at, order?.updated_at ?? "", activation?.updated_at ?? ""].sort().at(-1)!,
+      expires_at: order?.expires_at ?? intent?.expires_at ?? null, paid_at: closure?.late_paid_at ?? order?.paid_at ?? null,
+      created_at: row.created_at, updated_at: [row.updated_at, order?.updated_at ?? "", activation?.updated_at ?? "", closure?.closed_at ?? "", closure?.late_paid_at ?? ""].sort().at(-1)!,
       upstream_order_id: activation?.upstream_order_id ?? null,
-      qr_error_code: !order && intent ? paymentState.error_code ?? "payment_result_unknown" : null,
-      qr_error_zh: !order && intent ? paymentState.error_zh ?? "付款码尚未保存，付款结果仍需核对。请勿新建订单重复付款。" : null,
+      qr_error_code: !closure && !order && intent ? paymentState.error_code ?? "payment_result_unknown" : null,
+      qr_error_zh: !closure && !order && intent ? paymentState.error_zh ?? "付款码尚未保存，付款结果仍需核对。请勿新建订单重复付款。" : null,
       qr_retry_allowed: canRetry,
-      qr_retry_requires_renewal: Boolean(intent && intent.expires_at <= new Date().toISOString()),
+      qr_retry_requires_renewal: !closure && Boolean(intent && intent.expires_at <= new Date().toISOString()),
       qr_retry_version: paymentState.retry_version,
-      detail_zh: intent ? "尚未取得可用付款码。可手动核验原单后重取；系统不会自动重新发起支付请求。" :
+      detail_zh: closure ? (closure.late_paid_at ? "已关闭测试收到晚到账通知，已暂停自动赠送，请人工核对。" : "已核验原交易不存在并关闭测试，历史记录保留，可开始下一笔。") :
+        intent ? "尚未取得可用付款码。可手动核验原单后重取；系统不会自动重新发起支付请求。" :
         review ? "结果尚未确认，只核对原单，请勿重复付款或赠送。" :
         status === "success" ? "赠送已确认成功。" : status === "failed" ? "赠送已明确失败，请人工处理已收款项。" :
         paymentStatus === "paid" ? "已确认收款，等待自动赠送。" : paymentStatus === "pending" ? "请扫描原订单二维码付款。" :
@@ -291,6 +305,7 @@ export class BluevSandboxOrders {
     const claimed = this.db.transaction(() => {
       const row = this.row(id);
       if (!row) throw new BusinessError(404, "test_not_found", "测试记录不存在");
+      if (this.closure(id)) throw new BusinessError(409, "retry_not_allowed", "原测试已关闭，不能再次请求付款码");
       const state = this.paymentState(id);
       if (input.expected_version < state.retry_version) return false;
       if (input.expected_version !== state.retry_version) throw new BusinessError(409, "retry_conflict", "原单状态已变化，请先查询原单");
@@ -408,6 +423,53 @@ export class BluevSandboxOrders {
     const path = this.config.partnerSalesGateFile;
     return existsSync(path) && !lstatSync(path).isSymbolicLink() && lstatSync(path).isFile();
   }
+  /** Close only an unmaterialized, verified non-existent trade; never delete its intent or issue a refund. */
+  async closeTest(id: string): Promise<{ item: BluevTestOrder; idempotent: boolean }> {
+    const token = randomUUID();
+    const original = this.db.transaction(() => {
+      const row = this.row(id);
+      if (!row) throw new BusinessError(404, "test_not_found", "测试记录不存在");
+      if (this.closure(id)) return undefined;
+      const candidate = this.intent(row);
+      if (this.order(row) || !candidate || !this.supportsRecovery() || candidate.status !== "pending" ||
+          candidate.paid_at || candidate.alipay_trade_no || candidate.qr) {
+        throw new BusinessError(409, "close_not_allowed", "此测试已有付款记录或无法安全关闭，请继续核对原单");
+      }
+      if (!this.retryIdle(row)) throw new BusinessError(409, "close_busy", "原单仍在处理中，请稍后核对并关闭");
+      // An unknown precreate may finish late. A permission error from a later retry cannot prove
+      // that an earlier attempt will never settle; require original expiry plus a safety margin.
+      const expiry = Date.parse(candidate.expires_at);
+      if (!Number.isFinite(expiry) || expiry + 60_000 > Date.now()) {
+        throw new BusinessError(409, "close_window_open", "原付款窗口尚未结束，请等待到期后核对，不能直接释放可能付款的订单");
+      }
+      this.db.db.prepare("UPDATE bluev_test_requests SET query_lease=?,query_lease_until=? WHERE request_id=?")
+        .run(token, new Date(Date.now() + 60_000).toISOString(), id);
+      return candidate;
+    });
+    if (!original) return { item: this.item(id), idempotent: true };
+    const owns = () => Boolean(this.db.db.prepare("SELECT 1 FROM bluev_test_requests WHERE request_id=? AND query_lease=? AND query_lease_until>?")
+      .get(id, token, new Date().toISOString()));
+    try {
+      let result: Awaited<ReturnType<BluevRecoveryPayment["queryForRecovery"]>>;
+      try { result = await (this.payment as BluevRecoveryPayment).queryForRecovery(original); }
+      catch { throw new BusinessError(409, "close_payment_unknown", "支付宝原单结果尚未核实，未关闭测试，请继续核对"); }
+      this.db.transaction(() => {
+        const row = this.row(id)!;
+        if (!owns() || this.order(row) || JSON.stringify(this.intent(row)) !== JSON.stringify(original)) {
+          throw new BusinessError(409, "close_busy", "原单状态已变化，请重新查询后再决定");
+        }
+        if (result.confirmation.paid || result.state !== "not_found" || result.confirmation.tradeNo || result.confirmation.tradeStatus) {
+          throw new BusinessError(409, "close_payment_unknown", "支付宝原交易存在或结果尚未核实，未关闭测试，请继续核对");
+        }
+        const now = new Date().toISOString();
+        this.db.db.prepare("INSERT INTO bluev_test_closures(request_id,closed_at,reason) VALUES(?,?,'verified_trade_not_found')").run(id, now);
+        this.setState(id, "closed");
+      });
+      return { item: this.item(id), idempotent: false };
+    } finally {
+      this.db.db.prepare("UPDATE bluev_test_requests SET query_lease=NULL,query_lease_until=NULL WHERE request_id=? AND query_lease=?").run(id, token);
+    }
+  }
   qr(id: string): string {
     const item = this.item(id);
     if (!item.qr_available) throw new BusinessError(409, "qr_unavailable", "当前无可支付二维码，请查询原单");
@@ -417,7 +479,20 @@ export class BluevSandboxOrders {
     if (!result.paid || typeof result.tradeNo !== "string" || !result.tradeNo.trim() || result.tradeNo.length > 128 ||
         !["TRADE_SUCCESS", "TRADE_FINISHED"].includes(result.tradeStatus ?? "") ||
         !Number.isFinite(Date.parse(result.paidAt))) throw new Error("payment_confirmation_invalid");
-    this.db.transaction(() => { if (!this.order(row)) this.db.createOrder(candidate); });
+    const retired = this.db.transaction(() => {
+      const existing = this.closure(row.request_id);
+      if (existing) {
+        if (existing.late_trade_no && existing.late_trade_no !== result.tradeNo) throw new Error("payment_trade_conflict");
+        // Share the same write transaction with materialization: another connection cannot close
+        // between checking the retirement marker and creating an automatically fulfilled order.
+        this.db.db.prepare("UPDATE bluev_test_closures SET late_paid_at=?,late_trade_no=?,late_receipt_amount=? WHERE request_id=?")
+          .run(result.paidAt, result.tradeNo, result.receiptAmount, row.request_id);
+        return true;
+      }
+      if (!this.order(row)) this.db.createOrder(candidate);
+      return false;
+    });
+    if (retired) return;
     const existing = this.order(row)!;
     if (existing.status === "paid" && existing.alipay_trade_no !== result.tradeNo) throw new Error("payment_trade_conflict");
     this.db.markOrderPaid(candidate.order_id, result.paidAt, result.tradeNo, result.receiptAmount);
@@ -446,12 +521,14 @@ export class BluevSandboxOrders {
     const rows = this.db.db.prepare(`SELECT t.request_id,t.client_order_id,t.product,t.recipient,t.state,t.created_at,t.updated_at
       FROM bluev_test_requests t JOIN checkout_intents i ON i.client_order_id=t.client_order_id
       LEFT JOIN orders o ON o.client_order_id=t.client_order_id
-      WHERE o.order_id IS NULL AND t.next_check<=? AND (t.query_lease_until IS NULL OR t.query_lease_until<=?)
+      WHERE o.order_id IS NULL AND NOT EXISTS(SELECT 1 FROM bluev_test_closures c WHERE c.request_id=t.request_id)
+      AND t.next_check<=? AND (t.query_lease_until IS NULL OR t.query_lease_until<=?)
       AND (i.lease_until IS NULL OR i.lease_until<=?) ORDER BY t.next_check LIMIT 1`).all(now, now, now) as unknown as RequestRow[];
     for (const row of rows) {
       const token = randomUUID();
       const claimed = this.db.db.prepare(`UPDATE bluev_test_requests SET query_lease=?,query_lease_until=?
-        WHERE request_id=? AND (query_lease_until IS NULL OR query_lease_until<=?)`)
+        WHERE request_id=? AND (query_lease_until IS NULL OR query_lease_until<=?)
+        AND NOT EXISTS(SELECT 1 FROM bluev_test_closures c WHERE c.request_id=bluev_test_requests.request_id)`)
         .run(token, new Date(Date.now() + 60_000).toISOString(), row.request_id, now).changes;
       if (!claimed) continue;
       let candidate: OrderRecord | undefined;
@@ -468,7 +545,10 @@ export class BluevSandboxOrders {
           .get(row.request_id, token, new Date().toISOString())) continue;
         if (result.paid) this.acceptPaid(row, candidate, result);
         else this.setState(row.request_id, "review");
-      } catch { this.setState(row.request_id, "review"); }
+      } catch {
+        if (!this.closure(row.request_id) && this.db.db.prepare("SELECT 1 FROM bluev_test_requests WHERE request_id=? AND query_lease=? AND query_lease_until>?")
+          .get(row.request_id, token, new Date().toISOString())) this.setState(row.request_id, "review");
+      }
       finally {
         clearInterval(heartbeat);
         const expiredFor = candidate ? Date.now() - Date.parse(candidate.expires_at) : 0;
@@ -483,20 +563,27 @@ export class BluevSandboxOrders {
 function price(product: string): string { return product === "x_premium_3m" ? "22.00" : "44.00"; }
 const RETRY_ERRORS = new Set(["retry_not_allowed", "retry_busy", "renewal_required", "retry_conflict",
   "retry_recipient_changed", "retry_fulfillment_unavailable", "sales_paused"]);
+const CLOSE_ERRORS = new Set(["close_not_allowed", "close_busy", "close_payment_unknown", "close_window_open"]);
 
-export interface BluevSandboxOptions { payment?: PaymentClient; xApi?: XApiClient; startWorkers?: boolean }
+export interface BluevSandboxOptions {
+  payment?: PaymentClient; xApi?: XApiClient; startWorkers?: boolean;
+  /** Test-only factory: production never accepts an injected payment implementation. */
+  alipayClientFactory?: BluevAlipayClientFactory;
+}
 export async function buildBluevSandbox(config: BluevSandboxConfig, options: BluevSandboxOptions = {}): Promise<{
   app: FastifyInstance; db: AppDatabase; tests: BluevSandboxOrders; paymentReconciler: XPaymentReconciler; activationWorker: ActivationWorker;
 }> {
   validateSandboxPaths(config);
   if (!/^[A-Za-z0-9_-]{32,256}$/.test(config.bluevTestKey) || config.platformWebhookEnabled !== false ||
       JSON.stringify(config.products) !== JSON.stringify(bluevSandboxProducts()) ||
-      (config.nodeEnv !== "test" && (options.payment || options.xApi || options.startWorkers === false))) throw new Error("bluev_sandbox_configuration_invalid");
+      (config.nodeEnv !== "test" && (options.payment || options.xApi || options.alipayClientFactory || options.startWorkers === false))) throw new Error("bluev_sandbox_configuration_invalid");
   const app = Fastify({ logger: false, trustProxy: false, bodyLimit: 16 * 1024, requestTimeout: 35_000 });
   await app.register(formbody);
   const db = openBluevSandboxDatabase(config);
   db.seedProducts(bluevSandboxProducts());
-  const payment = options.payment ?? new BluevSandboxPaymentClient(config.alipay);
+  const alipaySettings = !options.payment || options.alipayClientFactory
+    ? new BluevAlipaySettings(db, config.alipay, config.sessionEncryptionKey, options.alipayClientFactory) : undefined;
+  const payment = options.payment ?? new BluevAlipayPaymentRouter(alipaySettings!);
   const xApi = options.xApi ?? createXApiClient(config);
   const zovo = new MockZovoClient(); // No GPT route, SKU, upstream key or worker task can enter this isolated DB.
   const orders = new OrderService(db, payment, zovo, xApi, { encryptionKey: config.sessionEncryptionKey, hmacKey: config.emailHmacKey }, config.partnerSalesGateFile);
@@ -519,13 +606,23 @@ export async function buildBluevSandbox(config: BluevSandboxConfig, options: Blu
   });
   app.addHook("onResponse", async request => { if (admitted.delete(request)) inFlight -= 1; });
   app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof BluevAlipaySettingsError) return reply.code(error.httpStatus).send({ success: false,
+      error: { code: error.code, message: error.message } });
     if (error instanceof ZodError) return reply.code(400).send({ success: false, error: { code: "invalid_request", message: "测试请求格式不正确" } });
-    const safe = error instanceof BusinessError && (["test_not_found", "idempotency_conflict", "test_in_progress", "qr_unavailable", "sales_paused"].includes(error.code) || RETRY_ERRORS.has(error.code));
+    const safe = error instanceof BusinessError && (["test_not_found", "idempotency_conflict", "test_in_progress", "qr_unavailable", "sales_paused"].includes(error.code) || RETRY_ERRORS.has(error.code) || CLOSE_ERRORS.has(error.code));
     return reply.code(safe ? error.httpStatus : 503).send({ success: false, error: {
       code: safe ? error.code : "test_unavailable", message: safe ? error.message : "测试暂时不可用，请查询原请求号，勿重复付款" } });
   });
   app.setNotFoundHandler((_request, reply) => reply.code(404).send({ success: false, error: { code: "not_found", message: "接口不存在" } }));
   app.get("/health", async () => ({ success: true, service: "bluev-sandbox", isolated: true }));
+  app.get("/internal/bluev-test/settings/alipay", async () => {
+    if (!alipaySettings) throw new Error("settings_not_available_with_mock_payment");
+    return { success: true, settings: alipaySettings.read() };
+  });
+  app.post("/internal/bluev-test/settings/alipay", async request => {
+    if (!alipaySettings) throw new Error("settings_not_available_with_mock_payment");
+    return { success: true, settings: alipaySettings.save(request.body) };
+  });
   app.get("/internal/bluev-test/status", async () => {
     const sales = salesOpen();
     const products = await Promise.all(bluevSandboxProducts().map(async product => ({
@@ -552,6 +649,10 @@ export async function buildBluevSandbox(config: BluevSandboxConfig, options: Blu
   app.get("/internal/bluev-test/orders", async request => ({ success: true, items: tests.list(listInput.parse(request.query).request_id) }));
   app.post("/internal/bluev-test/orders/:id/retry-qr", async request => ({ success: true,
     ...await tests.retryQr(pathInput.parse(request.params).id, retryInput.parse(request.body)) }));
+  app.post("/internal/bluev-test/orders/:id/close", async request => {
+    closeInput.parse(request.body);
+    return { success: true, ...await tests.closeTest(pathInput.parse(request.params).id) };
+  });
   app.get("/internal/bluev-test/orders/:id", async request => ({ success: true, item: tests.item(pathInput.parse(request.params).id) }));
   app.get("/internal/bluev-test/orders/:id/qr", async (request, reply) => reply.type("image/png").send(await renderQrPng(tests.qr(pathInput.parse(request.params).id))));
   app.post("/callbacks/alipay", async (request, reply) => {

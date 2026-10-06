@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tarfile
@@ -362,7 +363,7 @@ class PrepareAndGuardTests(unittest.TestCase):
                 archive.addfile(member, io.BytesIO(content))
         self.mod = types.SimpleNamespace(ROOT=self.root, CONFIG=self.config, STATE=self.install_path,
             CADDYFILE=self.proxy, REQUIRED=required, inspect=lambda _: copy.deepcopy(self.original),
-            old_health=Mock(), validate_network=Mock())
+            old_health=Mock(), validate_network=Mock(), public_checks=Mock())
         self.args = types.SimpleNamespace(role='console', from_sha=OLD, to_sha=NEW,
             artifact=str(self.artifact), sha256=common.fingerprint(self.artifact), proxy_sha256=common.fingerprint(self.proxy))
         def fake_run(args, **kwargs):
@@ -427,6 +428,271 @@ class PrepareAndGuardTests(unittest.TestCase):
         (Path(state['release']) / 'dist/bluev-test-page.js').write_text('unexpected change')
         with self.assertRaisesRegex(common.DeployError, 'new_release_changed'):
             up.assert_guard(state)
+
+    def installed_parent(self):
+        up.prepare(self.args)
+        parent = up.read_state(self.args)
+        parent['status'] = 'installed'; parent['candidate_id'] = NEW_ID
+        parent['scripts'] = {'upgrade-bluev-test.py': 'historical-script-hash-must-not-match-current'}
+        parent.pop('parent', None)  # The real 3d9 release used v1 parentless records.
+        up.record(parent)
+        self.original = container(parent, True)
+        self.original['State']['Running'] = True
+        self.args.from_sha = NEW; self.args.to_sha = 'f' * 40
+        return parent
+
+    def test_continuous_prepare_uses_active_parent_id_and_keeps_initial_state(self):
+        parent = self.installed_parent()
+        parent_path = up.state_path('console', NEW)
+        parent_bytes = parent_path.read_bytes()
+        up.prepare(self.args)
+        child = up.read_state(self.args)
+        self.assertEqual(child['parent'], {'kind': 'upgrade', 'release_id': NEW,
+                                          'sha256': common.sha(parent_bytes)})
+        self.assertEqual(child['old_release'], parent['release'])
+        self.assertEqual(child['old_container_id'], NEW_ID)
+        self.assertNotEqual(child['old_container_id'], OLD_ID)
+        self.assertEqual(self.install_path.read_bytes(), self.install_bytes)
+        self.assertEqual(parent_path.read_bytes(), parent_bytes)
+        up.assert_guard(child)
+
+    def test_changed_parent_record_invalidates_child_even_if_only_whitespace(self):
+        self.installed_parent(); up.prepare(self.args)
+        child = up.read_state(self.args)
+        path = up.state_path('console', NEW)
+        path.write_bytes(path.read_bytes() + b'\n')
+        with self.assertRaisesRegex(common.DeployError, 'upgrade_parent_changed'):
+            up.assert_guard(child)
+
+    def test_current_script_change_is_rejected_but_historical_script_change_is_not_compared(self):
+        self.installed_parent(); up.prepare(self.args)
+        child = up.read_state(self.args)
+        up.assert_guard(child)
+        with patch.object(up, 'scripts', return_value={'newer-unreviewed-script': 'changed'}):
+            with self.assertRaisesRegex(common.DeployError, 'upgrade_script_changed'):
+                up.assert_guard(child)
+
+    def test_parent_must_be_installed_and_its_active_container_must_match(self):
+        parent = self.installed_parent()
+        parent['status'] = 'rolled_back'; up.record(parent)
+        with self.assertRaisesRegex(common.DeployError, 'previous_upgrade_not_installed'):
+            up.prepare(self.args)
+        parent['status'] = 'installed'; up.record(parent)
+        self.original['Id'] = OLD_ID
+        with self.assertRaisesRegex(common.DeployError, 'sidecar_identity_changed'):
+            up.prepare(self.args)
+
+    def test_parent_chain_cannot_change_protected_baseline(self):
+        parent = self.installed_parent()
+        parent['baseline'] = {'forged': True}; up.record(parent)
+        with self.assertRaisesRegex(common.DeployError, 'protected_service_or_configuration_changed'):
+            up.prepare(self.args)
+
+    def test_changed_historical_release_is_rejected(self):
+        self.installed_parent()
+        (self.root / 'releases' / OLD / 'dist/bluev-test-console-server.js').write_text('tampered old code')
+        with self.assertRaisesRegex(common.DeployError, 'old_release_changed'):
+            up.prepare(self.args)
+
+    def test_child_container_id_is_anchored_to_parent_candidate_not_first_install(self):
+        self.installed_parent(); up.prepare(self.args)
+        child = up.read_state(self.args)
+        child['old_container_id'] = OLD_ID
+        with self.assertRaisesRegex(common.DeployError, 'upgrade_parent_container_mismatch'):
+            up.assert_guard(child)
+
+
+class RollbackDataTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.data = self.root / 'data'; self.data.mkdir()
+        self.path = self.data / 'bluev-sandbox.sqlite'
+        self.old = self.root / 'releases' / OLD; self.old.mkdir(parents=True)
+        self.new = self.root / 'releases' / NEW; self.new.mkdir(parents=True)
+        self.unit = self.root / 'sandbox.service'; self.unit.write_text('test unit')
+        self.mod = types.SimpleNamespace(ROOT=self.root, DATA=self.data, UNIT=self.unit)
+        self.state = {'role': 'x', 'old_release': str(self.old), 'release': str(self.new),
+                      'old_manifest': {}, 'to_sha': NEW, 'from_sha': OLD}
+        self.sql('CREATE TABLE test_fixture(id INTEGER)')
+        p = patch.object(up, 'legacy', return_value=self.mod); p.start(); self.addCleanup(p.stop)
+
+    def sql(self, script):
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.executescript(script); connection.commit()
+        finally:
+            connection.close()
+
+    def seed(self):
+        self.sql('''CREATE TABLE bluev_alipay_versions(revision INTEGER PRIMARY KEY,identity_id TEXT,secret_ciphertext TEXT);
+          CREATE TABLE bluev_alipay_settings(id INTEGER PRIMARY KEY,active_revision INTEGER);
+          CREATE TABLE bluev_alipay_order_identities(order_id TEXT PRIMARY KEY,identity_id TEXT,bound_revision INTEGER);
+          INSERT INTO bluev_alipay_versions VALUES(1,'initial-test-identity','DO_NOT_SELECT_THIS_TEST_SENTINEL');
+          INSERT INTO bluev_alipay_settings VALUES(1,1);
+          INSERT INTO bluev_alipay_order_identities VALUES('original-test-order','initial-test-identity',1);''')
+
+    def save_second_profile(self):
+        self.sql("INSERT INTO bluev_alipay_versions VALUES(2,'changed-test-identity','TEST_ONLY');"
+                 "UPDATE bluev_alipay_settings SET active_revision=2 WHERE id=1;")
+
+    def closures(self, count=0):
+        self.sql('CREATE TABLE bluev_test_closures(request_id TEXT PRIMARY KEY)')
+        if count:
+            self.sql("INSERT INTO bluev_test_closures VALUES('test-request')")
+
+    def capability(self, module, contents):
+        target = self.old / module; target.parent.mkdir(exist_ok=True, parents=True)
+        target.write_text(contents)
+        self.state['old_manifest'][module] = common.fingerprint(target)
+
+    def current_link(self):
+        try:
+            (self.root / 'current').symlink_to(self.new, target_is_directory=True)
+        except OSError:
+            self.skipTest('symlink privilege unavailable')
+
+    def test_absent_new_tables_allow_legacy_rollback(self):
+        self.assertEqual(up.payment_profile_revision(), 0)
+        self.assertEqual(up.closed_test_count(), 0)
+        up.assert_data_rollback(self.state)
+
+    def test_seed_revision_one_allows_rollback_without_reading_secrets_or_writing_database(self):
+        self.seed(); before = self.path.read_bytes(); statements = []
+        connect = sqlite3.connect
+        def traced(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connection.set_trace_callback(statements.append)
+            return connection
+        with patch.object(up.sqlite3, 'connect', side_effect=traced):
+            up.assert_data_rollback(self.state)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertNotIn('secret_ciphertext', '\n'.join(statements))
+        self.assertNotIn('DO_NOT_SELECT_THIS_TEST_SENTINEL', '\n'.join(statements))
+        self.assertFalse(any(command.startswith(('UPDATE ', 'DELETE ', 'INSERT ')) for command in statements))
+
+    def test_any_saved_revision_blocks_legacy_even_if_active_returns_to_one(self):
+        self.seed(); self.save_second_profile()
+        self.sql('UPDATE bluev_alipay_settings SET active_revision=1')
+        self.assertEqual(up.payment_profile_revision(), 2)
+        with self.assertRaisesRegex(common.DeployError, 'payment_profile_rollback_blocked'):
+            up.assert_data_rollback(self.state)
+
+    def test_current_profile_support_capability_allows_compatible_rollback(self):
+        self.seed(); self.save_second_profile()
+        self.capability(up.PROFILE_MODULE, 'export const BLUEV_PAYMENT_PROFILE_SCHEMA_VERSION = 1;')
+        up.assert_data_rollback(self.state)
+        (self.old / up.PROFILE_MODULE).write_text('export const BLUEV_PAYMENT_PROFILE_SCHEMA_VERSION = 2;')
+        with self.assertRaisesRegex(common.DeployError, 'old_profile_module_changed'):
+            up.assert_data_rollback(self.state)
+
+    def test_incomplete_profile_tables_are_not_treated_as_unconfigured(self):
+        self.sql('CREATE TABLE bluev_alipay_versions(revision INTEGER PRIMARY KEY)')
+        with self.assertRaisesRegex(common.DeployError, 'payment_profile_schema_invalid'):
+            up.payment_profile_revision()
+
+    def test_invalid_active_reference_blocks_rollback(self):
+        self.seed(); self.sql('UPDATE bluev_alipay_settings SET active_revision=99')
+        with self.assertRaisesRegex(common.DeployError, 'payment_profile_active_invalid'):
+            up.payment_profile_revision()
+
+    def test_missing_historical_revision_blocks_rollback(self):
+        self.seed(); self.sql("INSERT INTO bluev_alipay_versions VALUES(3,'third','TEST_ONLY')")
+        with self.assertRaisesRegex(common.DeployError, 'payment_profile_revision_invalid'):
+            up.payment_profile_revision()
+
+    def test_mismatched_order_identity_blocks_rollback(self):
+        self.seed(); self.sql("UPDATE bluev_alipay_order_identities SET identity_id='mismatch'")
+        with self.assertRaisesRegex(common.DeployError, 'payment_profile_binding_invalid'):
+            up.payment_profile_revision()
+
+    def test_profile_sql_errors_are_safe_and_fail_closed(self):
+        self.path.write_bytes(b'not a sqlite database')
+        with self.assertRaisesRegex(common.DeployError, '^payment_profile_state_unreadable$'):
+            up.payment_profile_revision()
+
+    def test_closures_block_rollback_to_code_without_closure_support(self):
+        self.seed(); self.closures(1)
+        self.assertEqual(up.closed_test_count(), 1)
+        with self.assertRaisesRegex(common.DeployError, 'test_closure_rollback_blocked'):
+            up.assert_data_rollback(self.state)
+        self.capability('dist/bluev-sandbox.js', 'const tableName = "bluev_test_closures";')
+        up.assert_data_rollback(self.state)
+
+    def test_closure_schema_errors_fail_closed(self):
+        self.sql('CREATE TABLE bluev_test_closures(unrelated TEXT)')
+        with self.assertRaisesRegex(common.DeployError, '^test_closure_state_unreadable$'):
+            up.closed_test_count()
+
+    def test_preexisting_saved_configuration_blocks_before_service_stop(self):
+        self.seed(); self.save_second_profile()
+        with patch.object(up, 'run') as run, patch.object(up, 'switch_x') as switch:
+            with self.assertRaisesRegex(common.DeployError, 'payment_profile_rollback_blocked'):
+                up.restore_x(self.state)
+            run.assert_not_called(); switch.assert_not_called()
+
+    def test_profile_saved_while_stopping_resumes_same_new_release_never_downgrades(self):
+        self.seed(); self.current_link()
+        def run(args, **kwargs):
+            if args[:2] == ['systemctl', 'stop']:
+                self.save_second_profile()
+            return ''
+        with patch.object(up, 'assert_guard'), patch.object(up, 'run', side_effect=run) as command, \
+             patch.object(up, 'service_identity', return_value={'MainPID': '0', 'FragmentPath': str(self.unit)}), \
+             patch.object(up, 'switch_x') as switch:
+            with self.assertRaisesRegex(common.DeployError, 'payment_profile_rollback_blocked'):
+                up.restore_x(self.state)
+            switch.assert_not_called()
+            self.assertEqual([call.args[0] for call in command.call_args_list],
+                             [['systemctl', 'stop', up.SERVICE], ['systemctl', 'start', up.SERVICE]])
+        self.assertEqual((self.root / 'current').resolve(), self.new.resolve())
+
+    def test_test_closed_while_stopping_resumes_same_new_release_never_downgrades(self):
+        self.seed(); self.closures(); self.current_link()
+        def run(args, **kwargs):
+            if args[:2] == ['systemctl', 'stop']:
+                self.sql("INSERT INTO bluev_test_closures VALUES('closed-during-drain')")
+            return ''
+        with patch.object(up, 'assert_guard'), patch.object(up, 'run', side_effect=run) as command, \
+             patch.object(up, 'service_identity', return_value={'MainPID': '0', 'FragmentPath': str(self.unit)}), \
+             patch.object(up, 'switch_x') as switch:
+            with self.assertRaisesRegex(common.DeployError, 'test_closure_rollback_blocked'):
+                up.restore_x(self.state)
+            switch.assert_not_called()
+            self.assertEqual(command.call_args_list[-1].args[0], ['systemctl', 'start', up.SERVICE])
+        self.assertEqual((self.root / 'current').resolve(), self.new.resolve())
+
+    def test_seed_only_drain_allows_safe_old_release_switch(self):
+        self.seed(); self.closures(); self.current_link()
+        with patch.object(up, 'assert_guard'), patch.object(up, 'run') as command, \
+             patch.object(up, 'service_identity', return_value={'MainPID': '0', 'FragmentPath': str(self.unit)}), \
+             patch.object(up, 'switch_x') as switch:
+            up.restore_x(self.state)
+            switch.assert_called_once_with(self.state, False)
+            command.assert_called_once_with(['systemctl', 'stop', up.SERVICE], timeout=50)
+
+    def test_unconfirmed_stop_never_switches_release(self):
+        self.seed(); self.current_link()
+        with patch.object(up, 'assert_guard'), patch.object(up, 'run'), \
+             patch.object(up, 'service_identity', return_value={'MainPID': '123', 'FragmentPath': str(self.unit)}), \
+             patch.object(up, 'switch_x') as switch:
+            with self.assertRaisesRegex(common.DeployError, 'sandbox_stop_unconfirmed'):
+                up.restore_x(self.state)
+            switch.assert_not_called()
+
+    def test_automatic_rollback_reports_block_and_keeps_database(self):
+        self.seed(); self.save_second_profile()
+        state = {**self.state, 'status': 'prepared'}
+        args = types.SimpleNamespace(role='x', to_sha=NEW)
+        before = self.path.read_bytes()
+        with patch.object(up, 'read_state', return_value=state), patch.object(up, 'assert_guard'), \
+             patch.object(up, 'assert_current_x'), patch.object(up, 'record'), patch.object(up, 'emit') as emit, \
+             patch.object(up, 'switch_x', side_effect=common.DeployError('new_service_failed')):
+            with self.assertRaisesRegex(common.DeployError, 'new_service_failed'):
+                up.apply(args)
+        self.assertEqual(state['status'], 'rollback_required')
+        self.assertEqual(emit.call_args.kwargs['code'], 'payment_profile_rollback_blocked')
+        self.assertEqual(self.path.read_bytes(), before)
 
 
 if __name__ == '__main__':

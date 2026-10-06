@@ -78,6 +78,106 @@ describe("isolated administrator blueV real-payment sandbox", () => {
     return service.app.inject({ method: "POST", url: `${prefix}/orders/${id}/retry-qr`, headers: headers(),
       payload: { expected_version: version, confirm_retry: true, confirm_renewal: renewal } });
   }
+  async function closeTest(id: string, payload: Record<string, unknown> = { confirm_close: true }) {
+    return service.app.inject({ method: "POST", url: `${prefix}/orders/${id}/close`, headers: headers(), payload });
+  }
+  it("closes a verified absent expired test without changing its intent, and admits a new test", async () => {
+    const query = enableRecovery(); const created = await missingQr(true);
+    const before = service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id);
+    const result = await closeTest(created.test_id);
+    expect(result.statusCode).toBe(200);
+    expect(result.json().item).toMatchObject({ payment_status: "closed", terminal: true, qr_retry_allowed: false, qr_available: false });
+    expect(service.tests.active()).toBeNull();
+    expect(service.db.db.prepare("SELECT order_json FROM checkout_intents WHERE client_order_id=?").get(created.client_order_id)).toEqual(before);
+    expect((await closeTest(created.test_id)).json().idempotent).toBe(true);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect((await retry(created.test_id)).json().error.code).toBe("retry_not_allowed");
+    expect((await create(input(created.test_id))).json().item.payment_status).toBe("closed");
+    await service.tests.recoverIntents(); expect(payment.queryPayment).not.toHaveBeenCalled();
+    expect((await create(input(randomUUID(), "x_premium_3m", "next_user"))).statusCode).toBe(201);
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(2);
+  });
+  it("requires an ended payment window even after a later permission rejection", async () => {
+    const query = enableRecovery(); const created = await missingQr();
+    expect((await closeTest(created.test_id)).json().error.code).toBe("close_window_open");
+    expect(query).not.toHaveBeenCalled();
+    service.db.db.prepare("UPDATE bluev_test_payment_state SET error_code='bluev_payment_provider_permission' WHERE request_id=?").run(created.test_id);
+    expect((await closeTest(created.test_id)).json().error.code).toBe("close_window_open");
+    expect(query).not.toHaveBeenCalled();
+  });
+  it.each(["unknown", "trade_exists", "paid", "error"])("does not close when the signed query result is %s", async kind => {
+    const query = enableRecovery(); const created = await missingQr(true);
+    if (kind === "error") query.mockRejectedValue(new Error("provider-secret-do-not-leak"));
+    else query.mockResolvedValue({ state: kind === "unknown" ? "unknown" : "trade_exists", confirmation: kind === "paid" ? confirmation() : {
+      paid: false, tradeNo: kind === "trade_exists" ? "existing-trade" : null, paidAt: new Date().toISOString(), receiptAmount: null, tradeStatus: null } });
+    const result = await closeTest(created.test_id);
+    expect(result.statusCode).toBe(409); expect(result.json().error.code).toBe("close_payment_unknown");
+    expect(result.body).not.toContain("provider-secret");
+    expect(service.tests.active()).toBe(created.test_id);
+    expect(service.db.db.prepare("SELECT count(*) n FROM bluev_test_closures").get()?.n).toBe(0);
+  });
+  it("does not close or overwrite a concurrent payment callback", async () => {
+    const query = enableRecovery(); const created = await missingQr(true);
+    query.mockImplementation(async () => { await paidCallback(created.order_id!); return { state: "not_found", confirmation: {
+      paid: false, tradeNo: null, paidAt: new Date().toISOString(), receiptAmount: null, tradeStatus: null } }; });
+    expect((await closeTest(created.test_id)).json().error.code).toBe("close_busy");
+    expect((await item(created.test_id)).payment_status).toBe("paid");
+    expect(service.db.listActivations(created.order_id!)).toHaveLength(1);
+  });
+  it("stores unexpected late payment after close for review without gifting", async () => {
+    enableRecovery(); const created = await missingQr(true);
+    await closeTest(created.test_id); await paidCallback(created.order_id!);
+    expect(await item(created.test_id)).toMatchObject({ payment_status: "paid", fulfillment_status: "review", terminal: false, requires_review: true });
+    expect(service.db.getOrder(created.order_id!)).toBeUndefined();
+    expect(service.db.listActivations(created.order_id!)).toHaveLength(0);
+    expect(service.tests.active()).toBe(created.test_id);
+    await service.paymentReconciler.tick();
+    expect(service.db.listActivations(created.order_id!)).toHaveLength(0);
+    expect(xApi.createOrder).not.toHaveBeenCalled();
+  });
+  it("fences close against retry and a lost query lease", async () => {
+    const query = enableRecovery(); const created = await missingQr(true);
+    query.mockImplementation(async () => {
+      expect((await retry(created.test_id, 0, true)).statusCode).toBe(409);
+      service.db.db.prepare("UPDATE bluev_test_requests SET query_lease='another-owner' WHERE request_id=?").run(created.test_id);
+      return { state: "not_found", confirmation: { paid: false, tradeNo: null, paidAt: new Date().toISOString(), receiptAmount: null, tradeStatus: null } };
+    });
+    expect((await closeTest(created.test_id)).json().error.code).toBe("close_busy");
+    expect((await item(created.test_id)).payment_status).toBe("unknown");
+    expect(payment.createPaymentUrl).toHaveBeenCalledTimes(1);
+  });
+  it("checks retirement inside the same transaction that would materialize a paid order", async () => {
+    enableRecovery(); const created = await missingQr(true);
+    const transaction = service.db.transaction.bind(service.db);
+    vi.spyOn(service.db, "transaction").mockImplementationOnce(work => {
+      service.db.db.prepare("INSERT INTO bluev_test_closures(request_id,closed_at,reason) VALUES(?,?,'verified_trade_not_found')")
+        .run(created.test_id, new Date().toISOString());
+      return transaction(work);
+    });
+    await paidCallback(created.order_id!);
+    expect(await item(created.test_id)).toMatchObject({ payment_status: "paid", fulfillment_status: "review", requires_review: true });
+    expect(service.db.getOrder(created.order_id!)).toBeUndefined();
+    expect(service.db.listActivations(created.order_id!)).toHaveLength(0);
+  });
+  it("does not overwrite closure after a stale recovery query loses its lease", async () => {
+    const created = await missingQr(true);
+    vi.mocked(payment.queryPayment).mockImplementationOnce(async () => {
+      service.db.db.prepare("INSERT INTO bluev_test_closures(request_id,closed_at,reason) VALUES(?,?,'verified_trade_not_found')")
+        .run(created.test_id, new Date().toISOString());
+      service.db.db.prepare("UPDATE bluev_test_requests SET state='closed',query_lease='new-owner' WHERE request_id=?").run(created.test_id);
+      throw new Error("late query unavailable");
+    });
+    await service.tests.recoverIntents();
+    expect(service.db.db.prepare("SELECT state FROM bluev_test_requests WHERE request_id=?").get(created.test_id)?.state).toBe("closed");
+    expect((await item(created.test_id)).payment_status).toBe("closed");
+  });
+  it("requires explicit close confirmation and does not close a materialized payment", async () => {
+    enableRecovery(); const created = (await create()).json().item;
+    expect((await closeTest(created.test_id, {})).statusCode).toBe(400);
+    expect((await closeTest(created.test_id, { confirm_close: true, force: true })).statusCode).toBe(400);
+    expect((await closeTest(created.test_id)).json().error.code).toBe("close_not_allowed");
+    expect((await item(created.test_id)).payment_status).toBe("pending");
+  });
   it("shows sanitized payment errors without falsely ending unknown payments", async () => {
     enableRecovery(); const created = await missingQr();
     expect(await item(created.test_id)).toMatchObject({ qr_error_code: "bluev_payment_timeout", qr_retry_allowed: true,

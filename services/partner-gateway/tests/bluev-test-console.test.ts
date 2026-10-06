@@ -9,6 +9,10 @@ const COOKIE = "merchant_admin=" + "a".repeat(40) + "." + "b".repeat(43);
 const ID = "23ff9a67-f3d0-4350-ae58-6f2c2cfa7304";
 const ORIGIN = "https://api.quefa.cn";
 const API = "/admin/api/bluev-test";
+const settings = () => ({ revision: 1, app_id: "2026000000000001", seller_id: "2088000000000001",
+  has_private_key: true, has_public_key: true, notify_url: "https://x.aifu.me/bluev-sandbox/callbacks/alipay", updated_at: "2026-10-06T00:00:00.000Z" });
+const settingsInput = () => ({ app_id: settings().app_id, seller_id: settings().seller_id,
+  private_key: "", public_key: "", expected_revision: 1, confirm_apply: true });
 const item = () => ({ test_id: ID, request_id: ID, order_id: "po_test", client_order_id: "BLUEVTEST-" + ID,
   product: "x_premium_3m", recipient: "@tester", amount: "22.00", currency: "CNY", payment_status: "pending",
   fulfillment_status: "not_started", requires_review: false, qr_available: true, terminal: false,
@@ -265,6 +269,99 @@ describe("isolated bluev admin console", () => {
     expect((await get(API + "/orders")).status).toBe(401);
     fakeFetch.mockImplementation(async (url: string) => { if (url.includes("/admin/api/session")) return Response.json({ success: true }); throw new Error(KEY); });
     const result = await get(API + "/orders"); expect(result.status).toBe(503); expect(await result.text()).not.toContain(KEY);
+  });
+  it("requires current admin login for settings and returns only validated non-secret metadata", async () => {
+    upstreamBody = { success: true, settings: { ...settings(), private_key: "private-PEM", public_key: "public-PEM", config: { secret: KEY } }, secret: KEY };
+    expect((await get(API + "/settings/alipay", { Cookie: "" })).status).toBe(401);
+    expect(upstreamCalls()).toHaveLength(0);
+    const response = await get(API + "/settings/alipay");
+    expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(await response.json()).toEqual({ success: true, settings: settings() });
+    expect(upstreamCalls()[0][0]).toBe("https://x.aifu.me/bluev-sandbox/internal/bluev-test/settings/alipay");
+    sessionStatus = 401; sessionPayload = { success: false };
+    expect((await get(API + "/settings/alipay")).status).toBe(401); expect(upstreamCalls()).toHaveLength(1);
+  });
+  it("fails closed on unsafe settings DTOs instead of relaying key text through metadata", async () => {
+    for (const invalid of [{ revision: 0 }, { revision: "1" }, { app_id: "private PEM" }, { seller_id: "2088" },
+      { has_private_key: "true" }, { notify_url: "https://evil.test/private" }, { updated_at: "private PEM" }]) {
+      upstreamBody = { success: true, settings: { ...settings(), ...invalid } };
+      const response = await get(API + "/settings/alipay");
+      expect(response.status).toBe(503); expect(await response.text()).not.toContain("PEM");
+    }
+  });
+  it("forwards exactly one explicitly confirmed settings save without changing any payment route", async () => {
+    const input = { ...settingsInput(), private_key: "FAKE-PRIVATE-PEM", public_key: "FAKE-PUBLIC-PEM" };
+    upstreamBody = { success: true, settings: { ...settings(), revision: 2 }, private_key: input.private_key };
+    const response = await post(API + "/settings/alipay", input);
+    expect(response.status).toBe(200);
+    const body = await response.json(); expect(body.settings.revision).toBe(2); expect(JSON.stringify(body)).not.toContain("PEM");
+    expect(upstreamCalls()).toHaveLength(1);
+    const sent = upstreamCalls()[0][1] as RequestInit;
+    expect(JSON.parse(sent.body as string)).toEqual(input);
+    expect(new Headers(sent.headers).get("x-bluev-test-key")).toBe(KEY);
+    expect(new Headers(sent.headers).get("cookie")).toBeNull();
+    expect(upstreamCalls()[0][0]).toContain("/settings/alipay");
+  });
+  it("requires same-origin JSON and exactly six typed fields for saving settings", async () => {
+    const path = API + "/settings/alipay", input = settingsInput();
+    expect((await post(path, input, { Origin: "https://evil.test" })).status).toBe(403);
+    expect((await post(path, input, { "Content-Type": "text/plain" })).status).toBe(415);
+    for (const invalid of [{ ...input, confirm_apply: false }, { ...input, expected_revision: "1" },
+      { ...input, expected_revision: 0 }, { ...input, expected_revision: 1.1 }, { ...input, app_id: 2026000000000001 },
+      { ...input, app_id: "123" }, { ...input, seller_id: "x".repeat(16) }, { ...input, private_key: null },
+      { ...input, public_key: "A".repeat(8193) }, { ...input, notify_url: "https://evil.test" },
+      { ...input, enabled: true }, { ...input, private_key: undefined }]) {
+      expect((await post(path, invalid)).status).toBe(422);
+    }
+    expect(upstreamCalls()).toHaveLength(0);
+  });
+  it("allows up to 16 KiB only for settings while preserving the original 4 KiB bound", async () => {
+    upstreamBody = { success: true, settings: settings() };
+    expect((await post(API + "/settings/alipay", { ...settingsInput(), private_key: "A".repeat(4300) })).status).toBe(200);
+    expect((await post(API + "/settings/alipay", { ...settingsInput(), private_key: "A".repeat(8192), public_key: "B".repeat(8192) })).status).toBe(413);
+    expect((await post(API + "/orders", { product: "x_premium_3m", recipient: "tester", request_id: ID, confirm_real_payment: true, extra: "A".repeat(4300) })).status).toBe(413);
+    expect((await post(API + "/orders/" + ID + "/close", { confirm_close: true, extra: "A".repeat(4300) })).status).toBe(413);
+    expect(upstreamCalls()).toHaveLength(1);
+  });
+  it("maps settings errors to fixed copy and never returns raw key or SDK error contents", async () => {
+    upstreamStatus = 409; upstreamBody = { error: { code: "bluev_alipay_revision_conflict", message: "PRIVATE KEY " + KEY }, stack: "private stack" };
+    const known = await (await post(API + "/settings/alipay", settingsInput())).json();
+    expect(known.error).toBe("bluev_alipay_revision_conflict"); expect(known.detail_zh).toContain("刷新配置");
+    expect(JSON.stringify(known)).not.toMatch(/PRIVATE KEY|private stack/);
+    upstreamStatus = 500; upstreamBody = { error: { code: "unknown", message: "PRIVATE KEY " + KEY } };
+    const unknown = await (await post(API + "/settings/alipay", settingsInput())).text();
+    expect(unknown).toContain("配置结果"); expect(unknown).not.toContain(KEY);
+    fakeFetch.mockImplementation(async (url: string) => { if (url.includes("/admin/api/session")) return Response.json({ success: true }); throw new Error("PRIVATE KEY " + KEY); });
+    const before = upstreamCalls().length;
+    const failed = await post(API + "/settings/alipay", settingsInput());
+    expect(failed.status).toBe(503); expect(await failed.text()).not.toContain(KEY);
+    expect(upstreamCalls()).toHaveLength(before + 1);
+  });
+  it("does not expose extra settings paths, secrets GETs or configuration query parameters", async () => {
+    for (const suffix of ["/settings/alipay/private-key", "/settings", "/settings/other"]) expect((await get(API + suffix)).status).toBe(405);
+    expect((await get(API + "/settings/alipay?private_key=yes")).status).toBe(422);
+    expect((await post(API + "/settings/alipay?confirm=yes", settingsInput())).status).toBe(422);
+    expect(upstreamCalls()).toHaveLength(0);
+  });
+  it("allows only an explicitly confirmed, authenticated original-order close", async () => {
+    const path = API + "/orders/" + ID + "/close";
+    expect((await get(path)).status).toBe(405);
+    expect((await post(path, { confirm_close: true }, { Origin: "https://evil.test" })).status).toBe(403);
+    for (const input of [{}, { confirm_close: false }, { confirm_close: true, force: true }]) expect((await post(path, input)).status).toBe(422);
+    expect(upstreamCalls()).toHaveLength(0);
+    upstreamBody = { success: true, item: { ...item(), payment_status: "closed", terminal: true, qr_available: false }, idempotent: false };
+    const response = await post(path, { confirm_close: true });
+    expect(response.status).toBe(200); expect((await response.json()).item.payment_status).toBe("closed");
+    expect(upstreamCalls()).toHaveLength(1);
+    expect(upstreamCalls()[0][0]).toBe("https://x.aifu.me/bluev-sandbox/internal/bluev-test/orders/" + ID + "/close");
+    expect(JSON.parse((upstreamCalls()[0][1] as RequestInit).body as string)).toEqual({ confirm_close: true });
+  });
+  it("sanitizes unsafe-close failures instead of exposing provider details", async () => {
+    for (const code of ["close_not_allowed", "close_busy", "close_payment_unknown", "close_window_open"]) {
+      upstreamStatus = 409; upstreamBody = { error: { code, message: "PRIVATE KEY " + KEY } };
+      const body = await (await post(API + "/orders/" + ID + "/close", { confirm_close: true })).json();
+      expect(body.error).toBe(code); expect(JSON.stringify(body)).not.toContain(KEY);
+    }
   });
 });
 

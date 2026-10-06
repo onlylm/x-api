@@ -13,22 +13,25 @@ const baseItem = () => ({ test_id: ID, request_id: ID, order_id: "po_test", clie
   qr_retry_allowed: false, qr_retry_requires_renewal: false, qr_retry_version: 0 });
 const retryItem = () => ({ ...baseItem(), payment_status: "unknown", qr_available: false, requires_review: true,
   qr_error_code: "payment_result_unknown", qr_error_zh: "付款码生成结果尚未确认，请核对原单。", qr_retry_allowed: true });
+const alipaySettings = () => ({ revision: 1, app_id: "2026000000000001", seller_id: "2088000000000001",
+  has_private_key: true, has_public_key: true, notify_url: "https://x.aifu.me/bluev-sandbox/callbacks/alipay", updated_at: "2026-10-06T00:00:00.000Z" });
 
 // A minimal DOM facade exercises event/state logic only. No browser or visual tools.
 class Element {
   value = ""; checked = false; disabled = false; hidden = false; textContent = ""; className = ""; type = ""; src = "";
   children: Element[] = [];
+  attributes = new Map<string, string>();
   onclick?: () => Promise<void> | void; onchange?: () => void; oninput?: () => void;
   onerror?: () => void; onload?: () => void;
   onsubmit?: (event: { preventDefault(): void }) => Promise<void>;
   append(...elements: Element[]) { this.children.push(...elements); }
   replaceChildren() { this.children = []; }
   removeAttribute(name: string) { if (name === "src") this.src = ""; }
-  setAttribute(_name: string, _value: string) {}
+  setAttribute(name: string, value: string) { this.attributes.set(name, value); }
   focus() {} scrollIntoView() {}
 }
 type Handler = (path: string, init: RequestInit) => Response | Promise<Response>;
-async function harness(handler: Handler = () => Response.json({ success: true, items: [] }), saved?: string | Record<string, unknown>, statusFails = false, savedAttempt?: Record<string, unknown>) {
+async function harness(handler: Handler = () => Response.json({ success: true, items: [] }), saved?: string | Record<string, unknown>, statusFails = false, savedAttempt?: Record<string, unknown>, hash = "") {
   const elements = new Map([...bluevTestPage.matchAll(/\sid="([^"]+)"/g)].map(match => [match[1], new Element()]));
   const el = (id: string) => elements.get(id)!;
   el("product").value = "x_premium_3m"; el("recipient").value = "tester";
@@ -38,7 +41,9 @@ async function harness(handler: Handler = () => Response.json({ success: true, i
   const calls: Array<{ path: string; init: RequestInit }> = [];
   let tick = () => {}; let ids = saved ? 1 : 0; let pendingAtFirstRead = false;
   const document = { hidden: false, getElementById: el, createElement: () => new Element() };
-  const context = createContext({ document, Date, Intl, AbortSignal, Error,
+  const events = new Map<string, (event?: unknown) => void>();
+  const window = { location: { hash }, addEventListener: (name: string, callback: (event?: unknown) => void) => { events.set(name, callback); } };
+  const context = createContext({ document, window, Date, Intl, AbortSignal, Error,
     crypto: { randomUUID: () => ids++ === 0 ? ID : SECOND },
     sessionStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
     setInterval: (fn: () => void) => { tick = fn; },
@@ -54,10 +59,14 @@ async function harness(handler: Handler = () => Response.json({ success: true, i
   const settle = async () => { for (let index = 0; index < 4; index++) await new Promise<void>(resolve => setImmediate(resolve)); };
   await settle();
   const qualify = async () => { await el("form").onsubmit!({ preventDefault() {} }); el("confirm").checked = true; el("confirm").onchange!(); };
-  return { el, storage, calls, settle, qualify, document, pendingAtFirstRead, tick: async () => { tick(); await settle(); } };
+  return { el, storage, calls, settle, qualify, document, events, pendingAtFirstRead,
+    navigate: async (hash: string) => { window.location.hash = hash; events.get("hashchange")?.(); await settle(); },
+    tick: async () => { tick(); await settle(); } };
 }
 const creates = (calls: Array<{ path: string; init: RequestInit }>) => calls.filter(call => call.path === "/orders" && call.init.method === "POST");
 const qrRetries = (calls: Array<{ path: string; init: RequestInit }>) => calls.filter(call => call.path.endsWith("/retry-qr") && call.init.method === "POST");
+const settingSaves = (calls: Array<{ path: string; init: RequestInit }>) => calls.filter(call => call.path === "/settings/alipay" && call.init.method === "POST");
+const closes = (calls: Array<{ path: string; init: RequestInit }>) => calls.filter(call => call.path.endsWith("/close") && call.init.method === "POST");
 
 describe("bluev test page state flow without a browser", () => {
   it("loads only reads, has a real empty state and requires eligibility plus explicit consent", async () => {
@@ -297,5 +306,165 @@ describe("bluev test page state flow without a browser", () => {
     expect(qrRetries(app.calls)).toHaveLength(0); expect(creates(app.calls)).toHaveLength(0);
     expect(app.el("requestQrRetry").disabled).toBe(true); expect(app.el("qrRetryConfirm").checked).toBe(false);
     expect(JSON.parse(app.storage.get("bluev-test-qr-attempt")!)).toBeNull();
+  });
+  it("loads settings only through its hash view without posting or changing the test flow", async () => {
+    const app = await harness(path => Response.json(path === "/settings/alipay" ? { success: true, settings: alipaySettings() } : { success: true, items: [] }));
+    expect(app.calls.some(call => call.path === "/settings/alipay")).toBe(false);
+    await app.navigate("#alipay");
+    expect(app.el("alipayView").hidden).toBe(false); expect(app.el("testView").hidden).toBe(true);
+    expect(app.el("alipayTab").attributes.get("aria-current")).toBe("page");
+    expect(app.el("alipayAppId").value).toBe(alipaySettings().app_id);
+    expect(app.el("alipayPrivateKey").value).toBe(""); expect(app.el("alipayPublicKey").value).toBe("");
+    expect(app.el("alipayPrivateState").textContent).toContain("不会回显");
+    expect(app.el("saveAlipay").disabled).toBe(true); expect(settingSaves(app.calls)).toHaveLength(0);
+    await app.navigate("#test"); await app.tick();
+    expect(app.el("testView").hidden).toBe(false); expect(settingSaves(app.calls)).toHaveLength(0);
+    expect(creates(app.calls)).toHaveLength(0); expect(qrRetries(app.calls)).toHaveLength(0);
+  });
+  it("saves same-identity blank keys only after consent and never stores or fills key values", async () => {
+    const app = await harness((path, init) => Response.json(path === "/settings/alipay"
+      ? { success: true, settings: { ...alipaySettings(), revision: init.method === "POST" ? 2 : 1 } } : { success: true, items: [] }), undefined, false, undefined, "#alipay");
+    await app.el("alipayForm").onsubmit!({ preventDefault() {} }); expect(settingSaves(app.calls)).toHaveLength(0);
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!();
+    await app.el("alipayForm").onsubmit!({ preventDefault() {} });
+    expect(JSON.parse(settingSaves(app.calls)[0].init.body as string)).toEqual({ app_id: alipaySettings().app_id, seller_id: alipaySettings().seller_id,
+      private_key: "", public_key: "", expected_revision: 1, confirm_apply: true });
+    expect(app.el("alipayRevision").textContent).toBe("2"); expect(app.el("alipayConfirm").checked).toBe(false);
+    expect(app.el("alipayNotice").textContent).toContain("没有发起交易或开启接单");
+    expect([...app.storage.keys()].some(key => key.includes("alipay"))).toBe(false);
+    expect(creates(app.calls)).toHaveLength(0); expect(qrRetries(app.calls)).toHaveLength(0);
+  });
+  it("requires both new keys for an identity change and resets consent after any edit", async () => {
+    const app = await harness(path => Response.json(path === "/settings/alipay" ? { success: true, settings: alipaySettings() } : { success: true, items: [] }), undefined, false, undefined, "#alipay");
+    app.el("alipayAppId").value = "2026000000000002"; app.el("alipayAppId").oninput!();
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!();
+    expect(app.el("saveAlipay").disabled).toBe(true); expect(app.el("alipayFieldHint").textContent).toContain("同时填写");
+    app.el("alipayPrivateKey").value = "FAKE PRIVATE KEY"; app.el("alipayPrivateKey").oninput!();
+    expect(app.el("alipayConfirm").checked).toBe(false);
+    app.el("alipayPublicKey").value = "FAKE PUBLIC KEY"; app.el("alipayPublicKey").oninput!();
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!();
+    expect(app.el("saveAlipay").disabled).toBe(false);
+    expect([...app.storage.values()].join("")).not.toMatch(/FAKE PRIVATE|FAKE PUBLIC/);
+    expect(settingSaves(app.calls)).toHaveLength(0);
+  });
+  it("preserves unsaved keys across hash tabs, warns on leaving, and requires explicit discard before rereading", async () => {
+    const app = await harness(path => Response.json(path === "/settings/alipay" ? { success: true, settings: alipaySettings() } : { success: true, items: [] }), undefined, false, undefined, "#alipay");
+    app.el("alipayPrivateKey").value = "UNSAVED SECRET"; app.el("alipayPrivateKey").oninput!();
+    expect(app.el("alipayUnsaved").hidden).toBe(false);
+    const before = app.calls.length; await app.el("refreshAlipay").onclick!(); expect(app.calls).toHaveLength(before);
+    expect(app.el("alipayPrivateKey").value).toBe("UNSAVED SECRET");
+    await app.navigate("#test"); await app.navigate("#alipay");
+    expect(app.el("alipayPrivateKey").value).toBe("UNSAVED SECRET");
+    let prevented = false;
+    app.events.get("beforeunload")!({ preventDefault: () => { prevented = true; }, returnValue: undefined });
+    expect(prevented).toBe(true);
+    await app.el("discardAlipay").onclick!();
+    expect(app.el("alipayPrivateKey").value).toBe(""); expect(app.el("alipayUnsaved").hidden).toBe(true);
+    expect(settingSaves(app.calls)).toHaveLength(0);
+  });
+  it("blocks duplicate saves and transaction creation while configuration is being saved", async () => {
+    let release: (response: Response) => void = () => {};
+    const app = await harness((path, init) => path === "/settings/alipay" && init.method === "POST"
+      ? new Promise<Response>(resolve => { release = resolve; })
+      : Response.json(path === "/settings/alipay" ? { success: true, settings: alipaySettings() } : { success: true, items: [] }), undefined, false, undefined, "#alipay");
+    await app.qualify();
+    app.el("alipayPrivateKey").value = "FAKE PRIVATE KEY"; app.el("alipayPrivateKey").oninput!();
+    app.el("alipayPublicKey").value = "FAKE PUBLIC KEY"; app.el("alipayPublicKey").oninput!();
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!();
+    const first = app.el("alipayForm").onsubmit!({ preventDefault() {} }); await app.settle();
+    expect(app.el("saveAlipay").disabled).toBe(true); expect(app.el("saveAlipay").textContent).toContain("正在保存");
+    expect(app.el("alipayPrivateKey").disabled).toBe(true); expect(app.el("create").disabled).toBe(true);
+    await app.el("alipayForm").onsubmit!({ preventDefault() {} }); await app.el("create").onclick!();
+    expect(settingSaves(app.calls)).toHaveLength(1); expect(creates(app.calls)).toHaveLength(0);
+    release(Response.json({ success: true, settings: { ...alipaySettings(), revision: 2 } })); await first;
+    expect(app.el("alipayPrivateKey").value).toBe(""); expect(app.el("alipayPublicKey").value).toBe("");
+    expect([...app.storage.values()].join("")).not.toMatch(/FAKE PRIVATE|FAKE PUBLIC/);
+  });
+  it("keeps a lost save result locked until an explicit reread and never auto-saves from polling", async () => {
+    let revision = 1;
+    const app = await harness((path, init) => {
+      if (path === "/settings/alipay" && init.method === "POST") { revision++; throw new Error("private fake key must not display"); }
+      return Response.json(path === "/settings/alipay" ? { success: true, settings: { ...alipaySettings(), revision } } : { success: true, items: [] });
+    }, undefined, false, undefined, "#alipay");
+    app.el("alipayPrivateKey").value = "FAKE PRIVATE KEY"; app.el("alipayPrivateKey").oninput!();
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!();
+    await app.el("alipayForm").onsubmit!({ preventDefault() {} });
+    expect(app.el("alipayNotice").textContent).not.toContain("private fake key");
+    expect(app.el("alipayPrivateKey").value).toBe("FAKE PRIVATE KEY");
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!();
+    expect(app.el("saveAlipay").disabled).toBe(true);
+    await app.el("alipayForm").onsubmit!({ preventDefault() {} }); await app.tick();
+    expect(settingSaves(app.calls)).toHaveLength(1);
+    await app.el("discardAlipay").onclick!();
+    expect(app.el("alipayRevision").textContent).toBe("2"); expect(app.el("alipayPrivateKey").value).toBe("");
+    expect(app.el("alipayConfirm").checked).toBe(false); expect(settingSaves(app.calls)).toHaveLength(1);
+  });
+  it("keeps rejected key input for correction while showing only a fixed validation message", async () => {
+    const app = await harness((path, init) => path === "/settings/alipay" && init.method === "POST"
+      ? Response.json({ success: false, error: "bluev_alipay_invalid_private_key", detail_zh: "PRIVATE RAW CONTENT" }, { status: 400 })
+      : Response.json(path === "/settings/alipay" ? { success: true, settings: alipaySettings() } : { success: true, items: [] }), undefined, false, undefined, "#alipay");
+    app.el("alipayPrivateKey").value = "INVALID KEY"; app.el("alipayPrivateKey").oninput!();
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!();
+    await app.el("alipayForm").onsubmit!({ preventDefault() {} });
+    expect(app.el("alipayNotice").textContent).toContain("RSA 私钥"); expect(app.el("alipayNotice").textContent).not.toContain("PRIVATE RAW");
+    expect(app.el("alipayPrivateKey").value).toBe("INVALID KEY");
+    app.el("alipayPrivateKey").value = "CORRECTED KEY"; app.el("alipayPrivateKey").oninput!();
+    app.el("alipayConfirm").checked = true; app.el("alipayConfirm").onchange!(); expect(app.el("saveAlipay").disabled).toBe(false);
+  });
+  it("does not overwrite an edit with a late settings GET and wipes transient keys when leaving the page", async () => {
+    let reads = 0; let release: (response: Response) => void = () => {};
+    const app = await harness(path => path === "/settings/alipay" && ++reads > 1
+      ? new Promise<Response>(resolve => { release = resolve; })
+      : Response.json(path === "/settings/alipay" ? { success: true, settings: alipaySettings() } : { success: true, items: [] }), undefined, false, undefined, "#alipay");
+    const reading = app.el("refreshAlipay").onclick!(); await app.settle();
+    app.el("alipayPrivateKey").value = "LATE INPUT"; app.el("alipayPrivateKey").oninput!();
+    release(Response.json({ success: true, settings: { ...alipaySettings(), revision: 2 } })); await reading;
+    expect(app.el("alipayPrivateKey").value).toBe("LATE INPUT"); expect(app.el("alipayRevision").textContent).toBe("1");
+    app.events.get("pagehide")!(); expect(app.el("alipayPrivateKey").value).toBe(""); expect(app.el("alipayPublicKey").value).toBe("");
+  });
+  it("allows a next-account draft while an old request is active but never changes its payload", async () => {
+    const app = await harness(path => Response.json(path === "/orders/" + ID ? { success: true, item: retryItem() }
+      : { success: true, items: path.includes("request_id=") ? [retryItem()] : [] }), ID);
+    expect(app.el("recipient").disabled).toBe(false); expect(app.el("product").disabled).toBe(false);
+    expect(app.el("eligibility").disabled).toBe(true); expect(app.el("testFormLock").textContent).toContain("@tester");
+    app.el("recipient").value = "next_user"; app.el("recipient").oninput!();
+    await app.el("form").onsubmit!({ preventDefault() {} }); await app.el("create").onclick!();
+    expect(app.el("orderRecipient").textContent).toBe("@tester"); expect(creates(app.calls)).toHaveLength(0);
+    expect(app.calls.some(call => call.path === "/eligibility")).toBe(false);
+  });
+  it("closes only the displayed unpaid unknown original after consent and preserves the next draft", async () => {
+    const closed = { ...retryItem(), payment_status: "closed", terminal: true };
+    const app = await harness((path, init) => Response.json(path.endsWith("/close") && init.method === "POST"
+      ? { success: true, item: closed, idempotent: false } : { success: true, items: path.includes("request_id=") ? [retryItem()] : [] }), ID);
+    expect(app.el("closeTestArea").hidden).toBe(false); expect(app.el("closeTest").disabled).toBe(true);
+    await app.el("closeTest").onclick!(); expect(closes(app.calls)).toHaveLength(0);
+    app.el("recipient").value = "next_user"; app.el("recipient").oninput!();
+    app.el("closeTestConfirm").checked = true; app.el("closeTestConfirm").onchange!();
+    await app.el("closeTest").onclick!();
+    expect(closes(app.calls)).toHaveLength(1); expect(closes(app.calls)[0].path).toBe("/orders/" + ID + "/close");
+    expect(JSON.parse(closes(app.calls)[0].init.body as string)).toEqual({ confirm_close: true });
+    expect(app.el("newTest").disabled).toBe(false); expect(app.el("create").disabled).toBe(true);
+    await app.el("newTest").onclick!();
+    expect(app.el("recipient").value).toBe("next_user"); expect(app.el("eligibility").disabled).toBe(false);
+    expect(app.el("testFormLock").hidden).toBe(true); expect(creates(app.calls)).toHaveLength(0);
+  });
+  it("does not offer a blind close for a saved QR or a paid order", async () => {
+    for (const current of [baseItem(), { ...baseItem(), payment_status: "paid", qr_available: false, fulfillment_status: "queued" }]) {
+      const app = await harness(path => Response.json({ success: true, items: path.includes("request_id=") ? [current] : [] }), ID);
+      expect(app.el("closeTestArea").hidden).toBe(true);
+      app.el("closeTestConfirm").checked = true; app.el("closeTestConfirm").onchange!();
+      await app.el("closeTest").onclick!(); expect(closes(app.calls)).toHaveLength(0);
+    }
+  });
+  it("keeps a refused close bound to its original order and never retries automatically", async () => {
+    const app = await harness((path, init) => path.endsWith("/close") && init.method === "POST"
+      ? Response.json({ success: false, error: "close_payment_unknown", detail_zh: "无法证实未付款" }, { status: 409 })
+      : Response.json(path === "/orders/" + ID ? { success: true, item: retryItem() }
+        : { success: true, items: path.includes("request_id=") ? [retryItem()] : [] }), ID);
+    app.el("closeTestConfirm").checked = true; app.el("closeTestConfirm").onchange!();
+    await app.el("closeTest").onclick!();
+    expect(app.el("notice").textContent).toContain("无法证实未付款");
+    expect(app.el("newTest").disabled).toBe(true); expect(app.el("closeTest").disabled).toBe(true);
+    await app.tick(); expect(closes(app.calls)).toHaveLength(1); expect(creates(app.calls)).toHaveLength(0);
   });
 });
