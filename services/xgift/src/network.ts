@@ -1,4 +1,5 @@
 import {
+  Failure,
   fail,
   hmac,
   integer,
@@ -10,6 +11,26 @@ import {
   unseal,
   type Env,
 } from './core.ts'
+export interface XQueryDiagnostic {
+  operation: string
+  kind: 'network' | 'body_read' | 'invalid_json' | 'http' | 'graphql' | 'missing_data'
+  http_status: number | null
+  error_codes: number[]
+}
+export class XQueryFailure extends Failure {
+  readonly diagnostic: XQueryDiagnostic
+  constructor(operation: string, kind: XQueryDiagnostic['kind'], status: number | null, result?: unknown) {
+    super('x_query_failed', status ? `X 查询结果未确认（HTTP ${status}）。` : 'X 请求结果暂未确认。', 503)
+    // Never retain provider messages, headers, URLs, variables or arbitrary codes.
+    const errors = result && typeof result === 'object' && 'errors' in result ? result.errors : null
+    this.diagnostic = {
+      operation: ['PremiumGiftingQuery', 'useOneTimePurchaseGiftMutation'].includes(operation) ? operation : 'other',
+      kind, http_status: status,
+      error_codes: Array.isArray(errors) ? [...new Set(errors.slice(0, 20).flatMap(error =>
+        error && typeof error === 'object' && Number.isSafeInteger(error.code) && error.code >= 0 && error.code <= 1000000 ? [error.code as number] : []))] : [],
+    }
+  }
+}
 const publicBearer =
   'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA'
 export async function saveSecret(
@@ -190,17 +211,28 @@ export async function xQuery(
     url.searchParams.set('variables', JSON.stringify(variables))
     url.searchParams.set('features', JSON.stringify(features))
   }
-  const response = await outbound(env, proxy, url.href, {
+  let response: Response
+  try { response = await outbound(env, proxy, url.href, {
     Authorization: env.X_BEARER ?? publicBearer,
     Cookie: `auth_token=${account.auth_token}; ct0=${account.ct0}`,
     'X-Csrf-Token': String(account.ct0), 'X-Twitter-Auth-Type': 'OAuth2Session',
     'X-Twitter-Active-User': 'yes', 'X-Twitter-Client-Language': 'en',
     'Content-Type': 'application/json', Origin: 'https://x.com',
     Referer: 'https://x.com/', 'User-Agent': 'Mozilla/5.0', Accept: 'application/json',
-  }, mutation ? { method: 'POST', body: JSON.stringify({ variables, features, queryId }) } : undefined)
-  if (!response.ok) fail('x_query_failed', `X 查询失败（HTTP ${response.status}）。`, 503)
-  const result = JSON.parse(await readResponse(response))
-  if (result.errors?.length || !result.data) fail('x_query_failed', 'X 查询结果暂未确认。', 503)
+  }, mutation ? { method: 'POST', body: JSON.stringify({ variables, features, queryId }) } : undefined) }
+  catch (error) {
+    if (error instanceof Failure) throw error
+    throw new XQueryFailure(operation, 'network', null)
+  }
+  let raw: string
+  try { raw = await readResponse(response) }
+  catch { throw new XQueryFailure(operation, 'body_read', response.status) }
+  let result: any
+  try { result = JSON.parse(raw) }
+  catch { throw new XQueryFailure(operation, response.ok ? 'invalid_json' : 'http', response.status) }
+  if (!response.ok) throw new XQueryFailure(operation, 'http', response.status, result)
+  if (result?.errors?.length) throw new XQueryFailure(operation, 'graphql', response.status, result)
+  if (!result?.data) throw new XQueryFailure(operation, 'missing_data', response.status)
   return result.data
 }
 export async function accountEligibility(

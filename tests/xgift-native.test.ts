@@ -37,7 +37,8 @@ async function fixture(t: Context) {
   const state = { eligible: true, recipientId: '12345', xError: false, malformed: false, xCreates: 0, cardOpens: 0, methods: 0, confirms: 0, polls: 0, lostConfirm: false, lostCard: false, wrongPage: false, openFee: 0.5, requiresAction: false,
     cardId: 123, cardProduct: 'PP5583RC', cardBalance: 20, cardStatus: 'ACTIVE', cardExpiry: '12/30', cardReads: [] as number[], methodBilling: [] as string[], paymentKeys: [] as string[], onInit: undefined as (() => Promise<void>) | undefined,
     cards: {} as Record<number, Record<string, unknown>>, methodCards: [] as string[], confirmMethods: [] as string[], methodLost: false,
-    providerFailure: null as 'network' | 'unauthorized' | null, onCardRead: undefined as ((cardId: number) => Promise<void>) | undefined }
+    providerFailure: null as 'network' | 'unauthorized' | null, onCardRead: undefined as ((cardId: number) => Promise<void>) | undefined,
+    xCreateError: false }
   t.mock.method(globalThis, 'fetch', async (input: string | URL, init?: RequestInit) => {
     const url = new URL(String(input))
     if (url.hostname === 'x.com') {
@@ -45,6 +46,7 @@ async function fixture(t: Context) {
       if (url.pathname.endsWith('/useSubscriptionProductDetailsByRestIdQuery')) return Response.json({ data: { web_subscription_product_details_by_rest_id: { rest_id: 'prod_TJXJtpzqCpI36N', prices: [{ currency_code: 'BDT', amount_local_micro: 300000000, price_type: 'OneTime' }] } } })
       assert.ok(url.pathname.endsWith('/useOneTimePurchaseGiftMutation')); state.xCreates++
       assert.equal(init?.method, 'POST'); assert.equal(JSON.parse(String(init?.body)).variables.gift_recipient, '12345')
+      if (state.xCreateError) return Response.json({ errors: [{ code: 353, message: 'auth_token=secret-cookie card=4242424242424242' }] }, { status: 403 })
       return Response.json({ data: { onetimepurchase_gift: { session_status: 'Unpaid', session_id: session, session_url: 'https://checkout.stripe.com/c/pay/' + session } } })
     }
     if (url.hostname === 'zovocard.com') {
@@ -94,6 +96,22 @@ async function fixture(t: Context) {
   }
   return { env, db, user, state, create, tick, signedRequest }
 }
+test('first creation failure is durable, redacted, audited once and not overwritten by later polling', async t => {
+  const s = await fixture(t); s.state.xCreateError = true
+  const created = await s.create(); await s.tick()
+  const read = async () => JSON.parse(await unseal(s.env, 'native:' + created.order.id,
+    String(s.db.prepare('SELECT payload FROM native_jobs').get()!.payload)))
+  const first = (await read()).first_error
+  assert.equal(first.stage, 'creating'); assert.equal(first.code, 'x_query_failed')
+  assert.deepEqual(first.upstream, { operation: 'useOneTimePurchaseGiftMutation', kind: 'http', http_status: 403, error_codes: [353] })
+  await s.tick(); await s.tick()
+  assert.deepEqual((await read()).first_error, first)
+  assert.equal(s.state.xCreates, 1); assert.equal(s.state.confirms + s.state.methods + s.state.cardOpens, 0)
+  const audits = s.db.prepare("SELECT note FROM audit WHERE action='native_execution_first_error'").all()
+  assert.equal(audits.length, 1)
+  assert.doesNotMatch(JSON.stringify(audits) + JSON.stringify(first), /secret-cookie|4242424242424242|auth_token|ct0/)
+})
+
 test('signed eligibility authenticates, normalizes, rejects replay, and never touches wallet or payment APIs', async t => {
   const s = await fixture(t)
   const unsigned = await worker.fetch(new Request('https://x-api.example.test/v1/eligibility', { method: 'POST', body: '{"username":"receiver"}' }), s.env)

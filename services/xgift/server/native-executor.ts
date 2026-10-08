@@ -1,7 +1,7 @@
 import { Failure, id, readResponse, seal, unseal, type Env } from '../src/core.ts'
 import type { Order } from '../src/orders.ts'
 import type { Result, Snapshot } from '../src/executor.ts'
-import { accountEligibility, quote, xQuery } from '../src/network.ts'
+import { accountEligibility, quote, xQuery, XQueryFailure, type XQueryDiagnostic } from '../src/network.ts'
 import { cardConfiguration, cardRead, cardWrite, paymentCard } from '../src/cards.ts'
 import { giftProfile, giftPolicy } from '../src/gift-profile.ts'
 import { assertPaymentAllowed, type PaymentBinding } from '../src/payments.ts'
@@ -9,8 +9,9 @@ import { assertPaymentAllowed, type PaymentBinding } from '../src/payments.ts'
 // X merchant published by x_gift_bot setup.go. Validate every returned payment page against it.
 export const X_MERCHANT = 'acct_1Ika5JA3KZ32dPo1'
 type Json = Record<string, any>
+interface FirstError { at: number; stage: string; code: string; upstream?: XQueryDiagnostic }
 interface Job { stage: string; session?: string; session_url?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding
-  candidate_index?: number; rejected_cards?: { card_id: number; reason: string }[]; candidates_exhausted?: boolean; tokenization_started?: boolean }
+  candidate_index?: number; rejected_cards?: { card_id: number; reason: string }[]; candidates_exhausted?: boolean; tokenization_started?: boolean; first_error?: FirstError }
 const sessionPattern = /^cs_live_[A-Za-z0-9]+$/
 const successUrl = (o: Order) => `https://x.com/${o.recipient}/gift-premium/success`
 export function validatedCheckoutUrl(value: unknown, session: unknown) {
@@ -40,7 +41,7 @@ async function stripe(key: string, method: string, path: string, fields: Record<
   if (!response.ok || data.error) throw new Error('stripe_result_unconfirmed')
   return data as Json
 }
-async function save(env: Env, order: Order, job: Job, change?: { from_card_id: number; to_card_id: number | null; reason: string }) {
+async function save(env: Env, order: Order, job: Job, change?: { from_card_id: number; to_card_id: number | null; reason: string }, error?: FirstError) {
   const now = Date.now()
   const payload = await seal(env, 'native:' + order.id, JSON.stringify(job))
   // Fence replaced workers: a closed order cannot persist another write-ahead stage.
@@ -48,9 +49,9 @@ async function save(env: Env, order: Order, job: Job, change?: { from_card_id: n
     SELECT 1 FROM orders WHERE id=? AND status IN('running','unknown') AND work_token IS ? AND lease_until>?)
     ON CONFLICT(order_id) DO UPDATE SET stage=excluded.stage,payload=excluded.payload,updated_at=excluded.updated_at`)
     .bind(order.id, job.stage, payload, now, order.id, order.work_token, now)
-  if (change) await env.DB.batch([update, env.DB.prepare(`INSERT INTO audit SELECT ?,?,?,?,?,? WHERE EXISTS(
+  if (change || error) await env.DB.batch([update, env.DB.prepare(`INSERT INTO audit SELECT ?,?,?,?,?,? WHERE EXISTS(
     SELECT 1 FROM native_jobs WHERE order_id=? AND payload=?)`)
-    .bind(id('audit'), 'system', change.to_card_id === null ? 'payment_cards_exhausted' : 'payment_card_failover', order.id, JSON.stringify(change), now, order.id, payload)])
+    .bind(id('audit'), 'system', error ? 'native_execution_first_error' : change!.to_card_id === null ? 'payment_cards_exhausted' : 'payment_card_failover', order.id, JSON.stringify(error ?? change), now, order.id, payload)])
   else await update.run()
   if (!await env.DB.prepare('SELECT 1 FROM native_jobs WHERE order_id=? AND payload=?').bind(order.id, payload).first())
     throw new Failure('order_busy', '原订单已由其他操作接管，请刷新状态。', 409)
@@ -261,6 +262,18 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
     }
     return unknown('execution_stage_unconfirmed')
   } catch (error) {
+    if (!job.first_error) {
+      // Fixed internal codes only. Unexpected exception messages may contain secrets.
+      const code = error instanceof XQueryFailure ? error.code : error instanceof CardCheckError ? error.reason :
+        error instanceof Error && ['invalid_checkout', 'invalid_checkout_url', 'stripe_result_unconfirmed',
+          'checkout_identity_mismatch', 'checkout_amount_mismatch', 'checkout_product_mismatch', 'checkout_not_unpaid',
+          'billing_profile_missing', 'payment_evidence_mismatch'].includes(error.message) ? error.message : 'execution_requires_reconciliation'
+      job.first_error = { at: Date.now(), stage: job.stage, code,
+        ...(error instanceof XQueryFailure ? { upstream: error.diagnostic } : {}) }
+      // Same lease fence as payment stages: cancellation/replaced workers cannot write.
+      // Logging failure must not change the original result or trigger another request.
+      try { await save(env, order, job, undefined, job.first_error) } catch { /* preserve original outcome */ }
+    }
     return unknown(error instanceof Failure ? error.code : error instanceof CardCheckError ? error.reason : 'execution_requires_reconciliation')
   }
 }
