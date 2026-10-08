@@ -8,7 +8,7 @@ import { AlipayOrders } from './AlipaySettings'
 import { AdminDirectGift } from './AdminDirectGift'
 import type { Request } from './Recharge'
 import { orderFailureDescription } from './order-failures'
-import { isClosedOrder, orderActions, orderNextStep, orderProduct, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow, type OrdersView } from './order-ui'
+import { isClosedOrder, orderActions, orderCloseConfirmation, orderNextStep, orderProduct, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow, type OrdersView } from './order-ui'
 import { useUnsavedChanges } from './unsaved-changes'
 import './orders-console.css'
 
@@ -123,7 +123,7 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
   async function action(row: OrderRow, kind: Action) {
     const allowed = orderActions(row)
     if (busyRef.current || !(kind === 'payment-page' ? allowed.payment_page : allowed[kind]) ||
-      (kind === 'close' && (confirmation !== 'CLOSE_ORDER' || !reason.trim()))) return
+      (kind === 'close' && (confirmation !== orderCloseConfirmation(row) || !reason.trim()))) return
     busyRef.current = true; sequence.current++; setBusy(`${row.id}:${kind}`); setActionError(''); setMessage(''); setLoading(false)
     try {
       const path = `/api/admin/orders/${encodeURIComponent(row.id)}/${kind}`
@@ -139,11 +139,13 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
           setPaymentLink(null)
         }
       } else {
-        await request(path, { reason: reason.trim(), confirmation: 'CLOSE_ORDER' })
+        const result = await request<{ order: OrderRow }>(path, { reason: reason.trim(), confirmation: orderCloseConfirmation(row) })
         if (mounted.current) {
           setClosing(null); setReason(''); setConfirmation(''); setPaymentLink(null)
-          setDetails((selected) => selected?.id === row.id ? { ...selected, status: 'failed', failure_code: 'cancelled_before_execution', actions: undefined } : selected)
-          setMessage('订单已安全关闭，冻结点数已释放。卡密兑换记录继续保留，不会自动恢复为未使用。')
+          setDetails((selected) => selected?.id === row.id ? { ...selected, ...result.order, actions: undefined } : selected)
+          setMessage(result.order.failure_code === 'cancelled_unconfirmed_creation'
+            ? '本地订单已终止，冻结点数已释放，系统不会再提交本单付款。X 端可能存在的历史账单未被撤销，请勿另行支付。'
+            : '订单已安全关闭，冻结点数已释放。卡密兑换记录继续保留，不会自动恢复为未使用。')
         }
       }
     } catch (error) {
@@ -157,6 +159,8 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
 
   const locked = !!busy || !!closing
   const selectedActions = details ? orderActions(details) : null
+  const closeToken = details ? orderCloseConfirmation(details) : 'CLOSE_ORDER'
+  const terminatingCreation = closeToken === 'CLOSE_UNCONFIRMED_CREATION'
   const paymentReady = details && paymentLink?.id === details.id && selectedActions?.payment_page
   const blockedTarget = queue?.blocked_order_id ? ordersHash({ status: '', query: queue.blocked_order_id, page: 1 }) : null
 
@@ -220,13 +224,13 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
     <Dialog.Root open={!!details} onOpenChange={(open) => { if (!open) dismissDetails() }}>
       <Dialog size="lg" className="x-modal oc-dialog">
         {closing ? <form onSubmit={submitClose}>
-          <Dialog.Title className="oc-dialog-title">安全关闭订单</Dialog.Title>
-          <Dialog.Description className="oc-dialog-description">@{closing.recipient} · {orderProduct(closing.product_code)}。系统会再次确认未创建付款，再关闭订单并释放冻结点数。关闭不会退款、重新扣款或恢复已兑换卡密。</Dialog.Description>
+          <Dialog.Title className="oc-dialog-title">{terminatingCreation ? '终止账单创建异常订单' : '安全关闭订单'}</Dialog.Title>
+          <Dialog.Description className="oc-dialog-description">@{closing.recipient} · {orderProduct(closing.product_code)}。{terminatingCreation ? '系统会再次确认没有付款会话、支付方式或扣款提交记录，再终止本地订单并释放冻结点数。这不会撤销 X 端可能创建的账单，请勿另行支付该历史账单。' : '系统会再次确认未创建付款，再关闭订单并释放冻结点数。关闭不会退款、重新扣款或恢复已兑换卡密。'}</Dialog.Description>
           <dl className="oc-close-summary"><div><dt>订单号</dt><dd><code>{closing.id}</code></dd></div><div><dt>冻结点数</dt><dd>{closing.points} 点</dd></div></dl>
-          <div className="modal-fields"><Input label="关闭原因" value={reason} maxLength={200} required disabled={!!busy} onChange={(event) => setReason(event.target.value)} /><Input label="输入 CLOSE_ORDER 确认" value={confirmation} autoComplete="off" spellCheck={false} required disabled={!!busy} onChange={(event) => setConfirmation(event.target.value)} /></div>
+          <div className="modal-fields"><Input label="关闭原因" value={reason} maxLength={200} required disabled={!!busy} onChange={(event) => setReason(event.target.value)} /><Input label={`输入 ${closeToken} 确认`} value={confirmation} autoComplete="off" spellCheck={false} required disabled={!!busy} onChange={(event) => setConfirmation(event.target.value)} /></div>
           {selectedActions && !selectedActions.close && <p className="oc-notice" role="status">订单状态已变化，目前不可安全关闭。请返回详情核对。</p>}
           {actionError && <p className="oc-notice oc-error" role="alert">{actionError}</p>}
-          <div className="oc-dialog-footer"><Button type="button" variant="secondary" disabled={!!busy} onClick={() => { setClosing(null); setReason(''); setConfirmation(''); setActionError('') }}>取消关闭</Button><Button type="submit" variant="primary" disabled={!!busy || !selectedActions?.close || !reason.trim() || confirmation !== 'CLOSE_ORDER'}>{busy ? '正在安全检查…' : '确认安全关闭'}</Button></div>
+          <div className="oc-dialog-footer"><Button type="button" variant="secondary" disabled={!!busy} onClick={() => { setClosing(null); setReason(''); setConfirmation(''); setActionError('') }}>取消关闭</Button><Button type="submit" variant="primary" disabled={!!busy || !selectedActions?.close || !reason.trim() || confirmation !== closeToken}>{busy ? '正在安全检查…' : terminatingCreation ? '确认终止本地订单' : '确认安全关闭'}</Button></div>
         </form> : details && <>
           <div className="oc-dialog-heading"><div><Dialog.Title className="oc-dialog-title">@{details.recipient}</Dialog.Title><Dialog.Description className="oc-dialog-description">{orderProduct(details.product_code)} · {source(details)}</Dialog.Description></div><Button variant="ghost" aria-label="关闭订单详情" disabled={!!busy} onClick={dismissDetails}><X size={18} /></Button></div>
           <div className="oc-detail-state"><span className={`status status-${isClosedOrder(details) ? 'closed' : details.status}`}>{orderStateText(details)}</span><p>{orderNextStep(details, queue?.queue_blocked)}</p></div>
@@ -241,7 +245,7 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
           {paymentReady && <p className="oc-payment-note" role="status">原付款页已获取。请先查看是否已付款；如需验证，在原页完成后返回核对原单，避免再次支付。</p>}
           <dl className="oc-detail-fields"><div><dt>订单号</dt><dd><code>{details.id}</code></dd></div><div><dt>商户单号</dt><dd><code>{details.merchant_order_no}</code></dd></div><div><dt>所属商户</dt><dd>{details.user_name || '—'}</dd></div><div><dt>点数</dt><dd>{details.points} 点</dd></div><div><dt>创建时间</dt><dd>{time(details.created_at)}</dd></div><div><dt>更新时间</dt><dd>{time(details.updated_at)}</dd></div>{details.queue_position && <div><dt>队列位置</dt><dd>第 {details.queue_position} 位</dd></div>}</dl>
           {(details.failure_code || details.receipt) && <div className="oc-evidence"><h3>执行记录</h3>{details.failure_code && <><p>{orderFailureDescription(details.failure_code) || '原执行端返回以下状态，可据此核对这笔订单。'}</p><dl><div><dt>原始状态码</dt><dd><code>{details.failure_code}</code></dd></div></dl></>}{details.receipt && <dl><div><dt>付款凭证</dt><dd><code>{details.receipt}</code></dd></div></dl>}</div>}
-          <div className="oc-close-area">{selectedActions?.close ? <><p>当前证据显示尚未创建付款，可安全关闭并释放冻结点数。已兑换卡密会保留记录。</p><Button variant="ghost" disabled={!!busy || !!detailError} onClick={() => startClose(details)}>安全关闭订单</Button></> : ['running', 'unknown'].includes(details.status) && <p>付款尚在执行或结果待确认，不能关闭并释放点数。请按上方可用步骤处理原单。</p>}</div>
+          <div className="oc-close-area">{selectedActions?.close ? <><p>{terminatingCreation ? selectedActions.message : '当前证据显示尚未创建付款，可安全关闭并释放冻结点数。已兑换卡密会保留记录。'}</p><Button variant="ghost" disabled={!!busy || !!detailError} onClick={() => startClose(details)}>{terminatingCreation ? '终止本地订单' : '安全关闭订单'}</Button></> : ['running', 'unknown'].includes(details.status) && <p>付款尚在执行或结果待确认，不能关闭并释放点数。请按上方可用步骤处理原单。</p>}</div>
         </>}
       </Dialog>
     </Dialog.Root>

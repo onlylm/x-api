@@ -30,10 +30,19 @@ export type AdminOrderCapabilities = {
   close: boolean
   reason_code: string
   message: string
+  close_confirmation?: 'CLOSE_UNCONFIRMED_CREATION'
 }
 
 const hasNotStartedPayment = (job: Record<string, any> | null) => !job ||
   (job.stage === 'preflight' && !job.session && !job.session_url && !job.method && !job.submitted_at && !job.tokenization_started)
+
+// Creation only sends recipient/product data to X, never card details. Terminating
+// this local job does not expire a possibly orphaned upstream checkout. Therefore
+// require a distinct admin acknowledgement and reject ANY downstream evidence.
+const hasUnconfirmedCreation = (order: Order, job: Record<string, any> | null) =>
+  order.status === 'unknown' && order.receipt === null && job?.stage === 'creating' &&
+  ['session', 'session_url', 'method', 'checksum', 'submitted_at', 'proof', 'tokenization_started']
+    .every(field => !Object.hasOwn(job, field))
 
 /** Admin-only display hints from persisted evidence. No claims, HTTP requests,
  * provider queries or financial writes. Action endpoints still recheck state. */
@@ -57,6 +66,11 @@ export async function adminOrderCapabilities(env: Env, order: Order): Promise<Ad
     if (hasNotStartedPayment(job)) return {
       check, payment_page: false, close: true, reason_code: 'payment_not_started',
       message: '未创建付款会话，可继续核对或安全关闭。',
+    }
+    if (hasUnconfirmedCreation(order, job)) return {
+      check, payment_page: false, close: true, close_confirmation: 'CLOSE_UNCONFIRMED_CREATION',
+      reason_code: 'unconfirmed_creation_not_submitted',
+      message: 'X 账单创建结果未知，但本单没有进入银行卡支付阶段。可由管理员确认风险后终止本地订单；此操作不会撤销 X 端可能创建的账单。',
     }
     let payment_page = false
     if (job && ['submitted', 'paid'].includes(job.stage)) {
@@ -160,7 +174,8 @@ export async function adminCheckOrder(env: Env, orderId: string) {
 }
 
 export async function adminCloseOrder(env: Env, orderId: string, data: Record<string, unknown>, queuedOnly = false) {
-  if (data.confirmation !== 'CLOSE_ORDER') return fail('confirmation_required', '请确认安全关闭原订单。')
+  const terminateCreation = data.confirmation === 'CLOSE_UNCONFIRMED_CREATION'
+  if (data.confirmation !== 'CLOSE_ORDER' && !terminateCreation) return fail('confirmation_required', '请确认关闭原订单。')
   const reason = text(data.reason, '关闭原因', 300), existing = await loadOrder(env, orderId)
   if (queuedOnly && (existing.status !== 'queued' || existing.execution_config))
     return fail('cannot_cancel', '只能取消尚未开始执行的订单。', 409)
@@ -175,21 +190,26 @@ export async function adminCloseOrder(env: Env, orderId: string, data: Record<st
     const job = await nativeJob(env, order)
     // A live checkout can still be paid outside this service. Without merchant
     // permission to expire it, "unpaid" is not enough to release this order.
-    if (!hasNotStartedPayment(job))
+    if (terminateCreation && (queuedOnly || !hasUnconfirmedCreation(order, job)))
+      return fail('cannot_terminate_creation', '仅允许终止没有付款会话、支付方式或扣款提交记录的待核对账单创建请求。状态已变化，请刷新原单；不能强制关闭已进入支付阶段的订单。', 409)
+    if (!terminateCreation && !hasNotStartedPayment(job))
       return fail('cannot_close_payment_started', '原付款可能已创建或已提交，不能仅关闭本地订单。请先核对原单；需要验证时打开原付款页面。只有确认未创建付款的订单可安全关闭，防止关闭后仍被扣款。', 409)
     if (!claimed && existing.execution_config)
       return fail('cannot_close_execution_bound', '订单已绑定执行配置，请刷新并先核对原单。', 409)
     const now = Date.now(), marker = claimed ? order.work_token! : id('adminclose')
+    const failureCode = terminateCreation ? 'cancelled_unconfirmed_creation' : 'cancelled_before_execution'
     const condition = claimed ? "status IN('running','unknown') AND work_token=?" : "status='queued' AND execution_config IS NULL AND lease_until<=?"
     // State transition and audit are committed together. Existing database
     // triggers return the frozen points and release the account exactly once.
     await env.DB.batch([
-      env.DB.prepare(`UPDATE orders SET status='failed',failure_code='cancelled_before_execution',work_token=?,lease_until=0,updated_at=?
+      env.DB.prepare(`UPDATE orders SET status='failed',failure_code=?,work_token=?,lease_until=0,updated_at=?
         WHERE id=? AND ${condition}`)
-        .bind(marker, now, order.id, claimed ? marker : now),
+        .bind(failureCode, marker, now, order.id, claimed ? marker : now),
       env.DB.prepare(`INSERT INTO audit SELECT ?,?,?,?,?,? WHERE EXISTS(
         SELECT 1 FROM orders WHERE id=? AND status='failed' AND work_token=? AND updated_at=?)`)
-        .bind(id('audit'), 'admin', 'close_order', order.id, reason, now, order.id, marker, now),
+        .bind(id('audit'), 'admin', terminateCreation ? 'close_unconfirmed_creation' : 'close_order', order.id,
+          terminateCreation ? JSON.stringify({ reason, stage: 'creating', upstream_checkout_unconfirmed: true, no_card_submission: true }) : reason,
+          now, order.id, marker, now),
     ])
     const current = await loadOrder(env, order.id)
     if (current.status !== 'failed' || current.work_token !== marker)

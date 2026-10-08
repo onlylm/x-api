@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { legacyPaymentStatus, orderActions, orderNextStep, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow } from '../services/xgift/web/order-ui.ts'
+import { legacyPaymentStatus, orderActions, orderCloseConfirmation, orderNextStep, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow } from '../services/xgift/web/order-ui.ts'
 
 test('admin payment links allow only live Stripe hosted checkout sessions', () => {
   const actual = 'https://checkout.stripe.com/c/pay/cs_live_abc123#original-fragment'
@@ -32,7 +32,19 @@ test('order state distinguishes queued, unresolved, success and admin closure', 
   assert.equal(orderStateText({ status: 'succeeded' }), '付款已确认')
   assert.equal(orderStateText({ status: 'failed', failure_code: 'cancelled_by_admin' }), '已关闭')
   assert.equal(orderStateText({ status: 'failed', failure_code: 'cancelled_before_execution' }), '已关闭')
+  assert.equal(orderStateText({ status: 'failed', failure_code: 'cancelled_unconfirmed_creation' }), '已关闭')
   assert.equal(orderStateText({ status: 'failed', failure_code: 'card_declined' }), '已结束')
+})
+
+test('unresolved creation termination uses the explicit acknowledgement rather than normal close', () => {
+  const row: OrderRow = { id: 'ord_fixture', merchant_order_no: 'fixture', recipient: 'receiver',
+    product_code: 'x-premium-3m', mode: 'direct', points: 300, status: 'unknown', created_at: 1,
+    actions: { check: true, payment_page: false, close: true, reason_code: 'unconfirmed_creation_not_submitted',
+      message: '确认风险后终止本地订单', close_confirmation: 'CLOSE_UNCONFIRMED_CREATION' } }
+  assert.equal(orderCloseConfirmation(row), 'CLOSE_UNCONFIRMED_CREATION')
+  assert.equal(orderActions(row).payment_page, false)
+  assert.equal(orderActions({ ...row, status: 'failed' }).close, false)
+  assert.equal(orderCloseConfirmation({ ...row, actions: undefined }), 'CLOSE_ORDER')
 })
 
 test('order status alone cannot authorize financial actions, and terminal state invalidates stale hints', () => {

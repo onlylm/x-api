@@ -63,6 +63,9 @@ async function fixture(t: Context) {
   return { env, db, user, snapshot, order, job, api, login }
 }
 const close = { reason: '测试结束，不再执行', confirmation: 'CLOSE_ORDER' }
+const terminate = { reason: '管理员确认终止本地创建异常原单，理解可能存在未撤销的上游账单', confirmation: 'CLOSE_UNCONFIRMED_CREATION' }
+const creationOnly = { stage: 'creating', session: undefined, session_url: undefined, method: undefined,
+  checksum: undefined, submitted_at: undefined, proof: undefined, tokenization_started: undefined }
 const rejectsCode = (promise: Promise<unknown>, code: string) => assert.rejects(promise, (e: Failure) => e.code === code)
 
 test('only administrators can reveal original payment links; public order data never includes checkout secrets', async t => {
@@ -167,6 +170,112 @@ test('a possible original checkout or 3DS never permits local close or releases 
     assert.equal(f.db.prepare('SELECT status FROM orders').get()!.status, 'unknown')
     assert.equal(f.db.prepare('SELECT lease_until FROM orders').get()!.lease_until, 0)
   }
+})
+
+test('terminating an unresolved creation requires distinct confirmation, returns points once and retains original job', async t => {
+  const f = await fixture(t), order = await f.order('unknown')
+  await f.job(order, creationOnly)
+  f.db.prepare('INSERT INTO account_slots VALUES(?,?,?,0)').run(order.id, 'sec_actionfixture', '2026-10-08')
+  const payload = f.db.prepare('SELECT payload FROM native_jobs WHERE order_id=?').get(order.id)!.payload
+  const capabilities = await adminOrderCapabilities(f.env, order)
+  assert.equal(capabilities.close, true)
+  assert.equal(capabilities.payment_page, false)
+  assert.equal(capabilities.close_confirmation, terminate.confirmation)
+  assert.match(capabilities.message, /不会撤销 X/)
+  await rejectsCode(adminCloseOrder(f.env, order.id, close), 'cannot_close_payment_started')
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('Termination must not contact any provider') })
+  const result = await adminCloseOrder(f.env, order.id, terminate)
+  assert.equal(result.closed, true)
+  assert.equal(result.order.failure_code, 'cancelled_unconfirmed_creation')
+  assert.equal(f.db.prepare('SELECT available FROM wallets').get()!.available, 10000)
+  assert.equal(f.db.prepare('SELECT frozen FROM wallets').get()!.frozen, 0)
+  assert.equal(f.db.prepare('SELECT released FROM account_slots').get()!.released, 1)
+  assert.equal(f.db.prepare('SELECT payload FROM native_jobs WHERE order_id=?').get(order.id)!.payload, payload)
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='close_unconfirmed_creation'").get()!.n, 1)
+  await rejectsCode(adminCloseOrder(f.env, order.id, terminate), 'order_already_closed')
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM ledger WHERE kind='release'").get()!.n, 1)
+})
+
+test('creation termination rejects every downstream field, even null, empty, false or zero evidence', async t => {
+  const f = await fixture(t), order = await f.order('unknown')
+  for (const field of ['session', 'session_url', 'method', 'checksum', 'submitted_at', 'proof', 'tokenization_started']) {
+    for (const value of [null, '', false, 0]) {
+      await f.job(order, { ...creationOnly, [field]: value })
+      assert.equal((await adminOrderCapabilities(f.env, order)).close, false, field)
+      await rejectsCode(adminCloseOrder(f.env, order.id, terminate), 'cannot_terminate_creation')
+    }
+  }
+  assert.equal(f.db.prepare('SELECT frozen FROM wallets').get()!.frozen, 300)
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM ledger WHERE kind='release'").get()!.n, 0)
+})
+
+test('creation termination never becomes a generic forced close for other stages, receipts or live leases', async t => {
+  const f = await fixture(t), order = await f.order('unknown')
+  for (const stage of ['preflight', 'session', 'funding', 'funded', 'tokenizing', 'tokenized', 'submitted', 'paid']) {
+    await f.job(order, { ...creationOnly, stage })
+    await rejectsCode(adminCloseOrder(f.env, order.id, terminate), 'cannot_terminate_creation')
+  }
+  await f.job(order, creationOnly)
+  f.db.prepare("UPDATE orders SET receipt='cs_live_fixture' WHERE id=?").run(order.id)
+  await rejectsCode(adminCloseOrder(f.env, order.id, terminate), 'cannot_terminate_creation')
+  f.db.prepare('UPDATE orders SET receipt=NULL,lease_until=? WHERE id=?').run(Date.now() + 180000, order.id)
+  await rejectsCode(adminCloseOrder(f.env, order.id, terminate), 'order_busy')
+  assert.equal(f.db.prepare('SELECT frozen FROM wallets').get()!.frozen, 300)
+})
+
+test('creation termination is administrator-only, same-origin and atomic with its audit', async t => {
+  const f = await fixture(t), order = await f.order('unknown'), path = '/api/admin/orders/' + order.id + '/close'
+  await f.job(order, creationOnly)
+  assert.equal((await f.api(path, terminate)).status, 401)
+  const merchant = await f.login(f.user.email, 'fixture-user-password')
+  assert.equal((await f.api(path, terminate, merchant)).status, 403)
+  const admin = await f.login()
+  assert.equal((await f.api(path, terminate, admin, 'https://other.example')).status, 403)
+  f.db.exec("CREATE TRIGGER reject_termination_audit BEFORE INSERT ON audit WHEN NEW.action='close_unconfirmed_creation' BEGIN SELECT RAISE(ABORT,'fixture_termination_audit_failure'); END")
+  await assert.rejects(adminCloseOrder(f.env, order.id, terminate), /fixture_termination_audit_failure/)
+  assert.equal(f.db.prepare('SELECT status FROM orders').get()!.status, 'unknown')
+  assert.equal(f.db.prepare('SELECT frozen FROM wallets').get()!.frozen, 300)
+  assert.equal(f.db.prepare('SELECT lease_until FROM orders').get()!.lease_until, 0)
+  f.db.exec('DROP TRIGGER reject_termination_audit')
+  assert.equal((await f.api(path, terminate, admin)).status, 200)
+})
+
+test('running and queued creations cannot use the unresolved-creation acknowledgement', async t => {
+  const f = await fixture(t)
+  for (const state of ['queued', 'running'] as const) {
+    const order = await f.order(state, state)
+    await f.job(order, creationOnly)
+    await rejectsCode(adminCloseOrder(f.env, order.id, terminate), 'cannot_terminate_creation')
+  }
+})
+
+test('a late X checkout creation response cannot resume payment after local termination', async t => {
+  const f = await fixture(t), order = await f.order('running')
+  f.db.prepare('UPDATE orders SET lease_until=? WHERE id=?').run(Date.now() + 180000, order.id)
+  let notify!: () => void, resume!: () => void, creates = 0, cardRequests = 0
+  const started = new Promise<void>(resolve => { notify = resolve }), pending = new Promise<void>(resolve => { resume = resolve })
+  t.mock.method(globalThis, 'fetch', async (input: string | URL, init?: RequestInit) => {
+    const url = new URL(String(input))
+    if (url.hostname === 'api.stripe.com') { cardRequests++; throw new Error('No downstream card operation authorized') }
+    if (init?.method === 'POST') {
+      assert.ok(url.pathname.endsWith('/useOneTimePurchaseGiftMutation'))
+      creates++; notify(); await pending
+      return Response.json({ data: { onetimepurchase_gift: { session_status: 'Unpaid', session_id: sessionId, session_url: originalUrl } } })
+    }
+    if (url.pathname.endsWith('/PremiumGiftingQuery')) return Response.json({ data: { user: { result: {
+      rest_id: '12345', core: { screen_name: 'receiver' }, premium_gifting_eligible: true } } } })
+    return Response.json({ data: { web_subscription_product_details_by_rest_id: { rest_id: 'prod_TJXJtpzqCpI36N',
+      prices: [{ currency_code: 'BDT', amount_local_micro: 300000000, price_type: 'OneTime' }] } } })
+  })
+  const execution = executeNative(f.env, order, f.snapshot)
+  await started
+  f.db.prepare("UPDATE orders SET status='unknown',lease_until=0 WHERE id=?").run(order.id)
+  await adminCloseOrder(f.env, order.id, terminate)
+  resume(); await execution
+  assert.equal(creates, 1); assert.equal(cardRequests, 0)
+  assert.equal(f.db.prepare('SELECT status FROM orders').get()!.status, 'failed')
+  assert.equal(f.db.prepare('SELECT stage FROM native_jobs').get()!.stage, 'creating')
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM ledger WHERE kind='release'").get()!.n, 1)
 })
 
 test('targeted query only GETs the original checkout and settles verified success once, without processing another queued order', async t => {

@@ -1,5 +1,6 @@
 export type OrderActions = {
   check: boolean; payment_page: boolean; close: boolean; reason_code: string; message: string
+  close_confirmation?: 'CLOSE_UNCONFIRMED_CREATION'
 }
 
 export type OrderRow = {
@@ -55,6 +56,11 @@ export function orderNextStep(order: OrderRow, blocked = false): string {
   return orderActions(order).message
 }
 
+export function orderCloseConfirmation(order: OrderRow): string {
+  return orderActions(order).close_confirmation === 'CLOSE_UNCONFIRMED_CREATION'
+    ? 'CLOSE_UNCONFIRMED_CREATION' : 'CLOSE_ORDER'
+}
+
 export function orderProduct(code: string): string {
   return ({ 'x-premium-3m': 'X Premium · 3 个月', 'x-premium-6m': 'X Premium · 6 个月' } as Record<string, string>)[code] ?? code
 }
@@ -70,7 +76,7 @@ export function safePaymentPage(value: unknown): string | null {
 }
 
 export function isClosedOrder(order: Pick<OrderRow, 'status' | 'failure_code'>): boolean {
-  return order.status === 'failed' && ['cancelled_before_execution', 'cancelled_by_admin'].includes(order.failure_code ?? '')
+  return order.status === 'failed' && ['cancelled_before_execution', 'cancelled_by_admin', 'cancelled_unconfirmed_creation'].includes(order.failure_code ?? '')
 }
 
 export function orderStateText(order: Pick<OrderRow, 'status' | 'failure_code'>): string {
