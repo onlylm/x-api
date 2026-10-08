@@ -10,15 +10,18 @@ import { assertPaymentAllowed, type PaymentBinding } from '../src/payments.ts'
 export const X_MERCHANT = 'acct_1Ika5JA3KZ32dPo1'
 type Json = Record<string, any>
 interface FirstError { at: number; stage: string; code: string; upstream?: XQueryDiagnostic }
-interface Job { stage: string; session?: string; session_url?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding
+interface Job { stage: string; session?: string; session_url?: string; card_id?: number; method?: string; checksum?: string; submitted_at?: number; proof?: Json; key: string; payment?: PaymentBinding; manual_approved_at?: number
   candidate_index?: number; rejected_cards?: { card_id: number; reason: string }[]; candidates_exhausted?: boolean; tokenization_started?: boolean; first_error?: FirstError }
 const sessionPattern = /^cs_live_[A-Za-z0-9]+$/
+export function manualApprovalFresh(at: unknown, now = Date.now()) {
+  return typeof at === 'number' && Number.isSafeInteger(at) && at > 0 && at <= now && now - at < 300000
+}
 const successUrl = (o: Order) => `https://x.com/${o.recipient}/gift-premium/success`
 export function validatedCheckoutUrl(value: unknown, session: unknown) {
   if (typeof value !== 'string' || value.length > 8192 || typeof session !== 'string' || !sessionPattern.test(session)) throw new Error('invalid_checkout_url')
   const url = new URL(value)
   if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com' || url.port || url.username || url.password ||
-      !['/c/pay/' + session, '/pay/' + session].includes(url.pathname)) throw new Error('invalid_checkout_url')
+      !['/c/pay/' + session, '/g/pay/' + session, '/pay/' + session].includes(url.pathname)) throw new Error('invalid_checkout_url')
   return url.href
 }
 export function guardPage(p: Json, order: Order, session: string, before: boolean) {
@@ -66,9 +69,12 @@ async function prepareWrite(env: Env, order: Order, job: Job, stage: string) {
   try {
     // Saving is asynchronous: a pause can arrive after the preceding guard.
     await assertPaymentAllowed(env, job.payment, order.id)
+    if (stage === 'submitted' && job.payment?.manual_confirmation && !manualApprovalFresh(job.manual_approved_at))
+      throw new Failure('manual_payment_approval_expired', '人工付款授权已过期，请重新确认原单。', 409)
   } catch (error) {
     // No upstream request was sent, so resuming can safely retry the previous stage.
     job.stage = previous
+    if (stage === 'submitted' && job.payment?.manual_confirmation) delete job.submitted_at
     await save(env, order, job)
     throw error
   }
@@ -232,15 +238,22 @@ export async function executeNative(env: Env, order: Order, snapshot: Snapshot):
       for (const [name, value] of Object.entries({ line1: billing.billing_line1, line2: billing.billing_line2, city: billing.billing_city, state: billing.billing_state, postal_code: billing.billing_postal_code })) if (value) fields[`billing_details[address][${name}]`] = value
       const method = await stripe(job.key, 'POST', 'payment_methods', fields, 'xgift-method-' + order.id)
       if (method.livemode !== true || method.type !== 'card' || !/^pm_[A-Za-z0-9]+$/.test(method.id)) throw new Error('invalid_payment_method')
-      job.method = method.id; job.stage = 'tokenized'; await save(env, order, job); return running()
+      job.method = method.id; job.stage = payment?.manual_confirmation ? 'awaiting_approval' : 'tokenized'
+      await save(env, order, job)
+      return payment?.manual_confirmation ? unknown('manual_payment_approval_required') : running()
     }
-    if (job.stage === 'tokenized') {
+    if (job.stage === 'awaiting_approval' || job.stage === 'tokenized') {
+      if (job.stage === 'awaiting_approval' && !payment?.manual_confirmation) return unknown('manual_payment_binding_missing')
+      if (payment?.manual_confirmation && !manualApprovalFresh(job.manual_approved_at))
+        return unknown(job.manual_approved_at ? 'manual_payment_approval_expired' : 'manual_payment_approval_required')
       const check = await accountEligibility(env, snapshot.account, snapshot.proxy, order.recipient)
       if (!check.eligible || check.recipient_id !== order.recipient_id) return { order_id: order.id, status: 'failed', financial_state: 'not_charged', failure_code: 'recipient_changed_before_payment' }
       const page = await stripe(job.key, 'POST', `payment_pages/${job.session}/init`, { browser_locale: 'en', redirect_type: 'url' })
       guardPage(page, order, job.session, true)
       if (payment) validateCard(await paymentCard(env, job.card_id!), job.card_id!, true)
       await assertPaymentAllowed(env, payment, order.id)
+      // Recheck after asynchronous price/card reads; stale approval cannot debit.
+      if (payment?.manual_confirmation && !manualApprovalFresh(job.manual_approved_at)) return unknown('manual_payment_approval_expired')
       job.proof = page; job.checksum = page.init_checksum; job.submitted_at = Date.now()
       await prepareWrite(env, order, job, 'submitted')
       // Deliberately submit once. Every subsequent invocation only inspects the same checkout.
@@ -286,6 +299,10 @@ export async function queryNativeOrder(env: Env, order: Order, _snapshot: Snapsh
   try {
     const job = JSON.parse(await unseal(env, 'native:' + order.id, row.payload)) as Job
     if (job.stage === 'preflight' && !job.session) return { order_id: order.id, status: 'running', failure_code: 'payment_not_started' }
+    if (job.stage === 'awaiting_approval' && job.payment?.manual_confirmation) {
+      guardPage(job.proof!, order, job.session!, true)
+      return unknown(manualApprovalFresh(job.manual_approved_at) ? 'manual_payment_approved' : 'manual_payment_approval_required')
+    }
     if (!job.session || !sessionPattern.test(job.session)) return unknown('original_request_unconfirmed')
     if (!/^pk_live_[A-Za-z0-9]+$/.test(job.key)) return unknown('execution_configuration_missing')
     // URL alone is not proof: bind exact merchant, recipient, one-time product and price.

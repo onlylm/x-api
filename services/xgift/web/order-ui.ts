@@ -1,11 +1,13 @@
 export type OrderActions = {
   check: boolean; payment_page: boolean; close: boolean; reason_code: string; message: string
   close_confirmation?: 'CLOSE_UNCONFIRMED_CREATION'
+  approve_payment?: boolean; payment_card_id?: number
 }
 
 export type OrderRow = {
   id: string; merchant_order_no: string; recipient: string; user_name?: string
   product_code: string; mode: string; points: number; status: string
+  currency?: string; amount_minor?: number
   receipt?: string | null; failure_code?: string | null; created_at: number; updated_at?: number; queue_position?: number | null
   actions?: OrderActions
 }
@@ -45,7 +47,17 @@ export function orderActions(order: OrderRow): OrderActions {
     check: ['running', 'unknown'].includes(order.status) && order.actions.check === true,
     payment_page: ['running', 'unknown'].includes(order.status) && order.actions.payment_page === true,
     close: ['queued', 'running', 'unknown'].includes(order.status) && order.actions.close === true,
+    approve_payment: ['running', 'unknown'].includes(order.status) && order.actions.approve_payment === true,
   }
+}
+
+export function manualPaymentRequest(order: OrderRow, confirmation: string): Record<string, unknown> {
+  const actions = orderActions(order)
+  if (!actions.approve_payment || confirmation !== 'CONFIRM_PAYMENT' || !Number.isSafeInteger(actions.payment_card_id) ||
+      !Number.isSafeInteger(order.amount_minor) || !['bdt'].includes(order.currency ?? ''))
+    throw new Error('付款信息或确认内容已变化，请刷新原单后重新确认。')
+  return { confirmation, expected_card_id: actions.payment_card_id, expected_amount_minor: order.amount_minor,
+    expected_currency: order.currency, expected_recipient: order.recipient }
 }
 
 export function orderNextStep(order: OrderRow, blocked = false): string {
@@ -70,7 +82,7 @@ export function safePaymentPage(value: unknown): string | null {
   try {
     const url = new URL(value)
     if (url.protocol !== 'https:' || url.hostname !== 'checkout.stripe.com' || url.username || url.password || url.port) return null
-    if (!/^\/(?:c\/)?pay\/cs_live_[A-Za-z0-9]+$/.test(url.pathname)) return null
+    if (!/^\/(?:[cg]\/)?pay\/cs_live_[A-Za-z0-9]+$/.test(url.pathname)) return null
     return url.href
   } catch { return null }
 }
@@ -81,6 +93,8 @@ export function isClosedOrder(order: Pick<OrderRow, 'status' | 'failure_code'>):
 
 export function orderStateText(order: Pick<OrderRow, 'status' | 'failure_code'>): string {
   if (isClosedOrder(order)) return '已关闭'
+  if (order.status === 'unknown' && ['manual_payment_approval_required', 'manual_payment_approval_expired'].includes(order.failure_code ?? '')) return '待人工确认'
+  if (order.status === 'unknown' && order.failure_code === 'manual_payment_approved') return '待提交付款'
   return ({ queued: '排队中', running: '执行中', unknown: '待核对', succeeded: '付款已确认', failed: '已结束' } as Record<string, string>)[order.status] ?? order.status
 }
 

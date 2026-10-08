@@ -1,7 +1,8 @@
-import { fail, id, text, unseal, type Env } from './core.ts'
+import { fail, id, seal, text, unseal, type Env } from './core.ts'
 import { publicOrder, type Order } from './orders.ts'
 import type { Result, Snapshot } from './executor.ts'
-import { guardPage, validatedCheckoutUrl } from '../server/native-executor.ts'
+import { guardPage, manualApprovalFresh, validatedCheckoutUrl } from '../server/native-executor.ts'
+import { assertPaymentAllowed } from './payments.ts'
 
 const active = (order: Order) => ['running', 'unknown'].includes(order.status)
 async function loadOrder(env: Env, orderId: string) {
@@ -31,6 +32,8 @@ export type AdminOrderCapabilities = {
   reason_code: string
   message: string
   close_confirmation?: 'CLOSE_UNCONFIRMED_CREATION'
+  approve_payment?: boolean
+  payment_card_id?: number
 }
 
 const hasNotStartedPayment = (job: Record<string, any> | null) => !job ||
@@ -63,6 +66,16 @@ export async function adminOrderCapabilities(env: Env, order: Order): Promise<Ad
     if (!active(order)) return unavailable('unsupported_state', '请保留原单并核对执行状态。')
     await snapshotFor(env, order)
     const job = await nativeJob(env, order), check = !!env.NATIVE_ORDER_QUERY
+    if (job?.stage === 'awaiting_approval' && job.payment?.manual_confirmation) {
+      guardPage(job.proof, order, job.session, true)
+      validatedCheckoutUrl(job.session_url, job.session)
+      if (!/^pm_[A-Za-z0-9]+$/.test(job.method ?? '') || job.submitted_at || job.card_id !== job.payment.card_id)
+        return unavailable('evidence_unavailable', '人工付款准备记录不完整，请核对原单。')
+      const approved = manualApprovalFresh(job.manual_approved_at)
+      return { check, payment_page: false, close: false, approve_payment: !approved, payment_card_id: job.card_id,
+        reason_code: approved ? 'manual_payment_approved' : 'manual_payment_approval_required',
+        message: approved ? '已收到本单付款授权，等待队列提交；请勿重复付款。' : '银行卡支付方式已准备，尚未提交扣款。请核对账号、金额和本单银行卡后，人工确认付款。' }
+    }
     if (hasNotStartedPayment(job)) return {
       check, payment_page: false, close: true, reason_code: 'payment_not_started',
       message: '未创建付款会话，可继续核对或安全关闭。',
@@ -128,6 +141,42 @@ async function claimOrder(env: Env, orderId: string) {
 async function releaseClaim(env: Env, order: Order) {
   await env.DB.prepare("UPDATE orders SET lease_until=0 WHERE id=? AND work_token=? AND status IN('running','unknown')")
     .bind(order.id, order.work_token).run()
+}
+
+/** Persist order-bound human authority only. The worker still submits once. */
+export async function adminApprovePayment(env: Env, orderId: string, data: Record<string, unknown>) {
+  if (data.confirmation !== 'CONFIRM_PAYMENT') fail('confirmation_required', '请输入 CONFIRM_PAYMENT 确认真实扣款。')
+  const order = await claimOrder(env, orderId)
+  try {
+    const snapshot = await snapshotFor(env, order), job = await nativeJob(env, order)
+    if (!job || job.stage !== 'awaiting_approval' || !job.payment?.manual_confirmation ||
+        !snapshot.payment?.manual_confirmation || JSON.stringify(snapshot.payment) !== JSON.stringify(job.payment) ||
+        job.submitted_at || !/^pm_[A-Za-z0-9]+$/.test(job.method ?? '') || job.card_id !== job.payment.card_id)
+      return fail('manual_payment_not_ready', '本单不是待人工确认的付款，或已经提交；请核对原单，不可重复扣款。', 409)
+    guardPage(job.proof, order, job.session, true)
+    validatedCheckoutUrl(job.session_url, job.session)
+    if (data.expected_card_id !== job.card_id || data.expected_amount_minor !== order.amount_minor ||
+        data.expected_currency !== order.currency || data.expected_recipient !== order.recipient)
+      fail('manual_payment_confirmation_changed', '账号、金额或银行卡与当前原单不匹配，请刷新后重新确认。', 409)
+    await assertPaymentAllowed(env, job.payment, order.id)
+    if (manualApprovalFresh(job.manual_approved_at)) return { approved: true, order_id: order.id, already_approved: true }
+    const now = Date.now()
+    job.manual_approved_at = now
+    const payload = await seal(env, 'native:' + order.id, JSON.stringify(job))
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE native_jobs SET payload=?,updated_at=? WHERE order_id=? AND stage='awaiting_approval'
+        AND EXISTS(SELECT 1 FROM orders WHERE id=? AND status IN('running','unknown') AND work_token=? AND lease_until>?)`)
+        .bind(payload, now, order.id, order.id, order.work_token, now),
+      env.DB.prepare(`INSERT INTO audit SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM native_jobs WHERE order_id=? AND payload=?)`)
+        .bind(id('audit'), 'admin', 'approve_manual_payment', order.id,
+          JSON.stringify({ card_id: job.card_id, currency: order.currency, amount_minor: order.amount_minor, expires_at: now + 300000 }), now, order.id, payload),
+      env.DB.prepare(`UPDATE orders SET next_check=0,updated_at=? WHERE id=? AND work_token=?
+        AND EXISTS(SELECT 1 FROM native_jobs WHERE order_id=? AND payload=?)`).bind(now, order.id, order.work_token, order.id, payload),
+    ])
+    if (!await env.DB.prepare('SELECT 1 FROM native_jobs WHERE order_id=? AND payload=?').bind(order.id, payload).first())
+      fail('order_busy', '原单状态已改变，本次付款授权未确认，请刷新原单。', 409)
+    return { approved: true, order_id: order.id, expires_at: now + 300000 }
+  } finally { await releaseClaim(env, order) }
 }
 function verifiedSuccess(order: Order, result: Result) {
   const e = result.evidence

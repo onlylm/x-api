@@ -8,7 +8,7 @@ import {
   type Env,
 } from './core.ts'
 import { eligibility } from './network.ts'
-import { prepareOrderPaymentSelection, type OrderPaymentSelection } from './payments.ts'
+import { paymentBinding, prepareOrderPaymentSelection, type OrderPaymentSelection } from './payments.ts'
 import { activeOrdersSql, admissionView, alipaySettlementId, executionReady, newAdmissionSql } from './admission.ts'
 export { executionReady } from './admission.ts'
 export interface Order {
@@ -82,10 +82,12 @@ export async function createOrder(
   userId: string,
   idem: string,
   body: Record<string, unknown>,
-  options: { voucherId?: string; verifiedRecipientId?: string; alipayCheckoutId?: string; paymentCardSelection?: OrderPaymentSelection } = {},
+  options: { voucherId?: string; verifiedRecipientId?: string; alipayCheckoutId?: string; paymentCardSelection?: OrderPaymentSelection; manualConfirmation?: boolean } = {},
 ) {
   // Voucher authority is supplied only by the server-side redemption flow.
   const mode = options.voucherId ? 'voucher' : 'direct'
+  if (body.manual_confirmation !== undefined && options.manualConfirmation === undefined)
+    fail('invalid_input', '人工付款模式仅由管理员赠送入口授权。')
   if (body.payment_card_selection !== undefined && !options.paymentCardSelection)
     fail('invalid_input', '本单指定付款卡仅由管理员赠送入口授权。')
   if ((body.mode !== undefined && body.mode !== mode) || body.voucher_id !== undefined)
@@ -117,6 +119,7 @@ export async function createOrder(
     ...(checkIdentity || checkPrice ? { recipient_id: body.recipient_id, expected_points: body.expected_points } : {}),
     ...(options.voucherId ? { mode, voucher_id: options.voucherId } : {}),
     ...(options.paymentCardSelection ? { payment_card_selection: options.paymentCardSelection } : {}),
+    ...(options.manualConfirmation ? { manual_confirmation: true } : {}),
   }))
   const existing = async () =>
     env.DB.prepare(
@@ -159,9 +162,16 @@ export async function createOrder(
   }
   const orderId = id('ord'),
     now = Date.now()
-  const selectedPayment = options.paymentCardSelection
-    ? await seal(env, 'order-payment:' + orderId, JSON.stringify(await prepareOrderPaymentSelection(env, options.paymentCardSelection)))
-    : null
+  let binding = options.paymentCardSelection ? await prepareOrderPaymentSelection(env, options.paymentCardSelection) : null
+  if (options.manualConfirmation) {
+    if (!env.NATIVE_EXECUTOR || !env.LOCAL_EXECUTOR || env.PAYMENTS_ENABLED !== 'true' || options.voucherId || options.alipayCheckoutId)
+      fail('execution_disabled', '人工确认付款仅支持已启用的管理员原生赠送。', 503)
+    binding ??= await paymentBinding(env)
+    if (!binding) return fail('payment_configuration_missing', '请先配置指定卡付款服务。', 409)
+    // Immutable per-order authority, with one known card and no automatic failover.
+    binding = { ...binding, backup_card_ids: [], order_card_selection: true, manual_confirmation: true }
+  }
+  const selectedPayment = binding ? await seal(env, 'order-payment:' + orderId, JSON.stringify(binding)) : null
   // Paid checkouts already reserved their slot. Admission changes and midnight
   // must not strand that payment; retain all identity, product, payment revision
   // and shared-card serialization checks when converting the reservation.

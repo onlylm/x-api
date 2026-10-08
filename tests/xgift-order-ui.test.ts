@@ -1,6 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { legacyPaymentStatus, orderActions, orderCloseConfirmation, orderNextStep, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow } from '../services/xgift/web/order-ui.ts'
+import { legacyPaymentStatus, manualPaymentRequest, orderActions, orderCloseConfirmation, orderNextStep, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow } from '../services/xgift/web/order-ui.ts'
+
+test('manual payment UI uses explicit server capability, typed acknowledgement and original price/card/recipient', () => {
+  const row: OrderRow = { id: 'ord_fixture', merchant_order_no: 'fixture', recipient: 'receiver', product_code: 'x-premium-3m',
+    mode: 'direct', points: 300, status: 'unknown', currency: 'bdt', amount_minor: 30000, created_at: 1,
+    actions: { check: true, close: false, payment_page: false, reason_code: 'manual_payment_approval_required',
+      message: '待确认', approve_payment: true, payment_card_id: 123 } }
+  assert.deepEqual(manualPaymentRequest(row, 'CONFIRM_PAYMENT'), { confirmation: 'CONFIRM_PAYMENT', expected_card_id: 123,
+    expected_amount_minor: 30000, expected_currency: 'bdt', expected_recipient: 'receiver' })
+  assert.throws(() => manualPaymentRequest(row, ''))
+  for (const patch of [{ status: 'queued' }, { status: 'succeeded' }, { status: 'failed' }, { actions: undefined }, { amount_minor: undefined }])
+    assert.throws(() => manualPaymentRequest({ ...row, ...patch }, 'CONFIRM_PAYMENT'))
+})
 
 test('admin payment links allow only live Stripe hosted checkout sessions', () => {
   const actual = 'https://checkout.stripe.com/c/pay/cs_live_abc123#original-fragment'
@@ -27,6 +39,9 @@ test('closed historical payments are not mislabelled as waiting due to an audit 
 })
 
 test('order state distinguishes queued, unresolved, success and admin closure', () => {
+  assert.equal(orderStateText({ status: 'unknown', failure_code: 'manual_payment_approval_required' }), '待人工确认')
+  assert.equal(orderStateText({ status: 'unknown', failure_code: 'manual_payment_approval_expired' }), '待人工确认')
+  assert.equal(orderStateText({ status: 'unknown', failure_code: 'manual_payment_approved' }), '待提交付款')
   assert.equal(orderStateText({ status: 'queued' }), '排队中')
   assert.equal(orderStateText({ status: 'unknown' }), '待核对')
   assert.equal(orderStateText({ status: 'succeeded' }), '付款已确认')

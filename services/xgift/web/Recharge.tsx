@@ -54,6 +54,7 @@ type Attempt = {
   expected_points: number
   payment_card_selection?: Omit<OrderCardChoice, 'label'>
   payment_card_label?: string
+  manual_confirmation?: boolean
 }
 const message = (e: unknown) =>
   e instanceof Error ? e.message : '请求未确认，请查询原订单。'
@@ -406,6 +407,7 @@ export function DirectRecharge({
   const [products, setProducts] = useState<Product[]>([]),
     [productCode, setProductCode] = useState(attempt?.product_code ?? '')
   const [cardChoice, setCardChoice] = useState<OrderCardChoice | null>(null)
+  const [manualConfirmation, setManualConfirmation] = useState(attempt?.manual_confirmation === true)
   const [username, setUsername] = useState(attempt?.recipient ?? ''),
     [checked, setChecked] = useState<Eligibility | null>(null)
   const [order, setOrder] = useState<Order | null>(null),
@@ -484,6 +486,7 @@ export function DirectRecharge({
       recipient: checked!.username,
       recipient_id: checked!.recipient_id,
       expected_points: product!.points,
+      ...(adminGift && manualConfirmation ? { manual_confirmation: true } : {}),
       ...(adminGift && cardChoice ? { payment_card_selection: {
         card_id: cardChoice.card_id, payment_revision: cardChoice.payment_revision, provider_revision: cardChoice.provider_revision,
       }, payment_card_label: cardChoice.label } : {}),
@@ -529,7 +532,7 @@ export function DirectRecharge({
       <div className="recharge-result-heading">
         <div>
           <h2>{adminGift ? '直接赠送' : '点数直充'}</h2>
-          <p className="note">{adminGift ? '无需卡密。核验并确认后冻结所选商户点数，使用已配置银行卡按队列付款；这会产生真实赠送。' : '选择套餐并核验 X 账号，下单后冻结对应点数。'}</p>
+          <p className="note">{adminGift ? '无需卡密。下单后冻结所选商户点数，按队列准备银行卡支付；可选择自动付款或由管理员最后确认扣款。' : '选择套餐并核验 X 账号，下单后冻结对应点数。'}</p>
         </div>
         {!adminGift && <a className="text-link" href="/redeem">
           使用卡密兑换 →
@@ -550,6 +553,14 @@ export function DirectRecharge({
       )}
       {!attempt && (
         <>
+        {adminGift && <label className="form-field">付款方式
+          <select value={manualConfirmation ? 'manual' : 'automatic'} disabled={!!busy}
+            onChange={event => { setManualConfirmation(event.target.value === 'manual'); setChecked(null) }}>
+            <option value="automatic">自动付款（沿用现有流程）</option>
+            <option value="manual">人工确认付款（系统先准备银行卡）</option>
+          </select>
+          <span className="note">人工模式不会自动提交扣款或切换备用卡。准备完成后，在订单详情中点击“确认付款”。等待确认期间，后续订单保留在队列中。</span>
+        </label>}
         {adminGift && cardRequest && <OrderCardPicker request={cardRequest} value={cardChoice} disabled={!!busy} onChange={value => { setCardChoice(value); setChecked(null) }} />}
         <form className="direct-fields" onSubmit={check}>
           <label className="form-field">
@@ -620,7 +631,11 @@ export function DirectRecharge({
               请求结果未确认时，请查询原单或重试原请求。输入信息和订单号已保留。
             </p>
           )}
-          {adminGift && <p className="note">本单付款卡：{attempt?.payment_card_label || cardChoice?.label || '系统主卡与已配置备用卡'}</p>}
+          {adminGift && <p className="note">本单付款卡：{attempt?.payment_card_label || cardChoice?.label ||
+            ((attempt ? attempt.manual_confirmation : manualConfirmation) ? '系统主卡（固定到本单，不使用备用卡）' : '系统主卡与已配置备用卡')}</p>}
+          {adminGift && <p className="note">付款方式：{(attempt ? attempt.manual_confirmation : manualConfirmation)
+            ? '人工确认。本次只扣点入队及准备银行卡；准备完成后需到订单详情确认真实扣款，不自动换卡。'
+            : '自动付款。入队后系统会使用授权银行卡提交真实扣款。'}</p>}
           <div className="recharge-actions">
             {attempt && (
               <Button
@@ -642,7 +657,7 @@ export function DirectRecharge({
                 ? '正在提交…'
                 : attempt
                   ? '重试原请求'
-                  : adminGift ? '确认扣点并赠送' : '确认并直充'}
+                  : adminGift ? manualConfirmation ? '确认扣点并准备付款' : '确认扣点并赠送' : '确认并直充'}
             </Button>
           </div>
         </div>

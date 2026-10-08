@@ -1,4 +1,7 @@
 const descriptions: Record<string, string> = {
+  manual_payment_approval_required: '本单银行卡支付方式已准备，尚未提交扣款。请由管理员在订单详情核对后确认付款。',
+  manual_payment_approved: '管理员已授权本单付款，等待队列继续提交；请勿重复付款。',
+  manual_payment_approval_expired: '人工付款授权已过期，尚未提交扣款。请刷新订单详情，重新核对并确认。',
   x_query_failed: 'X 账号或赠送查询未完成，请核对原单。若尚未创建付款页面，可由管理员尝试安全关闭。',
   cancelled_before_execution: '管理员在创建付款页面前关闭了订单，冻结点数已释放；卡密兑换记录继续保留。',
   cancelled_by_admin: '管理员已关闭订单，冻结点数已释放。',

@@ -26,7 +26,7 @@ import {
   type Env,
 } from './core.ts'
 import { cleanup, reconcile } from './executor.ts'
-import { adminCheckOrder, adminCloseOrder, adminOrderCapabilities, adminPaymentPage } from './admin-order-actions.ts'
+import { adminApprovePayment, adminCheckOrder, adminCloseOrder, adminOrderCapabilities, adminPaymentPage } from './admin-order-actions.ts'
 import {
   cardConfiguration,
   configureCards,
@@ -461,6 +461,8 @@ async function route(request: Request, env: Env): Promise<Response> {
         return json(await eligibility(env, data.username))
       }
       if (resource === 'orders' && method === 'POST') {
+        if (data.manual_confirmation !== undefined && typeof data.manual_confirmation !== 'boolean')
+          fail('invalid_input', '人工确认付款须为布尔选项。')
         if (data.confirmation !== 'GIFT') fail('confirmation_required', '请确认账号、套餐及商户扣点后赠送。')
         if (typeof data.recipient_id !== 'string' || !/^\d{1,25}$/.test(data.recipient_id)) fail('invalid_input', '请先核验接收账号。')
         integer(data.expected_points, '确认点数', 1, 100000000)
@@ -468,6 +470,7 @@ async function route(request: Request, env: Env): Promise<Response> {
         await limit(env, 'eligibility:admin-gift', 20)
         const result = await createOrder(env, target, text(data.idempotency_key, '幂等键', 128), data, {
           paymentCardSelection: parseOrderPaymentSelection(data.payment_card_selection),
+          manualConfirmation: data.manual_confirmation === true,
         })
         if (result.created) await audit(env, 'admin', 'direct_gift', result.order.id)
         return json(result.order, result.created ? 201 : 200)
@@ -501,9 +504,13 @@ async function route(request: Request, env: Env): Promise<Response> {
           actions: await adminOrderCapabilities(env, o),
         }))))
     }
-    const orderAction = path.match(/^\/api\/admin\/orders\/(ord_[a-f0-9]{32})\/(payment-page|check|close)$/)
+    const orderAction = path.match(/^\/api\/admin\/orders\/(ord_[a-f0-9]{32})\/(payment-page|check|close|approve-payment)$/)
     if (orderAction) {
       const [, orderId, action] = orderAction
+      if (action === 'approve-payment' && method === 'POST') {
+        await limit(env, 'order-payment-approval:admin', 20)
+        return json(await adminApprovePayment(env, orderId, data))
+      }
       if (action === 'payment-page' && method === 'GET') {
         await limit(env, 'order-payment-page:admin', 30)
         return json(await adminPaymentPage(env, orderId))

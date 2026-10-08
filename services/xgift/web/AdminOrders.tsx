@@ -8,7 +8,7 @@ import { AlipayOrders } from './AlipaySettings'
 import { AdminDirectGift } from './AdminDirectGift'
 import type { Request } from './Recharge'
 import { orderFailureDescription } from './order-failures'
-import { isClosedOrder, orderActions, orderCloseConfirmation, orderNextStep, orderProduct, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow, type OrdersView } from './order-ui'
+import { isClosedOrder, manualPaymentRequest, orderActions, orderCloseConfirmation, orderNextStep, orderProduct, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow, type OrdersView } from './order-ui'
 import { useUnsavedChanges } from './unsaved-changes'
 import './orders-console.css'
 
@@ -19,7 +19,7 @@ type QueueView = {
   used: number; daily_limit: number; remaining: number; execution_ready: boolean
 }
 type CheckResult = { order_id: string; status: string; failure_code?: string | null; checked: boolean; message: string }
-type Action = 'check' | 'payment-page' | 'close'
+type Action = 'check' | 'payment-page' | 'close' | 'approve-payment'
 const filters = [['active', '待办'], ['unknown', '待核对'], ['', '全部']] as const
 const detailedFilters = [['queued', '排队中'], ['running', '执行中'], ['succeeded', '付款已确认'], ['failed', '已结束']] as const
 const errorText = (error: unknown) => error instanceof Error ? error.message : '操作结果未确认，请刷新原订单核对。'
@@ -37,6 +37,7 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
   const [busy, setBusy] = useState<string | null>(null), [closing, setClosing] = useState<OrderRow | null>(null)
   const [details, setDetails] = useState<OrderRow | null>(null), [detailError, setDetailError] = useState('')
   const [reason, setReason] = useState(''), [confirmation, setConfirmation] = useState('')
+  const [payConfirmation, setPayConfirmation] = useState('')
   const [paymentLink, setPaymentLink] = useState<{ id: string; url: string } | null>(null)
   const mounted = useRef(false), sequence = useRef(0), busyRef = useRef(false), onErrorRef = useRef(onError)
   const detailsRef = useRef(details), closingRef = useRef(closing), viewRef = useRef(view)
@@ -109,7 +110,7 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
     setView(next); setSearch(next.query)
     if (window.location.hash !== ordersHash(next)) window.history.pushState(null, '', ordersHash(next))
   }
-  function showDetails(row: OrderRow) { setDetails(row); setDetailError(''); setActionError(''); setMessage('') }
+  function showDetails(row: OrderRow) { setDetails(row); setDetailError(''); setActionError(''); setMessage(''); setPayConfirmation('') }
   function startClose(row: OrderRow) {
     if (!orderActions(row).close || busyRef.current) return
     setDetails(row); setClosing(row); setReason(''); setConfirmation(''); setActionError('')
@@ -122,7 +123,7 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
 
   async function action(row: OrderRow, kind: Action) {
     const allowed = orderActions(row)
-    if (busyRef.current || !(kind === 'payment-page' ? allowed.payment_page : allowed[kind]) ||
+    if (busyRef.current || !(kind === 'payment-page' ? allowed.payment_page : kind === 'approve-payment' ? allowed.approve_payment : allowed[kind]) ||
       (kind === 'close' && (confirmation !== orderCloseConfirmation(row) || !reason.trim()))) return
     busyRef.current = true; sequence.current++; setBusy(`${row.id}:${kind}`); setActionError(''); setMessage(''); setLoading(false)
     try {
@@ -131,6 +132,13 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
         const result = await request<{ url: string }>(path), url = safePaymentPage(result.url)
         if (!url) throw new Error('原付款页面地址未通过检查，未打开任何页面。请核对原订单。')
         if (mounted.current) { setDetails(row); setPaymentLink({ id: row.id, url }) }
+      } else if (kind === 'approve-payment') {
+        await request(path, manualPaymentRequest(row, payConfirmation))
+        if (mounted.current) {
+          setPayConfirmation(''); setPaymentLink(null)
+          setMessage('本单付款授权已保存，队列会继续提交一次扣款。请核对原单，不要重复付款。')
+          setDetails(selected => selected?.id === row.id ? { ...selected, actions: undefined } : selected)
+        }
       } else if (kind === 'check') {
         const result = await request<CheckResult>(path, {})
         if (mounted.current) {
@@ -167,6 +175,7 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
   function rowActions(row: OrderRow) {
     const allowed = orderActions(row), needsVerification = allowed.reason_code === 'payment_requires_action'
     return <div className="oc-row-actions">
+      {allowed.approve_payment && <Button size="sm" variant="primary" disabled={locked || loading || !!loadError} onClick={() => showDetails(row)}>确认付款…</Button>}
       {allowed.payment_page && needsVerification
         ? <Button size="sm" variant="secondary" disabled={locked || loading || !!loadError} onClick={() => { showDetails(row); void action(row, 'payment-page') }}>{busy === `${row.id}:payment-page` ? '正在获取…' : '获取原付款页'}</Button>
         : allowed.check && <Button size="sm" variant="secondary" disabled={locked || loading || !!loadError} onClick={() => { showDetails(row); void action(row, 'check') }}>{busy === `${row.id}:check` ? '正在核对…' : '核对原单'}</Button>}
@@ -242,6 +251,16 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
             {selectedActions?.payment_page && !paymentReady && <Button variant={selectedActions.reason_code === 'payment_requires_action' ? 'primary' : 'secondary'} disabled={!!busy || !!detailError} onClick={() => void action(details, 'payment-page')}>{busy === `${details.id}:payment-page` ? '正在获取原页…' : '获取原付款页'}</Button>}
             {paymentReady && <a className="oc-payment-link" href={paymentLink.url} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"><ArrowSquareOut size={16} />前往原 Stripe 付款页</a>}
           </div>
+          {selectedActions?.approve_payment && <div className="oc-evidence">
+            <h3>人工确认付款</h3>
+            <p>系统已准备银行卡支付方式，尚未提交扣款。请确认向 @{details.recipient} 赠送 {orderProduct(details.product_code)}，
+              扣款金额 {details.amount_minor != null ? (details.amount_minor / 100).toFixed(2) : '—'} {details.currency?.toUpperCase()}，银行卡 ID {selectedActions.payment_card_id}。
+              点击后会真实扣款；授权五分钟内有效，期间不会自动换卡。</p>
+            <Input label="输入 CONFIRM_PAYMENT 确认真实扣款" value={payConfirmation} autoComplete="off" spellCheck={false}
+              disabled={!!busy || !!detailError} onChange={event => setPayConfirmation(event.target.value)} />
+            <Button variant="primary" disabled={!!busy || !!detailError || payConfirmation !== 'CONFIRM_PAYMENT'}
+              onClick={() => void action(details, 'approve-payment')}>{busy === `${details.id}:approve-payment` ? '正在保存授权…' : '确认付款'}</Button>
+          </div>}
           {paymentReady && <p className="oc-payment-note" role="status">原付款页已获取。请先查看是否已付款；如需验证，在原页完成后返回核对原单，避免再次支付。</p>}
           <dl className="oc-detail-fields"><div><dt>订单号</dt><dd><code>{details.id}</code></dd></div><div><dt>商户单号</dt><dd><code>{details.merchant_order_no}</code></dd></div><div><dt>所属商户</dt><dd>{details.user_name || '—'}</dd></div><div><dt>点数</dt><dd>{details.points} 点</dd></div><div><dt>创建时间</dt><dd>{time(details.created_at)}</dd></div><div><dt>更新时间</dt><dd>{time(details.updated_at)}</dd></div>{details.queue_position && <div><dt>队列位置</dt><dd>第 {details.queue_position} 位</dd></div>}</dl>
           {(details.failure_code || details.receipt) && <div className="oc-evidence"><h3>执行记录</h3>{details.failure_code && <><p>{orderFailureDescription(details.failure_code) || '原执行端返回以下状态，可据此核对这笔订单。'}</p><dl><div><dt>原始状态码</dt><dd><code>{details.failure_code}</code></dd></div></dl></>}{details.receipt && <dl><div><dt>付款凭证</dt><dd><code>{details.receipt}</code></dd></div></dl>}</div>}

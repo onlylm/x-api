@@ -45,6 +45,9 @@ test('safe admin closure differs from failed delivery and never describes restor
 })
 
 test('confirmed payment does not claim independently verified X entitlement delivery', () => {
+  assert.equal(giftOrderPresentation({ status: 'unknown', failure_code: 'manual_payment_approval_required' }).label, '待人工确认')
+  assert.match(giftOrderPresentation({ status: 'unknown', failure_code: 'manual_payment_approval_required' }).description, /尚未提交扣款/)
+  assert.equal(giftOrderPresentation({ status: 'unknown', failure_code: 'manual_payment_approved' }).label, '待提交付款')
   const result = giftOrderPresentation({ status: 'succeeded' })
   assert.equal(result.label, '付款已确认')
   assert.match(result.description, /不等于已独立核实权益到账/)

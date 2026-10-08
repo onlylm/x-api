@@ -84,10 +84,31 @@ test('only administrators can reveal original payment links; public order data n
 
 test('checkout links require exact HTTPS Stripe host and original session, with no alternate port or credentials', () => {
   assert.equal(validatedCheckoutUrl(originalUrl, sessionId), originalUrl)
+  for (const prefix of ['c/', 'g/', '']) {
+    const url = 'https://checkout.stripe.com/' + prefix + 'pay/' + sessionId + '#original-checkout-options'
+    assert.equal(validatedCheckoutUrl(url, sessionId), url)
+  }
   for (const url of ['http://checkout.stripe.com/c/pay/' + sessionId, 'https://checkout.stripe.com.evil.test/c/pay/' + sessionId,
     'https://user:pass@checkout.stripe.com/c/pay/' + sessionId, 'https://checkout.stripe.com:444/c/pay/' + sessionId,
     'https://checkout.stripe.com/other/c/pay/' + sessionId, 'https://checkout.stripe.com/c/pay/cs_live_different',
     'https://checkout.stripe.com/c/pay/' + sessionId + '/extra']) assert.throws(() => validatedCheckoutUrl(url, sessionId))
+})
+
+test('g/pay admin link preserves the original URL and remains read-only and admin-only', async t => {
+  const f = await fixture(t), order = await f.order('unknown')
+  const url = 'https://checkout.stripe.com/g/pay/' + sessionId + '#original-checkout-options'
+  await f.job(order, { session_url: url })
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('No provider requests when revealing original URL') })
+  const before = f.db.prepare('SELECT payload FROM native_jobs').get()!.payload
+  assert.equal((await adminOrderCapabilities(f.env, order)).payment_page, true)
+  assert.equal((await adminPaymentPage(f.env, order.id)).url, url)
+  const path = '/api/admin/orders/' + order.id + '/payment-page'
+  assert.equal((await f.api(path)).status, 401)
+  const merchant = await f.login(f.user.email, 'fixture-user-password')
+  assert.equal((await f.api(path, undefined, merchant)).status, 403)
+  const admin = await f.login()
+  assert.equal((await (await f.api(path, undefined, admin)).json()).data.url, url)
+  assert.equal(f.db.prepare('SELECT payload FROM native_jobs').get()!.payload, before)
 })
 
 test('payment links are read-only, preserve new and legacy full URLs, and reject proof mismatch', async t => {

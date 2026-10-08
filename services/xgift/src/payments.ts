@@ -18,6 +18,7 @@ export interface PaymentSettings {
   updated_at: number
 }
 export interface PaymentBinding {
+  manual_confirmation?: true
   order_card_selection?: true
   revision: string
   card_id: number

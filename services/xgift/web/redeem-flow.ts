@@ -26,6 +26,10 @@ export function closedGift(order: { status: string; failure_code?: string | null
 
 export function giftOrderPresentation(order: { status: string; failure_code?: string | null }) {
   if (closedGift(order)) return { label: '订单已关闭', description: '管理员已安全关闭此订单，不会继续执行。卡密仍保留原兑换记录，请联系商户处理。' }
+  if (order.status === 'unknown' && ['manual_payment_approval_required', 'manual_payment_approval_expired'].includes(order.failure_code ?? ''))
+    return { label: '待人工确认', description: '银行卡支付方式已准备，尚未提交扣款。请管理员到订单详情核对账号、金额和银行卡后，确认付款。不要重复下单。' }
+  if (order.status === 'unknown' && order.failure_code === 'manual_payment_approved')
+    return { label: '待提交付款', description: '管理员已授权本单付款，队列会继续处理这笔原单。请勿重复付款。' }
   const states: Record<string, { label: string; description: string }> = {
     queued: { label: '排队中', description: '订单已接收，正在按顺序等待付款。无需再次兑换，也不要重复下单。' },
     running: { label: '正在处理', description: '正在处理这笔赠送订单。请保留卡密，通过原订单查看进度。' },

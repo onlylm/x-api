@@ -2,7 +2,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import { database } from '../services/xgift/server/database.ts'
-import { executeNative, guardPage, X_MERCHANT } from '../services/xgift/server/native-executor.ts'
+import { executeNative, guardPage, manualApprovalFresh, queryNativeOrder, X_MERCHANT } from '../services/xgift/server/native-executor.ts'
+import { adminOrderCapabilities, adminPaymentPage } from '../services/xgift/src/admin-order-actions.ts'
 import { createUser, createKey } from '../services/xgift/src/auth.ts'
 import { credit, createOrder, type Order } from '../services/xgift/src/orders.ts'
 import { saveSecret, eligibility } from '../services/xgift/src/network.ts'
@@ -38,7 +39,7 @@ async function fixture(t: Context) {
     cardId: 123, cardProduct: 'PP5583RC', cardBalance: 20, cardStatus: 'ACTIVE', cardExpiry: '12/30', cardReads: [] as number[], methodBilling: [] as string[], paymentKeys: [] as string[], onInit: undefined as (() => Promise<void>) | undefined,
     cards: {} as Record<number, Record<string, unknown>>, methodCards: [] as string[], confirmMethods: [] as string[], methodLost: false,
     providerFailure: null as 'network' | 'unauthorized' | null, onCardRead: undefined as ((cardId: number) => Promise<void>) | undefined,
-    xCreateError: false }
+    xCreateError: false, checkoutUrl: 'https://checkout.stripe.com/c/pay/' + session }
   t.mock.method(globalThis, 'fetch', async (input: string | URL, init?: RequestInit) => {
     const url = new URL(String(input))
     if (url.hostname === 'x.com') {
@@ -47,7 +48,7 @@ async function fixture(t: Context) {
       assert.ok(url.pathname.endsWith('/useOneTimePurchaseGiftMutation')); state.xCreates++
       assert.equal(init?.method, 'POST'); assert.equal(JSON.parse(String(init?.body)).variables.gift_recipient, '12345')
       if (state.xCreateError) return Response.json({ errors: [{ code: 353, message: 'auth_token=secret-cookie card=4242424242424242' }] }, { status: 403 })
-      return Response.json({ data: { onetimepurchase_gift: { session_status: 'Unpaid', session_id: session, session_url: 'https://checkout.stripe.com/c/pay/' + session } } })
+      return Response.json({ data: { onetimepurchase_gift: { session_status: 'Unpaid', session_id: session, session_url: state.checkoutUrl } } })
     }
     if (url.hostname === 'zovocard.com') {
       const data = url.pathname.endsWith('/products') ? [{ product_code: 'PP5583RC', issuer: 'four', min_amount: 20, open_fee: state.openFee, recharge_fee: 0 }]
@@ -96,6 +97,32 @@ async function fixture(t: Context) {
   }
   return { env, db, user, state, create, tick, signedRequest }
 }
+test('g/pay checkout proceeds through the existing mock executor without recreating or repeating confirmation', async t => {
+  const s = await fixture(t)
+  s.state.checkoutUrl = 'https://checkout.stripe.com/g/pay/' + session + '#original-fragment'
+  s.state.lostConfirm = true
+  const created = await s.create(); await s.tick()
+  const job = JSON.parse(await unseal(s.env, 'native:' + created.order.id,
+    String(s.db.prepare('SELECT payload FROM native_jobs').get()!.payload)))
+  assert.equal(job.stage, 'session'); assert.equal(job.session_url, s.state.checkoutUrl)
+  assert.equal(job.first_error, undefined)
+  for (let i = 0; i < 8; i++) await s.tick()
+  const order = s.db.prepare('SELECT * FROM orders').get()!
+  assert.equal(order.status, 'succeeded'); assert.equal(order.receipt, session)
+  assert.deepEqual([s.state.xCreates, s.state.methods, s.state.confirms], [1, 1, 1])
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM ledger WHERE kind='consume'").get()!.n, 1)
+})
+
+test('g/pay with another session remains rejected and cannot recreate or submit payment', async t => {
+  const s = await fixture(t)
+  s.state.checkoutUrl = 'https://checkout.stripe.com/g/pay/cs_live_different'
+  const created = await s.create(); await s.tick(); await s.tick()
+  const job = JSON.parse(await unseal(s.env, 'native:' + created.order.id,
+    String(s.db.prepare('SELECT payload FROM native_jobs').get()!.payload)))
+  assert.equal(job.stage, 'creating'); assert.equal(job.first_error.code, 'invalid_checkout_url')
+  assert.equal(s.state.xCreates, 1); assert.equal(s.state.methods + s.state.confirms + s.state.cardOpens, 0)
+})
+
 test('first creation failure is durable, redacted, audited once and not overwritten by later polling', async t => {
   const s = await fixture(t); s.state.xCreateError = true
   const created = await s.create(); await s.tick()
@@ -195,6 +222,135 @@ async function selectedFixture(t: Context, backupCardIds: number[] = []) {
   }
   return { ...s, tick, pause, resume, settings }
 }
+
+async function manualFixture(t: Context) {
+  const s = await selectedFixture(t, [456])
+  s.env.NATIVE_ORDER_QUERY = queryNativeOrder
+  s.state.checkoutUrl = 'https://checkout.stripe.com/g/pay/' + session + '#original-fragment'
+  const call = (path: string, body?: unknown, cookie = '', origin = 'https://x-api.example.test') => worker.fetch(new Request('https://x-api.example.test' + path, {
+    method: body === undefined ? 'GET' : 'POST', headers: { Cookie: cookie, Origin: origin, 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }), s.env)
+  const login = await call('/api/login', { email: 'admin', password: s.env.ADMIN_PASSWORD })
+  const cookie = login.headers.get('Set-Cookie')!.split(';')[0]
+  const route = `/api/admin/users/${s.user.id}/gift/orders`
+  const body = { confirmation: 'GIFT', merchant_order_no: 'admin_manual-001', idempotency_key: 'admin_manual-001',
+    product_code: 'x-premium-3m', recipient: 'receiver', recipient_id: '12345', expected_points: 1700, manual_confirmation: true }
+  const made = await call(route, body, cookie)
+  assert.equal(made.status, 201)
+  const orderId = (await made.json()).data.id
+  const row = () => s.db.prepare('SELECT * FROM orders WHERE id=?').get(orderId) as unknown as Order
+  const job = async () => JSON.parse(await unseal(s.env, 'native:' + orderId, String(s.db.prepare('SELECT payload FROM native_jobs WHERE order_id=?').get(orderId)!.payload)))
+  const setJob = async (patch: Record<string, unknown>) => s.db.prepare('UPDATE native_jobs SET payload=? WHERE order_id=?').run(
+    await seal(s.env, 'native:' + orderId, JSON.stringify({ ...await job(), ...patch })), orderId)
+  const approval = { confirmation: 'CONFIRM_PAYMENT', expected_card_id: 123, expected_amount_minor: 30000, expected_currency: 'bdt', expected_recipient: 'receiver' }
+  const approvePath = '/api/admin/orders/' + orderId + '/approve-payment'
+  for (let i = 0; i < 4; i++) await s.tick()
+  assert.equal((await job()).stage, 'awaiting_approval')
+  return { ...s, call, cookie, route, body, orderId, row, job, setJob, approval, approvePath }
+}
+
+test('manual mode is immutable, admin-only, prepares exactly one card and never submits before a human approval', async t => {
+  const s = await manualFixture(t)
+  for (let i = 0; i < 10; i++) await s.tick()
+  assert.equal(s.state.methods, 1); assert.equal(s.state.confirms + s.state.cardOpens, 0)
+  const binding = (await paymentBinding(await resolvePaymentEnv(s.env), s.orderId))!
+  assert.equal(binding.manual_confirmation, true); assert.deepEqual(binding.backup_card_ids, [])
+  assert.equal((await s.call(s.route, s.body, s.cookie)).status, 200)
+  assert.equal((await s.call(s.route, { ...s.body, manual_confirmation: false }, s.cookie)).status, 409)
+  await assert.rejects(s.create({ manual_confirmation: true }), /仅由管理员/)
+  const actions = await adminOrderCapabilities(s.env, s.row())
+  assert.equal(actions.approve_payment, true); assert.equal(actions.payment_page, false)
+  assert.equal(actions.payment_card_id, 123)
+  await assert.rejects(adminPaymentPage(s.env, s.orderId), /不能同时手动付款/)
+  const snapshot = JSON.parse(await unseal(s.env, 'execution:' + s.orderId, s.row().execution_config!))
+  assert.equal((await queryNativeOrder(s.env, s.row(), snapshot)).failure_code, 'manual_payment_approval_required')
+  assert.equal(s.state.polls, 0)
+})
+
+test('manual approval is admin-only, CSRF protected and rejects missing acknowledgement and stale payment identity', async t => {
+  const s = await manualFixture(t)
+  assert.equal((await s.call(s.approvePath, s.approval)).status, 401)
+  const merchant = await s.call('/api/login', { email: s.user.email, password: 'test-password-fixture' })
+  const cookie = merchant.headers.get('Set-Cookie')!.split(';')[0]
+  assert.equal((await s.call(s.approvePath, s.approval, cookie)).status, 403)
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie, 'https://evil.test')).status, 403)
+  assert.equal((await s.call(s.approvePath, { ...s.approval, confirmation: '' }, s.cookie)).status, 400)
+  for (const patch of [{ expected_card_id: 456 }, { expected_amount_minor: 1 }, { expected_currency: 'usd' }, { expected_recipient: 'other' }])
+    assert.equal((await s.call(s.approvePath, { ...s.approval, ...patch }, s.cookie)).status, 409)
+  assert.equal((await s.job()).manual_approved_at, undefined)
+  assert.equal(s.state.confirms, 0)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='approve_manual_payment'").get()!.n, 0)
+})
+
+test('approved manual order survives fresh environment resolution, submits once and only polls after a lost response', async t => {
+  const s = await manualFixture(t); s.state.lostConfirm = true
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 200)
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 200)
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='approve_manual_payment'").get()!.n, 1)
+  assert.equal(s.state.confirms, 0, 'Approval endpoint must only store authority')
+  await s.tick()
+  assert.equal(s.state.confirms, 1)
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 409)
+  for (let i = 0; i < 5; i++) await s.tick()
+  assert.equal(s.row().status, 'succeeded')
+  assert.deepEqual([s.state.xCreates, s.state.methods, s.state.confirms, s.state.cardOpens], [1, 1, 1, 0])
+  assert.equal(s.db.prepare("SELECT COUNT(*) n FROM ledger WHERE kind='consume'").get()!.n, 1)
+})
+
+test('paused, expired, future-dated and revoked approvals never submit; a fresh acknowledgement can resume the same method', async t => {
+  const s = await manualFixture(t)
+  await s.pause()
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 503)
+  assert.equal((await s.job()).manual_approved_at, undefined)
+  await s.resume()
+  await s.call(s.approvePath, s.approval, s.cookie)
+  for (const at of [Date.now() - 300001, Date.now() + 60000, undefined]) {
+    await s.setJob({ manual_approved_at: at }); await s.tick()
+    assert.equal(s.state.confirms, 0)
+  }
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 200)
+  await s.tick(); await s.tick()
+  assert.equal(s.state.methods, 1); assert.equal(s.state.confirms, 1)
+})
+
+test('approval expires during asynchronous page refresh and cannot proceed to debit', async t => {
+  const s = await manualFixture(t)
+  await s.call(s.approvePath, s.approval, s.cookie)
+  const now = Date.now(), at = (await s.job()).manual_approved_at
+  s.state.onInit = async () => { t.mock.method(Date, 'now', () => Math.max(now, at) + 300001) }
+  await s.tick()
+  assert.equal(s.state.confirms, 0); assert.equal((await s.job()).stage, 'awaiting_approval')
+})
+
+test('manual approval audit failure is atomic and a live worker lease prevents conflicting acknowledgement', async t => {
+  const s = await manualFixture(t)
+  s.db.prepare('UPDATE orders SET lease_until=? WHERE id=?').run(Date.now() + 60000, s.orderId)
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 409)
+  s.db.prepare('UPDATE orders SET lease_until=0 WHERE id=?').run(s.orderId)
+  s.db.exec("CREATE TRIGGER reject_approval BEFORE INSERT ON audit WHEN NEW.action='approve_manual_payment' BEGIN SELECT RAISE(ABORT,'fixture_failure'); END")
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 503)
+  assert.equal((await s.job()).manual_approved_at, undefined)
+  assert.equal(s.state.confirms, 0)
+})
+
+test('manual 3DS order cannot be approved again or switched to another card', async t => {
+  const s = await manualFixture(t); s.state.requiresAction = true
+  await s.call(s.approvePath, s.approval, s.cookie); await s.tick(); await s.tick()
+  assert.equal(s.row().failure_code, 'payment_requires_action')
+  const actions = await adminOrderCapabilities(s.env, s.row())
+  assert.equal(actions.approve_payment, undefined); assert.equal(actions.payment_page, true)
+  assert.equal((await adminPaymentPage(s.env, s.orderId)).url, s.state.checkoutUrl)
+  assert.equal((await s.call(s.approvePath, s.approval, s.cookie)).status, 409)
+  assert.deepEqual(s.state.methodCards, ['4242424242424242'])
+  assert.equal(s.state.confirms, 1)
+})
+
+test('manual approval lifetime is bounded and nonnumeric timestamps are rejected', () => {
+  for (const value of [undefined, null, true, '1', 0, -1, Infinity, NaN, 1001, 1.5]) assert.equal(manualApprovalFresh(value, 1000), false)
+  assert.equal(manualApprovalFresh(1, 300000), true)
+  assert.equal(manualApprovalFresh(1, 300001), false)
+})
 
 test('admin order-specific card is frozen atomically and used without changing the global card or backup list', async t => {
   const s = await selectedFixture(t, [456])
