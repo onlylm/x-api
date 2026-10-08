@@ -45,7 +45,7 @@ import {
   eligibility,
 } from './network.ts'
 import { giftProfile, configureGiftProfile } from './gift-profile.ts'
-import { configurePayments, paymentView, resolvePaymentEnv, setPaymentsEnabled } from './payments.ts'
+import { configurePayments, paymentView, resolvePaymentEnv, setPaymentsEnabled, parseOrderPaymentSelection } from './payments.ts'
 import { admissionView, configureAdmission, pauseAdmission } from './admission.ts'
 import { alipayNotification, alipayOrders, alipayView, checkoutCatalog, checkoutEligibility, checkoutStatus,
   configureAlipay, createCheckout, enableAlipay, reconcileAlipay } from './alipay-payments.ts'
@@ -442,6 +442,37 @@ async function route(request: Request, env: Env): Promise<Response> {
       const result = await reconcile(env)
       await audit(env, 'admin', 'reconcile', 'orders')
       return json(result)
+    }
+    const directGift = path.match(/^\/api\/admin\/users\/(usr_[a-f0-9]{32})\/gift\/(products|eligibility|orders)$/)
+    if (directGift) {
+      const [, target, resource] = directGift
+      const merchant = await env.DB.prepare('SELECT id,enabled FROM users WHERE id=?').bind(target).first<{ id: string; enabled: number }>()
+      if (!merchant) return fail('not_found', '扣点商户不存在。', 404)
+      if (resource === 'orders' && method === 'GET') {
+        const reference = text(url.searchParams.get('merchant_order_no'), '原商户订单号', 128)
+        const original = await env.DB.prepare('SELECT * FROM orders WHERE user_id=? AND merchant_order_no=?').bind(target, reference).first<Order>()
+        if (!original) return fail('not_found', '原订单不存在。', 404)
+        return json(publicOrder(original))
+      }
+      if (resource === 'products' && method === 'GET') return json(await products(env, target))
+      if (resource === 'eligibility' && method === 'POST') {
+        if (!merchant.enabled) fail('merchant_disabled', '扣点商户已停用，请选择已启用商户。', 409)
+        await limit(env, 'eligibility:admin-gift', 20)
+        return json(await eligibility(env, data.username))
+      }
+      if (resource === 'orders' && method === 'POST') {
+        if (data.confirmation !== 'GIFT') fail('confirmation_required', '请确认账号、套餐及商户扣点后赠送。')
+        if (typeof data.recipient_id !== 'string' || !/^\d{1,25}$/.test(data.recipient_id)) fail('invalid_input', '请先核验接收账号。')
+        integer(data.expected_points, '确认点数', 1, 100000000)
+        if (!/^admin_[A-Za-z0-9_.:-]{8,120}$/.test(text(data.merchant_order_no, '商户订单号', 128))) fail('invalid_input', '管理员赠送凭证号无效。')
+        await limit(env, 'eligibility:admin-gift', 20)
+        const result = await createOrder(env, target, text(data.idempotency_key, '幂等键', 128), data, {
+          paymentCardSelection: parseOrderPaymentSelection(data.payment_card_selection),
+        })
+        if (result.created) await audit(env, 'admin', 'direct_gift', result.order.id)
+        return json(result.order, result.created ? 201 : 200)
+      }
+      return fail('not_found', '接口不存在。', 404)
     }
     if (path === '/api/admin/orders' && method === 'GET') {
       const { offset } = pagination(url)

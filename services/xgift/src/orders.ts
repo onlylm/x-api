@@ -3,10 +3,12 @@ import {
   id,
   integer,
   sha256,
+  seal,
   text,
   type Env,
 } from './core.ts'
 import { eligibility } from './network.ts'
+import { prepareOrderPaymentSelection, type OrderPaymentSelection } from './payments.ts'
 import { activeOrdersSql, admissionView, alipaySettlementId, executionReady, newAdmissionSql } from './admission.ts'
 export { executionReady } from './admission.ts'
 export interface Order {
@@ -28,6 +30,7 @@ export interface Order {
   status: 'queued' | 'running' | 'unknown' | 'succeeded' | 'failed'
   executor_ref: string | null
   execution_config: string | null
+  payment_card_selection?: string | null
   failure_code: string | null
   receipt: string | null
   created_at: number
@@ -79,10 +82,12 @@ export async function createOrder(
   userId: string,
   idem: string,
   body: Record<string, unknown>,
-  options: { voucherId?: string; verifiedRecipientId?: string; alipayCheckoutId?: string } = {},
+  options: { voucherId?: string; verifiedRecipientId?: string; alipayCheckoutId?: string; paymentCardSelection?: OrderPaymentSelection } = {},
 ) {
   // Voucher authority is supplied only by the server-side redemption flow.
   const mode = options.voucherId ? 'voucher' : 'direct'
+  if (body.payment_card_selection !== undefined && !options.paymentCardSelection)
+    fail('invalid_input', '本单指定付款卡仅由管理员赠送入口授权。')
   if ((body.mode !== undefined && body.mode !== mode) || body.voucher_id !== undefined)
     fail('invalid_mode', '卡密订单请使用卡密兑换入口。')
   if (options.voucherId && !/^vch_[a-f0-9]{32}$/.test(options.voucherId))
@@ -111,6 +116,7 @@ export async function createOrder(
     merchant, product, recipient,
     ...(checkIdentity || checkPrice ? { recipient_id: body.recipient_id, expected_points: body.expected_points } : {}),
     ...(options.voucherId ? { mode, voucher_id: options.voucherId } : {}),
+    ...(options.paymentCardSelection ? { payment_card_selection: options.paymentCardSelection } : {}),
   }))
   const existing = async () =>
     env.DB.prepare(
@@ -153,6 +159,9 @@ export async function createOrder(
   }
   const orderId = id('ord'),
     now = Date.now()
+  const selectedPayment = options.paymentCardSelection
+    ? await seal(env, 'order-payment:' + orderId, JSON.stringify(await prepareOrderPaymentSelection(env, options.paymentCardSelection)))
+    : null
   // Paid checkouts already reserved their slot. Admission changes and midnight
   // must not strand that payment; retain all identity, product, payment revision
   // and shared-card serialization checks when converting the reservation.
@@ -167,8 +176,8 @@ export async function createOrder(
     : newAdmissionSql(now)
   try {
     const row = await env.DB.prepare(
-      `INSERT INTO orders(id,user_id,merchant_order_no,idempotency_key,request_hash,product_code,recipient,points,currency,amount_minor,stripe_product,months,created_at,updated_at,recipient_id,mode,voucher_id)
-   SELECT ?,u.id,?,?,?,?,?,COALESCE(up.points,p.points),p.currency,p.amount_minor,p.stripe_product,p.months,?,?,?,?,?
+      `INSERT INTO orders(id,user_id,merchant_order_no,idempotency_key,request_hash,product_code,recipient,points,currency,amount_minor,stripe_product,months,created_at,updated_at,recipient_id,mode,voucher_id,payment_card_selection)
+   SELECT ?,u.id,?,?,?,?,?,COALESCE(up.points,p.points),p.currency,p.amount_minor,p.stripe_product,p.months,?,?,?,?,?,?
    FROM users u JOIN products p ON p.code=? LEFT JOIN user_prices up ON up.user_id=u.id AND up.product_code=p.code WHERE u.id=? AND u.enabled=1 AND p.enabled=1${checkPrice ? ' AND COALESCE(up.points,p.points)=?' : ''}${env.LOCAL_EXECUTOR ? ' AND (' + admissionSql + ')' : ''}${env.PAYMENT_SETTINGS ? ' AND EXISTS(SELECT 1 FROM payment_settings WHERE id=1 AND enabled=1 AND revision=?)' : ''} RETURNING *`,
     )
       .bind(
@@ -183,6 +192,7 @@ export async function createOrder(
         recipientId,
         mode,
         options.voucherId ?? null,
+        selectedPayment,
         product,
         userId,
         ...(checkPrice ? [Number(body.expected_points)] : []),

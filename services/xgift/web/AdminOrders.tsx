@@ -5,6 +5,7 @@ import { Dialog } from '@cloudflare/kumo/components/dialog'
 import { Table } from '@cloudflare/kumo/components/table'
 import { ArrowClockwise, ArrowLeft, ArrowRight, ArrowSquareOut, CheckCircle, Clock, WarningCircle, X } from '@phosphor-icons/react'
 import { AlipayOrders } from './AlipaySettings'
+import { AdminDirectGift } from './AdminDirectGift'
 import type { Request } from './Recharge'
 import { orderFailureDescription } from './order-failures'
 import { isClosedOrder, orderActions, orderNextStep, orderProduct, ordersHash, orderStateText, parseOrdersHash, safePaymentPage, type OrderRow, type OrdersView } from './order-ui'
@@ -29,6 +30,7 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
   const [view, setView] = useState(() => parseOrdersHash(window.location.hash))
   const { status, page, query } = view
   const [search, setSearch] = useState(view.query), [history, setHistory] = useState(false)
+  const [giftOpen, setGiftOpen] = useState(false)
   const [rows, setRows] = useState<OrderRow[]>([]), [queue, setQueue] = useState<QueueView | null>(null)
   const [loading, setLoading] = useState(true), [loadError, setLoadError] = useState(''), [queueError, setQueueError] = useState('')
   const [message, setMessage] = useState(''), [actionError, setActionError] = useState(''), [checkedAt, setCheckedAt] = useState<number | null>(null)
@@ -170,6 +172,10 @@ export function AdminOrders({ request, onError, refreshVersion }: { request: Req
   }
 
   return <section className="orders-console" aria-label="赠送订单与执行队列">
+    <details className="oc-history" onToggle={event => { if (event.currentTarget.open) setGiftOpen(true) }}>
+      <summary>直接赠送<span>无需卡密 · 核验账号后扣点并入队</span></summary>
+      {giftOpen && <div className="oc-history-content"><AdminDirectGift request={request} onCreated={load} /></div>}
+    </details>
     <div className="oc-queue" aria-label="执行队列状态">
       <div className="oc-queue-description"><strong>执行队列</strong><span>{queue ? queue.accepts_orders ? '接受新订单' : '暂停新增接单' : '读取接单状态…'}<span aria-hidden="true"> · </span>今日 {queue ? `${queue.used} / ${queue.daily_limit}` : '—'} 笔</span></div>
       <dl className="oc-counts"><div><dt>排队中</dt><dd>{queue?.queued_orders ?? '—'}</dd></div><div><dt>执行中</dt><dd>{queue?.executing_orders ?? '—'}</dd></div><div><dt>待核对</dt><dd>{queue?.unknown_orders ?? '—'}</dd></div></dl>

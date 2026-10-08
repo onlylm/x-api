@@ -341,6 +341,84 @@ test('API denies signature replay, revoked keys, stale timestamps and tenant lea
   f.db.prepare('UPDATE api_keys SET revoked=1 WHERE id=?').run(k.key_id)
   assert.equal((await f.signed(k, '/v1/balance')).status, 401)
 })
+test('admin direct gifting is admin-only, same-origin, and requires explicit confirmation', async (t) => {
+  const f = setup(t), u = await f.user()
+  const base = `/api/admin/users/${u.id}/gift`
+  const login = await f.call('/api/login', { email: 'admin', password: f.env.ADMIN_PASSWORD })
+  const cookie = login.headers.get('Set-Cookie')!.split(';')[0]
+  const merchantLogin = await f.call('/api/login', { email: u.email, password: 'test-user-password-12345' })
+  const merchantCookie = merchantLogin.headers.get('Set-Cookie')!.split(';')[0]
+  for (const [path, body] of [[base + '/products', undefined], [base + '/eligibility', { username: 'testuser' }], [base + '/orders', {}]] as const) {
+    assert.equal((await f.call(path, body)).status, 401)
+    assert.equal((await f.call(path, body, merchantCookie)).status, 403)
+  }
+  assert.equal((await f.call(base + '/orders', {}, cookie)).status, 400)
+  assert.equal((await f.call(base + '/orders', {}, cookie, 'https://foreign.example')).status, 403)
+  assert.equal((await f.call(base + '/products', undefined, cookie)).status, 200)
+  f.db.prepare('UPDATE users SET enabled=0 WHERE id=?').run(u.id)
+  assert.equal((await f.call(base + '/eligibility', { username: 'testuser' }, cookie)).status, 409)
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 0)
+  assert.deepEqual({ ...f.wallet(u.id) }, { available: 0, frozen: 0 })
+})
+
+test('admin direct gifting rechecks identity, honors merchant prices and freezes points exactly once', async (t) => {
+  const f = setup(t), u = await f.user(), other = await f.user('other')
+  await f.fund(u.id)
+  f.db.prepare('INSERT INTO user_prices(user_id,product_code,points) VALUES(?,?,?)').run(u.id, 'x-premium-3m', 350)
+  await saveSecret(f.env, id('sec'), 'account', { name: 'test', auth_token: 'PRIVATE-COOKIE', ct0: 'PRIVATE-CSRF' })
+  let reads = 0
+  t.mock.method(globalThis, 'fetch', async (target: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(target))
+    assert.match(url.pathname, /PremiumGiftingQuery$/)
+    assert.equal(init?.method, undefined, 'Only read-only eligibility checks are allowed in this test')
+    reads++
+    return Response.json({ data: { user: { result: { rest_id: '12345', core: { screen_name: 'testuser' }, premium_gifting_eligible: true } } } })
+  })
+  const login = await f.call('/api/login', { email: 'admin', password: f.env.ADMIN_PASSWORD })
+  const cookie = login.headers.get('Set-Cookie')!.split(';')[0], base = `/api/admin/users/${u.id}/gift`
+  const checked = await f.call(base + '/eligibility', { username: '@testuser' }, cookie)
+  assert.equal(checked.status, 200)
+  const payload = { confirmation: 'GIFT', mode: 'direct', idempotency_key: 'test-admin-idem-001', merchant_order_no: 'admin_test-order-001', product_code: 'x-premium-3m', recipient: 'testuser', recipient_id: '12345', expected_points: 350 }
+  const made = await f.call(base + '/orders', payload, cookie)
+  assert.equal(made.status, 201)
+  const order = (await made.json()).data
+  assert.equal(order.mode, 'direct')
+  assert.equal(order.status, 'queued')
+  assert.equal(order.points, 350)
+  assert.equal(reads, 2, 'Submit rechecks eligibility and identity')
+  assert.deepEqual({ ...f.wallet(u.id) }, { available: 650, frozen: 350 })
+  assert.deepEqual({ ...f.wallet(other.id) }, { available: 0, frozen: 0 })
+  assert.equal((await f.call(base + '/orders', payload, cookie)).status, 200)
+  assert.equal(reads, 2, 'Idempotent retry does not create a new external request')
+  assert.equal((await f.call(base + '/orders', { ...payload, expected_points: 300 }, cookie)).status, 409)
+  assert.equal((await f.call(base + '/orders?merchant_order_no=admin_test-order-001', undefined, cookie)).status, 200)
+  assert.equal((await f.call(`/api/admin/users/${other.id}/gift/orders?merchant_order_no=admin_test-order-001`, undefined, cookie)).status, 404)
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 1)
+  assert.equal(f.db.prepare("SELECT COUNT(*) n FROM audit WHERE action='direct_gift'").get()!.n, 1)
+  assert.doesNotMatch(JSON.stringify(order), /PRIVATE|payload|auth_token|ct0/)
+  f.db.prepare('UPDATE users SET enabled=0 WHERE id=?').run(u.id)
+  assert.equal((await f.call(base + '/orders?merchant_order_no=admin_test-order-001', undefined, cookie)).status, 200)
+  assert.equal((await f.call(base + '/orders', payload, cookie)).status, 200, 'Existing request is recoverable even after disabling merchant')
+})
+
+test('admin gifting cannot bypass price, points, recipient identity or the payment switch', async (t) => {
+  const f = setup(t), u = await f.user()
+  await saveSecret(f.env, id('sec'), 'account', { name: 'test', auth_token: 'dummy-test-cookie', ct0: 'dummy-test-csrf' })
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ data: { user: { result: { rest_id: '12345', core: { screen_name: 'testuser' }, premium_gifting_eligible: true } } } }))
+  const login = await f.call('/api/login', { email: 'admin', password: f.env.ADMIN_PASSWORD })
+  const cookie = login.headers.get('Set-Cookie')!.split(';')[0], base = `/api/admin/users/${u.id}/gift/orders`
+  const payload = { confirmation: 'GIFT', idempotency_key: 'test-admin-idem-002', merchant_order_no: 'admin_test-order-002', product_code: 'x-premium-3m', recipient: 'testuser', recipient_id: '12345', expected_points: 300 }
+  assert.equal((await f.call(base, { ...payload, recipient_id: '999' }, cookie)).status, 409)
+  assert.equal((await f.call(base, { ...payload, expected_points: 1 }, cookie)).status, 409)
+  const insufficient = await f.call(base, payload, cookie)
+  assert.equal((await insufficient.json()).error.code, 'insufficient_points')
+  f.env.PAYMENTS_ENABLED = 'false'
+  const paused = await f.call(base, payload, cookie)
+  assert.equal((await paused.json()).error.code, 'execution_disabled')
+  assert.equal(f.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 0)
+  assert.deepEqual({ ...f.wallet(u.id) }, { available: 0, frozen: 0 })
+})
+
 test('user login cannot access admin APIs and disabling user invalidates its session', async (t) => {
   const f = setup(t),
     u = await f.user()

@@ -18,6 +18,7 @@ export interface PaymentSettings {
   updated_at: number
 }
 export interface PaymentBinding {
+  order_card_selection?: true
   revision: string
   card_id: number
   backup_card_ids?: number[]
@@ -209,7 +210,36 @@ export async function setPaymentsEnabled(env: Env, body: Row) {
   return paymentView(env)
 }
 
-export async function paymentBinding(env: Env): Promise<PaymentBinding | null> {
+export type OrderPaymentSelection = { card_id: number; payment_revision: string; provider_revision: string }
+export function parseOrderPaymentSelection(value: unknown): OrderPaymentSelection | undefined {
+  if (value === undefined) return undefined
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return fail('invalid_input', '本单付款卡格式无效。')
+  const selected = value as Row
+  return { card_id: integer(selected.card_id, '本单付款卡 ID'),
+    payment_revision: text(selected.payment_revision, '付款配置版本', 64), provider_revision: text(selected.provider_revision, '卡台配置版本', 64) }
+}
+
+/** Prepare a server-authorized binding. The caller must atomically persist it with its order. */
+export async function prepareOrderPaymentSelection(env: Env, selection: OrderPaymentSelection): Promise<PaymentBinding> {
+  if (!env.NATIVE_EXECUTOR || !env.LOCAL_EXECUTOR || env.PAYMENTS_ENABLED !== 'true') return fail('execution_disabled', '本单选卡需要已启用的原生付款服务。', 503)
+  const binding = await paymentBinding(env)
+  if (!binding || binding.revision !== selection.payment_revision || binding.provider_revision !== selection.provider_revision)
+    return fail('payment_configuration_changed', '付款或卡台配置已变化，请刷新后重新选择本单付款卡。', 409)
+  await verifiedCard(env, selection.card_id, selection.provider_revision)
+  await assertPaymentAllowed(env, binding)
+  // Explicitly chosen cards do not fall back to unrelated global backup cards.
+  return { ...binding, card_id: selection.card_id, backup_card_ids: [], order_card_selection: true }
+}
+
+export async function paymentBinding(env: Env, orderId?: string): Promise<PaymentBinding | null> {
+  if (orderId) {
+    const row = await env.DB.prepare('SELECT payment_card_selection FROM orders WHERE id=?').bind(orderId).first<{ payment_card_selection: string | null }>()
+    if (row?.payment_card_selection) {
+      const binding = JSON.parse(await unseal(env, 'order-payment:' + orderId, row.payment_card_selection)) as PaymentBinding
+      await assertPaymentAllowed(env, binding, orderId)
+      return binding
+    }
+  }
   const settings = await paymentSettings(env)
   if (!settings) return null
   if (!settings.card_id || !settings.provider_revision || !keyValid(settings.stripe_publishable_key))
@@ -238,9 +268,14 @@ export async function assertPaymentAllowed(env: Env, binding?: PaymentBinding | 
     return
   }
   if (!current.enabled) fail('payments_paused', '支付已暂停。', 503)
-  if (!binding || current.revision !== binding.revision || current.card_id !== binding.card_id ||
-      JSON.stringify(current.backup_card_ids) !== JSON.stringify(binding.backup_card_ids ?? []) ||
+  if (!binding || current.revision !== binding.revision ||
       current.provider_revision !== binding.provider_revision || current.stripe_publishable_key !== binding.stripe_publishable_key)
+    return fail('payment_configuration_changed', '原订单支付配置不匹配，停止处理并核对原订单。', 503)
+  if (binding.order_card_selection) {
+    const authorized = orderId ? await env.DB.prepare('SELECT payment_card_selection FROM orders WHERE id=?').bind(orderId).first<{ payment_card_selection: string | null }>() : null
+    if (!authorized?.payment_card_selection || JSON.stringify(binding) !== JSON.stringify(JSON.parse(await unseal(env, 'order-payment:' + orderId, authorized.payment_card_selection))))
+      return fail('payment_configuration_changed', '本单付款卡未匹配原订单授权，停止处理并核对原单。', 503)
+  } else if (current.card_id !== binding.card_id || JSON.stringify(current.backup_card_ids) !== JSON.stringify(binding.backup_card_ids ?? []))
     return fail('payment_configuration_changed', '原订单支付配置不匹配，停止处理并核对原订单。', 503)
   const provider = await cardConfiguration(env)
   if (provider.revision !== binding.provider_revision || provider.environment !== 'production' || provider.transport !== 'direct')

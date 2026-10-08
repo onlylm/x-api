@@ -4,6 +4,8 @@ import { Input } from '@cloudflare/kumo/components/input'
 import { orderFailureDescription } from './order-failures'
 import { closedGift, giftOrderPresentation, giftProductName, redeemStage, REDEEM_POLL_FAILURE_LIMIT, REDEEM_POLL_INTERVAL, REDEEM_POLL_LIMIT, sameOriginalOrder, shouldPollRedeem, voucherRequest, type VoucherAttempt } from './redeem-flow'
 import './redeem-flow.css'
+import { useUnsavedChanges } from './unsaved-changes'
+import { OrderCardPicker, type OrderCardChoice } from './OrderCardPicker'
 
 export type Request = <T>(
   path: string,
@@ -50,6 +52,8 @@ type Attempt = {
   recipient: string
   recipient_id: string
   expected_points: number
+  payment_card_selection?: Omit<OrderCardChoice, 'label'>
+  payment_card_label?: string
 }
 const message = (e: unknown) =>
   e instanceof Error ? e.message : '请求未确认，请查询原订单。'
@@ -70,6 +74,10 @@ const safeRejections = [
   'execution_disabled',
   'first_order_locked',
   'price_changed',
+  'payment_configuration_changed',
+  'payment_card_not_ready',
+  'payment_provider_changed',
+  'payment_provider_not_ready',
 ]
 
 function useCapabilities(request: Request) {
@@ -380,17 +388,24 @@ export function DirectRecharge({
   request,
   userId,
   onCreated,
+  adminGift = false,
+  onLocked,
+  cardRequest,
 }: {
   request: Request
   userId: string
   onCreated: () => void
+  adminGift?: boolean
+  onLocked?: (locked: boolean) => void
+  cardRequest?: Request
 }) {
-  const storageKey = `xgift.direct-attempt.${userId}`
+  const storageKey = `xgift.${adminGift ? 'admin-gift' : 'direct'}-attempt.${userId}`
   const [attempt, setAttempt] = useState<Attempt | null>(() =>
     readAttempt(storageKey),
   )
   const [products, setProducts] = useState<Product[]>([]),
     [productCode, setProductCode] = useState(attempt?.product_code ?? '')
+  const [cardChoice, setCardChoice] = useState<OrderCardChoice | null>(null)
   const [username, setUsername] = useState(attempt?.recipient ?? ''),
     [checked, setChecked] = useState<Eligibility | null>(null)
   const [order, setOrder] = useState<Order | null>(null),
@@ -405,6 +420,8 @@ export function DirectRecharge({
     !!service.capabilities?.execution_ready &&
     !!service.capabilities?.accepts_orders &&
     !!service.capabilities?.modes.includes('direct')
+  useUnsavedChanges(!!busy || (!!attempt && !order) || !!checked || !!cardChoice)
+  useEffect(() => { onLocked?.(!!busy || !!attempt) }, [busy, attempt, onLocked])
   useEffect(() => {
     let live = true
     request<Product[]>('/api/products')
@@ -435,6 +452,7 @@ export function DirectRecharge({
   async function perform(task: string, work: () => Promise<void>) {
     if (lock.current) return
     lock.current = true
+    onLocked?.(true)
     setBusy(task)
     setError('')
     try {
@@ -461,11 +479,14 @@ export function DirectRecharge({
     const payload: Attempt = attempt ?? {
       mode: 'direct',
       idempotency_key: crypto.randomUUID(),
-      merchant_order_no: `web_${crypto.randomUUID()}`,
+      merchant_order_no: `${adminGift ? 'admin' : 'web'}_${crypto.randomUUID()}`,
       product_code: product!.code,
       recipient: checked!.username,
       recipient_id: checked!.recipient_id,
       expected_points: product!.points,
+      ...(adminGift && cardChoice ? { payment_card_selection: {
+        card_id: cardChoice.card_id, payment_revision: cardChoice.payment_revision, provider_revision: cardChoice.provider_revision,
+      }, payment_card_label: cardChoice.label } : {}),
     }
     void perform('submit', async () => {
       saveAttempt(payload)
@@ -504,15 +525,15 @@ export function DirectRecharge({
     })
   }
   return (
-    <section className="direct-recharge" aria-label="点数直充">
+    <section className="direct-recharge" aria-label={adminGift ? '管理员直接赠送' : '点数直充'}>
       <div className="recharge-result-heading">
         <div>
-          <h2>点数直充</h2>
-          <p className="note">选择套餐并核验 X 账号，下单后冻结对应点数。</p>
+          <h2>{adminGift ? '直接赠送' : '点数直充'}</h2>
+          <p className="note">{adminGift ? '无需卡密。核验并确认后冻结所选商户点数，使用已配置银行卡按队列付款；这会产生真实赠送。' : '选择套餐并核验 X 账号，下单后冻结对应点数。'}</p>
         </div>
-        <a className="text-link" href="/redeem">
+        {!adminGift && <a className="text-link" href="/redeem">
           使用卡密兑换 →
-        </a>
+        </a>}
       </div>
       <Availability {...service} />
       {productError && (
@@ -528,6 +549,8 @@ export function DirectRecharge({
         </div>
       )}
       {!attempt && (
+        <>
+        {adminGift && cardRequest && <OrderCardPicker request={cardRequest} value={cardChoice} disabled={!!busy} onChange={value => { setCardChoice(value); setChecked(null) }} />}
         <form className="direct-fields" onSubmit={check}>
           <label className="form-field">
             充值套餐
@@ -570,6 +593,7 @@ export function DirectRecharge({
             {busy === 'check' ? '正在核验…' : '核验账号'}
           </Button>
         </form>
+        </>
       )}
       {error && (
         <p className="notice error" role="alert">
@@ -578,7 +602,7 @@ export function DirectRecharge({
       )}
       {!order && (checked?.eligible || attempt) && (
         <div className="recharge-confirm">
-          <h2>{attempt ? '原提交请求' : '确认直充信息'}</h2>
+          <h2>{attempt ? '原提交请求' : adminGift ? '确认赠送及扣点' : '确认直充信息'}</h2>
           <p>
             <strong>@{attempt?.recipient ?? checked?.username}</strong> ·{' '}
             {giftProductName(product?.code ?? attempt?.product_code ?? '', product?.name)} · 冻结{' '}
@@ -596,6 +620,7 @@ export function DirectRecharge({
               请求结果未确认时，请查询原单或重试原请求。输入信息和订单号已保留。
             </p>
           )}
+          {adminGift && <p className="note">本单付款卡：{attempt?.payment_card_label || cardChoice?.label || '系统主卡与已配置备用卡'}</p>}
           <div className="recharge-actions">
             {attempt && (
               <Button
@@ -617,7 +642,7 @@ export function DirectRecharge({
                 ? '正在提交…'
                 : attempt
                   ? '重试原请求'
-                  : '确认并直充'}
+                  : adminGift ? '确认扣点并赠送' : '确认并直充'}
             </Button>
           </div>
         </div>
@@ -634,7 +659,7 @@ export function DirectRecharge({
             >
               {busy === 'lookup' ? '正在查询…' : '刷新原订单'}
             </Button>
-            {['succeeded', 'failed'].includes(order.status) && (
+            {(adminGift || ['succeeded', 'failed'].includes(order.status)) && (
               <Button
                 type="button"
                 variant="secondary"
@@ -643,11 +668,12 @@ export function DirectRecharge({
                   setOrder(null)
                   setChecked(null)
                   setUsername('')
+                  setCardChoice(null)
                   setError('')
                   service.refresh()
                 }}
               >
-                新建直充
+                {adminGift ? '新建下一笔赠送' : '新建直充'}
               </Button>
             )}
           </div>

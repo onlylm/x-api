@@ -1,5 +1,6 @@
 /* oxlint-disable react/jsx-key -- Grid puts each cell value inside a keyed Table.Cell; render arrays are not rendered directly. */
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -1342,13 +1343,45 @@ type CardsProps = {
   ) => ReactNode
   toolbar: (title: string, actions?: ReactNode) => ReactNode
 }
-function Cards({ data, pager, form, actionButton, toolbar }: CardsProps) {
+function Cards({ data, page, pager, form, actionButton, toolbar }: CardsProps) {
+  const [inventory, setInventory] = useState<{ list: Row[]; total?: number; provider_revision?: string; refresh?: { completed_at: number } } | null>(null)
+  const [syncing, setSyncing] = useState(false), [syncError, setSyncError] = useState('')
+  const syncSequence = useRef(0), syncLock = useRef(false)
   const config = (data.config ?? {}) as Row,
     balance = (data.balance ?? {}) as Row,
-    cards = (data.cards ?? { list: [] }) as { list: Row[]; total?: number },
+    cards = (inventory ?? data.cards ?? { list: [] }) as { list: Row[]; total?: number; refresh?: { completed_at: number } },
     products = (data.products ?? []) as Row[],
     operations = (data.operations ?? []) as Row[]
   const base = '/api/admin/card-provider'
+  const revision = s(config.revision)
+  const syncMounted = useRef(false)
+  useEffect(() => { setInventory(null) }, [data.cards])
+  useEffect(() => {
+    syncMounted.current = true
+    syncSequence.current++; syncLock.current = false
+    setInventory(null); setSyncError(''); setSyncing(false)
+    return () => { syncMounted.current = false; syncSequence.current++; syncLock.current = false }
+  }, [page, revision])
+  const refreshInventory = useCallback(async (manual = false) => {
+      if (!config.configured || !revision || syncLock.current) return
+      if (!manual && (document.visibilityState !== 'visible' || hasUnsavedChanges())) return
+      const sequence = ++syncSequence.current
+      syncLock.current = true; setSyncing(true)
+      try {
+        const next = await api<{ list: Row[]; total: number; provider_revision: string; refresh: { completed_at: number } }>(
+          base + '/cards/sync?page=' + page, { provider_revision: revision },
+        )
+        if (!syncMounted.current || sequence !== syncSequence.current) return
+        if (next.provider_revision !== revision) throw new Error('卡台连接已变化，请刷新页面后重查。')
+        setInventory(next); setSyncError('')
+      } catch (error) {
+        if (syncMounted.current && sequence === syncSequence.current) setSyncError(error instanceof Error ? error.message : '卡台列表同步失败，请重试。')
+      } finally { if (syncMounted.current && sequence === syncSequence.current) { syncLock.current = false; setSyncing(false) } }
+  }, [page, revision, config.configured])
+  useEffect(() => {
+    const timer = window.setInterval(() => { void refreshInventory() }, 30000)
+    return () => window.clearInterval(timer)
+  }, [refreshInventory])
   const giftProfile = (data.giftProfile ?? {}) as Row
   function configureGift() {
     form({
@@ -1554,13 +1587,14 @@ function Cards({ data, pager, form, actionButton, toolbar }: CardsProps) {
           )}
           {toolbar(
             '卡池',
-            !!config.writes_enabled &&
+            <><Button type="button" variant="secondary" disabled={syncing} onClick={() => void refreshInventory(true)}>{syncing ? '同步中…' : '同步卡台'}</Button>{!!config.writes_enabled &&
               products.length > 0 &&
-              actionButton('开卡并注资', () => write('open'), true),
+              actionButton('开卡并注资', () => write('open'), true)}</>,
           )}
-          {!!data.cards_error && (
+          <p className="note" role="status">第 {page} 页 · 共 {cards.total ?? '—'} 张 · 每页 30 张{cards.refresh?.completed_at ? ' · 最近获取 ' + date(cards.refresh.completed_at) : ''}。页面可见且没有未保存内容时每 30 秒刷新；余额、状态为卡台缓存数据。同步不会换卡、开卡或付款。</p>
+          {(!!syncError || (!!data.cards_error && !inventory)) && (
             <p role="alert" className="notice error">
-              {s(data.cards_error)}
+              {syncError || s(data.cards_error)}
             </p>
           )}
           <Grid
@@ -1591,7 +1625,7 @@ function Cards({ data, pager, form, actionButton, toolbar }: CardsProps) {
               </div>,
             ]}
           />
-          {pager((cards.list ?? []).length === 30 || operations.length === 30)}
+          {pager(page * 30 < (cards.total ?? 0) || (cards.total === undefined && (cards.list ?? []).length === 30) || operations.length === 30)}
           {toolbar('卡产品')}{' '}
           {!!data.products_error && (
             <p className="notice error">{s(data.products_error)}</p>

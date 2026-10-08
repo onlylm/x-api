@@ -8,7 +8,7 @@ import { credit, createOrder, type Order } from '../services/xgift/src/orders.ts
 import { saveSecret, eligibility } from '../services/xgift/src/network.ts'
 import { cardConfiguration, configureCards } from '../services/xgift/src/cards.ts'
 import { configureGiftProfile } from '../services/xgift/src/gift-profile.ts'
-import { configurePayments, paymentSettings, resolvePaymentEnv, setPaymentsEnabled } from '../services/xgift/src/payments.ts'
+import { configurePayments, paymentSettings, resolvePaymentEnv, setPaymentsEnabled, paymentBinding, assertPaymentAllowed } from '../services/xgift/src/payments.ts'
 import { reconcile } from '../services/xgift/src/executor.ts'
 import { seal, unseal, type Env } from '../services/xgift/src/core.ts'
 import { signature } from '../shared/xgift-signature.ts'
@@ -177,6 +177,71 @@ async function selectedFixture(t: Context, backupCardIds: number[] = []) {
   }
   return { ...s, tick, pause, resume, settings }
 }
+
+test('admin order-specific card is frozen atomically and used without changing the global card or backup list', async t => {
+  const s = await selectedFixture(t, [456])
+  s.state.cards[789] = { id: 789, card_number: '4000000000000002', status: 'ACTIVE', available_amount: 20, expire: '12/30' }
+  const provider = await cardConfiguration(s.env), before = s.db.prepare('SELECT * FROM payment_settings').get()
+  const selection = { card_id: 789, payment_revision: s.settings.revision, provider_revision: provider.revision }
+  const call = (path: string, body?: unknown, cookie = '') => worker.fetch(new Request('https://x-api.example.test' + path, {
+    method: body ? 'POST' : 'GET', headers: { Cookie: cookie, Origin: 'https://x-api.example.test', 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  }), s.env)
+  const login = await call('/api/login', { email: 'admin', password: s.env.ADMIN_PASSWORD })
+  const cookie = login.headers.get('Set-Cookie')!.split(';')[0]
+  const route = `/api/admin/users/${s.user.id}/gift/orders`
+  const payload = { confirmation: 'GIFT', merchant_order_no: 'admin_selected-001', idempotency_key: 'admin_selected-001', product_code: 'x-premium-3m', recipient: 'receiver', recipient_id: '12345', expected_points: 1700, payment_card_selection: selection }
+  const made = await call(route, payload, cookie)
+  assert.equal(made.status, 201)
+  const id = (await made.json()).data.id
+  const stored = s.db.prepare('SELECT * FROM orders WHERE id=?').get(id)!
+  assert.doesNotMatch(String(stored.payment_card_selection), /pk_live|test@example|billing/)
+  assert.throws(() => s.db.prepare('UPDATE orders SET payment_card_selection=NULL WHERE id=?').run(id), /immutable_order_payment_selection/)
+  const binding = (await paymentBinding(await resolvePaymentEnv(s.env), id))!
+  assert.equal(binding.card_id, 789)
+  assert.deepEqual(binding.backup_card_ids, [])
+  await assertPaymentAllowed(s.env, binding, id)
+  await assert.rejects(assertPaymentAllowed(s.env, binding), /未匹配原订单授权/)
+  await assert.rejects(assertPaymentAllowed(s.env, { ...binding, card_id: 456 }, id), /未匹配原订单授权/)
+  const reads = s.state.cardReads.length
+  assert.equal((await call(route, payload, cookie)).status, 200)
+  assert.equal(s.state.cardReads.length, reads, 'Retry must not reselect a card or recheck a new candidate')
+  assert.equal((await call(route, { ...payload, payment_card_selection: { ...selection, card_id: 456 } }, cookie)).status, 409)
+  assert.deepEqual(s.db.prepare('SELECT * FROM payment_settings').get(), before)
+  for (let i = 0; i < 8; i++) await s.tick()
+  assert.equal(s.db.prepare('SELECT status FROM orders WHERE id=?').get(id)!.status, 'succeeded')
+  assert.deepEqual(s.state.methodCards, ['4000000000000002'])
+  assert.deepEqual([s.state.cardOpens, s.state.methods, s.state.confirms], [0, 1, 1])
+  assert.deepEqual(s.db.prepare('SELECT * FROM payment_settings').get(), before)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM native_funding').get()!.n, 0)
+})
+
+test('a chosen order card failing preflight never silently falls back to the global primary or backups', async t => {
+  const s = await selectedFixture(t, [456]), settings = await paymentSettings(s.env)
+  s.state.cards[789] = { id: 789, card_number: '4000000000000002', status: 'ACTIVE', available_amount: 20, expire: '12/30' }
+  const selection = { card_id: 789, payment_revision: settings!.revision, provider_revision: settings!.provider_revision! }
+  const body = { merchant_order_no: 'admin_chosen-002', product_code: 'x-premium-3m', recipient: 'receiver', recipient_id: '12345', expected_points: 1700, payment_card_selection: selection }
+  await createOrder(s.env, s.user.id, 'admin_chosen-002', body, { paymentCardSelection: selection })
+  s.state.cardReads.length = 0; s.state.cards[789].status = 'FROZEN'
+  for (let i = 0; i < 5; i++) await s.tick()
+  assert.ok(s.state.cardReads.every(card => card === 789))
+  assert.equal(s.db.prepare('SELECT status FROM orders').get()!.status, 'unknown')
+  assert.equal(s.db.prepare('SELECT failure_code FROM orders').get()!.failure_code, 'card_frozen')
+  assert.deepEqual([s.state.methods, s.state.confirms, s.state.cardOpens], [0, 0, 0])
+  assert.equal((await paymentSettings(s.env))!.card_id, 123)
+})
+
+test('unready or stale order-card selection rejects before freezing points and cannot be supplied by merchants', async t => {
+  const s = await selectedFixture(t, [456]), settings = (await paymentSettings(s.env))!
+  const selection = { card_id: 456, payment_revision: settings.revision, provider_revision: settings.provider_revision! }
+  const body = { merchant_order_no: 'admin_chosen-003', product_code: 'x-premium-3m', recipient: 'receiver', recipient_id: '12345', expected_points: 1700, payment_card_selection: selection }
+  await assert.rejects(createOrder(s.env, s.user.id, 'admin_chosen-003', body), /仅由管理员/)
+  await assert.rejects(createOrder(s.env, s.user.id, 'admin_chosen-003', body, { paymentCardSelection: { ...selection, payment_revision: 'paycfg_stale' } }), /配置已变化/)
+  s.state.cards[456].available_amount = 5
+  await assert.rejects(createOrder(s.env, s.user.id, 'admin_chosen-003', body, { paymentCardSelection: selection }), /不少于 10 USD/)
+  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM orders').get()!.n, 0)
+  assert.equal(s.db.prepare('SELECT frozen FROM wallets WHERE user_id=?').get(s.user.id)!.frozen, 0)
+})
 
 test('selected existing card never opens or funds a card and freezes key, card and billing per execution', async t => {
   const s = await selectedFixture(t)

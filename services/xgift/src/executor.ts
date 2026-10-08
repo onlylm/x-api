@@ -105,7 +105,7 @@ async function bindQueued(env: Env, order: Order) {
   // the slot; it is not permission to submit the next payment.
   const queueGate = native ? ` AND NOT EXISTS(SELECT 1 FROM orders WHERE status IN('running','unknown'))
     AND orders.id=(SELECT id FROM orders WHERE status='queued' ORDER BY created_at,id LIMIT 1)` : ''
-  const payment = native ? await paymentBinding(env) : null
+  const payment = native ? await paymentBinding(env, order.id) : null
   // Persist the chosen card and billing configuration with this execution.
   // A configured payment service may never fall back to legacy automatic funding.
   if (native && env.PAYMENT_SETTINGS && !payment) return null
